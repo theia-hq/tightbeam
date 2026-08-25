@@ -10,6 +10,8 @@
 
 pub mod nauthy;
 
+mod protocol;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -17,10 +19,11 @@ use bifrost::{Discovery, Node, NodeId, Session, Transport};
 use clap::Args;
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
-use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{self, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::nauthy::{Approvals, Gate, parse_allowed};
+use crate::protocol::{Request, Response};
 
 /// Expose a local service to peers who hold this node's key.
 #[derive(Debug, Args)]
@@ -113,9 +116,8 @@ impl ConnectCmd {
             tokio::select! {
                 accepted = listener.accept() => {
                     let (tcp, _) = accepted?;
-                    let (mut writer, reader) = session.open_bi().await?;
-                    write_service(&mut writer, &self.service).await?;
-                    pipes.push(splice(tcp, writer, reader));
+                    let (writer, reader) = session.open_bi().await?;
+                    pipes.push(request_service(self.service.clone(), tcp, writer, reader));
                 }
                 Some(result) = pipes.next(), if !pipes.is_empty() => {
                     if let Err(error) = result {
@@ -145,7 +147,7 @@ impl ApproveCmd {
     }
 }
 
-/// Serve one accepted session: read each inbound stream's requested service and pipe it there.
+/// Serve one accepted session: handle each inbound stream's service request.
 async fn serve_session<S: Session>(
     session: S,
     services: Arc<HashMap<String, String>>,
@@ -154,16 +156,8 @@ async fn serve_session<S: Session>(
     loop {
         tokio::select! {
             accepted = session.accept_bi() => {
-                let (writer, mut reader) = accepted?;
-                let services = services.clone();
-                pipes.push(async move {
-                    let name = read_service(&mut reader).await?;
-                    let Some(addr) = services.get(&name) else {
-                        eyre::bail!("unknown service {name:?}");
-                    };
-                    dial_and_splice(addr, writer, reader).await?;
-                    Ok::<(), eyre::Report>(())
-                });
+                let (writer, reader) = accepted?;
+                pipes.push(serve_request(writer, reader, services.clone()));
             }
             Some(result) = pipes.next(), if !pipes.is_empty() => {
                 if let Err(error) = result {
@@ -172,6 +166,49 @@ async fn serve_session<S: Session>(
             }
         }
     }
+}
+
+/// Open a stream to a service: send the request, and if the host accepts, pipe the connection.
+async fn request_service<W, R>(
+    service: String,
+    tcp: TcpStream,
+    mut writer: W,
+    mut reader: R,
+) -> eyre::Result<()>
+where
+    W: io::AsyncWrite + Unpin,
+    R: io::AsyncRead + Unpin,
+{
+    Request { service }.write(&mut writer).await?;
+    match Response::read(&mut reader).await? {
+        Response::Ok => splice(tcp, writer, reader).await?,
+        Response::Error(message) => eyre::bail!("service refused: {message}"),
+    }
+    Ok(())
+}
+
+/// Serve one inbound stream: read the requested service, reply, and pipe on success.
+async fn serve_request<W, R>(
+    mut writer: W,
+    mut reader: R,
+    services: Arc<HashMap<String, String>>,
+) -> eyre::Result<()>
+where
+    W: io::AsyncWrite + Unpin,
+    R: io::AsyncRead + Unpin,
+{
+    let request = Request::read(&mut reader).await?;
+    match services.get(&request.service) {
+        Some(addr) => {
+            Response::Ok.write(&mut writer).await?;
+            dial_and_splice(addr, writer, reader).await?;
+        }
+        None => {
+            let message = format!("unknown service {:?}", request.service);
+            Response::Error(message).write(&mut writer).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Parse `name=addr` service entries; a bare `addr` becomes the `default` service.
@@ -185,24 +222,6 @@ fn parse_services(entries: &[String]) -> eyre::Result<HashMap<String, String>> {
         services.insert(name, addr);
     }
     Ok(services)
-}
-
-/// Write a length-prefixed service name at the start of a stream.
-async fn write_service<W: io::AsyncWrite + Unpin>(writer: &mut W, name: &str) -> io::Result<()> {
-    let bytes = name.as_bytes();
-    let len = u16::try_from(bytes.len()).map_err(|_| io::Error::other("service name too long"))?;
-    writer.write_all(&len.to_be_bytes()).await?;
-    writer.write_all(bytes).await?;
-    Ok(())
-}
-
-/// Read a length-prefixed service name from the start of a stream.
-async fn read_service<R: io::AsyncRead + Unpin>(reader: &mut R) -> io::Result<String> {
-    let mut len = [0u8; 2];
-    reader.read_exact(&mut len).await?;
-    let mut bytes = vec![0u8; u16::from_be_bytes(len) as usize];
-    reader.read_exact(&mut bytes).await?;
-    String::from_utf8(bytes).map_err(|_| io::Error::other("invalid service name"))
 }
 
 /// Dial a service target (a `unix:<path>` socket or a `host:port`) and pipe it to the bifrost stream.
