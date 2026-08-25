@@ -10,11 +10,14 @@
 
 pub mod nauthy;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use bifrost::{Discovery, Node, NodeId, Session, Transport};
 use clap::Args;
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
-use tokio::io::{self, AsyncWriteExt as _};
+use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::nauthy::{Approvals, Gate, parse_allowed};
@@ -22,8 +25,9 @@ use crate::nauthy::{Approvals, Gate, parse_allowed};
 /// Expose a local service to peers who hold this node's key.
 #[derive(Debug, Args)]
 pub struct ExposeCmd {
-    /// The local address inbound streams are forwarded to, e.g. `127.0.0.1:22`.
-    pub local_addr: String,
+    /// Services to expose as `name=addr` (e.g. `ssh=127.0.0.1:22`), or a bare `addr` for `default`.
+    #[arg(required = true)]
+    pub services: Vec<String>,
     /// Only allow these node ids to connect (repeatable). Overrides `--pair`.
     #[arg(long = "allow")]
     pub allow: Vec<String>,
@@ -36,7 +40,12 @@ impl ExposeCmd {
     /// Accept overlay sessions from permitted peers and forward each inbound stream to the service.
     pub async fn run<T: Transport, D: Discovery>(&self, node: &Node<T, D>) -> eyre::Result<()> {
         let gate = self.gate().await?;
-        println!("exposing {} as {}", self.local_addr, node.node_id());
+        let services = Arc::new(parse_services(&self.services)?);
+        println!(
+            "exposing {} service(s) as {}",
+            services.len(),
+            node.node_id()
+        );
         let mut sessions = FuturesUnordered::new();
         loop {
             tokio::select! {
@@ -47,7 +56,7 @@ impl ExposeCmd {
                         self.reject(peer);
                         continue;
                     }
-                    sessions.push(serve_session(session, self.local_addr.clone()));
+                    sessions.push(serve_session(session, services.clone()));
                 }
                 Some(result) = sessions.next(), if !sessions.is_empty() => {
                     if let Err(error) = result {
@@ -72,10 +81,7 @@ impl ExposeCmd {
     /// Report a rejected peer: a reviewable pending line in pairing mode, otherwise a warning.
     fn reject(&self, peer: NodeId) {
         if self.pair {
-            println!(
-                "pending: {peer} tried to reach {} (approve: tightbeam approve {peer})",
-                self.local_addr
-            );
+            println!("pending: {peer} tried to connect (approve: tightbeam approve {peer})");
         } else {
             tracing::warn!(%peer, "rejected: not permitted");
         }
@@ -90,6 +96,9 @@ pub struct ConnectCmd {
     /// The local port to listen on and forward to the peer.
     #[arg(long)]
     pub to: u16,
+    /// Which exposed service to reach.
+    #[arg(long, default_value = "default")]
+    pub service: String,
 }
 
 impl ConnectCmd {
@@ -104,7 +113,8 @@ impl ConnectCmd {
             tokio::select! {
                 accepted = listener.accept() => {
                     let (tcp, _) = accepted?;
-                    let (writer, reader) = session.open_bi().await?;
+                    let (mut writer, reader) = session.open_bi().await?;
+                    write_service(&mut writer, &self.service).await?;
                     pipes.push(splice(tcp, writer, reader));
                 }
                 Some(result) = pipes.next(), if !pipes.is_empty() => {
@@ -135,15 +145,26 @@ impl ApproveCmd {
     }
 }
 
-/// Serve one accepted session: forward each inbound stream to a fresh local connection.
-async fn serve_session<S: Session>(session: S, local_addr: String) -> eyre::Result<()> {
+/// Serve one accepted session: read each inbound stream's requested service and pipe it there.
+async fn serve_session<S: Session>(
+    session: S,
+    services: Arc<HashMap<String, String>>,
+) -> eyre::Result<()> {
     let mut pipes = FuturesUnordered::new();
     loop {
         tokio::select! {
             accepted = session.accept_bi() => {
-                let (writer, reader) = accepted?;
-                let tcp = TcpStream::connect(&local_addr).await?;
-                pipes.push(splice(tcp, writer, reader));
+                let (writer, mut reader) = accepted?;
+                let services = services.clone();
+                pipes.push(async move {
+                    let name = read_service(&mut reader).await?;
+                    let Some(addr) = services.get(&name) else {
+                        eyre::bail!("unknown service {name:?}");
+                    };
+                    let tcp = TcpStream::connect(addr.as_str()).await?;
+                    splice(tcp, writer, reader).await?;
+                    Ok::<(), eyre::Report>(())
+                });
             }
             Some(result) = pipes.next(), if !pipes.is_empty() => {
                 if let Err(error) = result {
@@ -152,6 +173,37 @@ async fn serve_session<S: Session>(session: S, local_addr: String) -> eyre::Resu
             }
         }
     }
+}
+
+/// Parse `name=addr` service entries; a bare `addr` becomes the `default` service.
+fn parse_services(entries: &[String]) -> eyre::Result<HashMap<String, String>> {
+    let mut services = HashMap::new();
+    for entry in entries {
+        let (name, addr) = match entry.split_once('=') {
+            Some((name, addr)) => (name.to_owned(), addr.to_owned()),
+            None => ("default".to_owned(), entry.clone()),
+        };
+        services.insert(name, addr);
+    }
+    Ok(services)
+}
+
+/// Write a length-prefixed service name at the start of a stream.
+async fn write_service<W: io::AsyncWrite + Unpin>(writer: &mut W, name: &str) -> io::Result<()> {
+    let bytes = name.as_bytes();
+    let len = u16::try_from(bytes.len()).map_err(|_| io::Error::other("service name too long"))?;
+    writer.write_all(&len.to_be_bytes()).await?;
+    writer.write_all(bytes).await?;
+    Ok(())
+}
+
+/// Read a length-prefixed service name from the start of a stream.
+async fn read_service<R: io::AsyncRead + Unpin>(reader: &mut R) -> io::Result<String> {
+    let mut len = [0u8; 2];
+    reader.read_exact(&mut len).await?;
+    let mut bytes = vec![0u8; u16::from_be_bytes(len) as usize];
+    reader.read_exact(&mut bytes).await?;
+    String::from_utf8(bytes).map_err(|_| io::Error::other("invalid service name"))
 }
 
 /// Copy bytes both ways between a TCP connection and a bifrost stream until both sides close.

@@ -41,7 +41,7 @@ async fn tunnels_tcp_over_bifrost() {
 
             tokio::task::spawn_local(async move {
                 ExposeCmd {
-                    local_addr: echo_addr.to_string(),
+                    services: vec![echo_addr.to_string()],
                     allow: Vec::new(),
                     pair: false,
                 }
@@ -53,6 +53,7 @@ async fn tunnels_tcp_over_bifrost() {
                 ConnectCmd {
                     node: exposer_id.to_string(),
                     to: local_port,
+                    service: "default".to_string(),
                 }
                 .run(&consumer)
                 .await
