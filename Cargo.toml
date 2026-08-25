@@ -1,0 +1,11 @@
+[package]
+name = "tightbeam"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+eyre = "0.6"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
