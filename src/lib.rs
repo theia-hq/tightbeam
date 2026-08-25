@@ -7,6 +7,8 @@
 //! `tokio::spawn`, because the bifrost seam's futures are not `Send`-bounded. This keeps the tool
 //! generic over any transport; see DECISIONS.md for the trade-off.
 
+use std::collections::HashSet;
+
 use bifrost::{Discovery, Node, NodeId, Session, Transport};
 use clap::Args;
 use futures::StreamExt as _;
@@ -19,17 +21,27 @@ use tokio::net::{TcpListener, TcpStream};
 pub struct ExposeCmd {
     /// The local address inbound streams are forwarded to, e.g. `127.0.0.1:22`.
     pub local_addr: String,
+    /// Only allow these node ids to connect (repeatable). Empty allows any peer that has the key.
+    #[arg(long = "allow")]
+    pub allow: Vec<String>,
 }
 
 impl ExposeCmd {
-    /// Accept overlay sessions and forward every inbound stream to the local service.
+    /// Accept overlay sessions from permitted peers and forward each inbound stream to the service.
     pub async fn run<T: Transport, D: Discovery>(&self, node: &Node<T, D>) -> eyre::Result<()> {
+        let allowed = parse_allowed(&self.allow)?;
         println!("exposing {} as {}", self.local_addr, node.node_id());
         let mut sessions = FuturesUnordered::new();
         loop {
             tokio::select! {
                 accepted = node.accept() => {
-                    sessions.push(serve_session(accepted?, self.local_addr.clone()));
+                    let session = accepted?;
+                    let peer = session.peer();
+                    if !permitted(&allowed, peer) {
+                        tracing::warn!(%peer, "rejected: not in allowlist");
+                        continue;
+                    }
+                    sessions.push(serve_session(session, self.local_addr.clone()));
                 }
                 Some(result) = sessions.next(), if !sessions.is_empty() => {
                     if let Err(error) = result {
@@ -39,6 +51,18 @@ impl ExposeCmd {
             }
         }
     }
+}
+
+/// Parse node ids into an allowlist set.
+fn parse_allowed(ids: &[String]) -> eyre::Result<HashSet<NodeId>> {
+    ids.iter()
+        .map(|id| id.parse::<NodeId>().map_err(Into::into))
+        .collect()
+}
+
+/// Whether a peer is permitted: an empty allowlist permits any peer that reached this key.
+fn permitted(allowed: &HashSet<NodeId>, peer: NodeId) -> bool {
+    allowed.is_empty() || allowed.contains(&peer)
 }
 
 /// Reach a peer's exposed service and bind it to a local port.
@@ -112,4 +136,26 @@ where
     };
     tokio::try_join!(upstream, downstream)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use bifrost::Transport as _;
+    use bifrost_mem::MemTransport;
+
+    use super::*;
+
+    #[test]
+    fn empty_allowlist_permits_any() {
+        assert!(permitted(&HashSet::new(), MemTransport::bind().node_id()));
+    }
+
+    #[test]
+    fn allowlist_restricts_to_listed_peers() {
+        let allowed_peer = MemTransport::bind().node_id();
+        let other_peer = MemTransport::bind().node_id();
+        let allowed = parse_allowed(&[allowed_peer.to_string()]).unwrap();
+        assert!(permitted(&allowed, allowed_peer));
+        assert!(!permitted(&allowed, other_peer));
+    }
 }
