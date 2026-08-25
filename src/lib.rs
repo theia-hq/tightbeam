@@ -161,8 +161,7 @@ async fn serve_session<S: Session>(
                     let Some(addr) = services.get(&name) else {
                         eyre::bail!("unknown service {name:?}");
                     };
-                    let tcp = TcpStream::connect(addr.as_str()).await?;
-                    splice(tcp, writer, reader).await?;
+                    dial_and_splice(addr, writer, reader).await?;
                     Ok::<(), eyre::Report>(())
                 });
             }
@@ -206,20 +205,45 @@ async fn read_service<R: io::AsyncRead + Unpin>(reader: &mut R) -> io::Result<St
     String::from_utf8(bytes).map_err(|_| io::Error::other("invalid service name"))
 }
 
-/// Copy bytes both ways between a TCP connection and a bifrost stream until both sides close.
-async fn splice<W, R>(tcp: TcpStream, mut writer: W, mut reader: R) -> io::Result<()>
+/// Dial a service target (a `unix:<path>` socket or a `host:port`) and pipe it to the bifrost stream.
+async fn dial_and_splice<W, R>(addr: &str, writer: W, reader: R) -> eyre::Result<()>
 where
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
-    let (mut tcp_reader, mut tcp_writer) = tcp.into_split();
+    if let Some(path) = addr.strip_prefix("unix:") {
+        #[cfg(unix)]
+        {
+            let local = tokio::net::UnixStream::connect(path).await?;
+            splice(local, writer, reader).await?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            eyre::bail!("unix sockets are not supported on this platform");
+        }
+    } else {
+        let local = TcpStream::connect(addr).await?;
+        splice(local, writer, reader).await?;
+    }
+    Ok(())
+}
+
+/// Copy bytes both ways between a local stream and a bifrost stream until both sides close.
+async fn splice<S, W, R>(local: S, mut writer: W, mut reader: R) -> io::Result<()>
+where
+    S: io::AsyncRead + io::AsyncWrite + Unpin,
+    W: io::AsyncWrite + Unpin,
+    R: io::AsyncRead + Unpin,
+{
+    let (mut local_reader, mut local_writer) = io::split(local);
     let upstream = async {
-        io::copy(&mut tcp_reader, &mut writer).await?;
+        io::copy(&mut local_reader, &mut writer).await?;
         writer.shutdown().await
     };
     let downstream = async {
-        io::copy(&mut reader, &mut tcp_writer).await?;
-        tcp_writer.shutdown().await
+        io::copy(&mut reader, &mut local_writer).await?;
+        local_writer.shutdown().await
     };
     tokio::try_join!(upstream, downstream)?;
     Ok(())
