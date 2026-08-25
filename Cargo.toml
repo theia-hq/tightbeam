@@ -6,6 +6,14 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+bifrost = { path = "../bifrost/crates/bifrost" }
+bifrost-iroh = { path = "../bifrost/crates/transports/bifrost-iroh" }
 clap = { version = "4", features = ["derive"] }
 eyre = "0.6"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+bifrost-mem = { path = "../bifrost/crates/transports/bifrost-mem" }

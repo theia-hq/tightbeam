@@ -1,10 +1,11 @@
 //! tightbeam: private peer-to-peer tunnels over the bifrost overlay.
 //!
-//! Expose a local service by key on one machine; reach it as a local port on another. `ssh -L` /
-//! cloudflared shaped, but p2p and pubkey-addressed. See DECISIONS.md for the design; the two
-//! subcommands are stubbed pending design review.
+//! `tightbeam expose <local-addr>` publishes a local service under this node's key;
+//! `tightbeam connect <node-id> --to <port>` binds that service to a local port on another machine.
 
+use bifrost::{NoDiscovery, Node};
 use clap::{Parser, Subcommand};
+use tightbeam::{ConnectCmd, ExposeCmd};
 
 /// Private peer-to-peer tunnels over the bifrost overlay.
 #[derive(Debug, Parser)]
@@ -17,31 +18,24 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Expose a local service to peers who hold this node's key.
-    Expose {
-        /// The local address inbound streams are forwarded to, e.g. `127.0.0.1:22`.
-        local_addr: String,
-    },
+    Expose(ExposeCmd),
     /// Reach a peer's exposed service and bind it to a local port.
-    Connect {
-        /// The node id to dial.
-        node: String,
-        /// The local port to listen on and forward to the peer.
-        #[arg(long)]
-        to: u16,
-    },
+    Connect(ConnectCmd),
 }
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     let cli = Cli::parse();
+
+    // The one place a concrete transport is named; everything downstream speaks `bifrost`.
+    let node = Node::new(bifrost_iroh::Endpoint::bind().await?, NoDiscovery);
+
     match cli.command {
-        Command::Expose { local_addr } => {
-            eyre::bail!("expose {local_addr}: not yet implemented (design in DECISIONS.md)")
-        }
-        Command::Connect { node, to } => {
-            eyre::bail!(
-                "connect {node} -> 127.0.0.1:{to}: not yet implemented (design in DECISIONS.md)"
-            )
-        }
+        Command::Expose(cmd) => cmd.run(&node).await,
+        Command::Connect(cmd) => cmd.run(&node).await,
     }
 }

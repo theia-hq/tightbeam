@@ -4,7 +4,7 @@ Private peer-to-peer tunnels over the bifrost overlay. Expose a local service by
 machine, and reach it as a local port on another, with no public internet in between. `ssh -L` /
 cloudflared shaped, but p2p and pubkey-addressed.
 
-> Experimental and not yet implemented. The CLI is stubbed pending design review.
+> Experimental. Works for TCP over the iroh transport; not ready for production use.
 
 ## Installation
 
