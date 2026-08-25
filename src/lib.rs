@@ -1,13 +1,14 @@
 //! tightbeam: private peer-to-peer tunnels over the bifrost overlay.
 //!
 //! `expose` forwards inbound overlay streams to a local TCP service; `connect` binds a peer's exposed
-//! service to a local port. Each proxied TCP connection rides one bifrost bidirectional stream.
+//! service to a local port. Each proxied TCP connection rides one bifrost bidirectional stream. Who
+//! may connect is decided by [`nauthy`], the authorization gate.
 //!
 //! Concurrency uses `FuturesUnordered` + `select!` (structured concurrency on one task) rather than
 //! `tokio::spawn`, because the bifrost seam's futures are not `Send`-bounded. This keeps the tool
 //! generic over any transport; see DECISIONS.md for the trade-off.
 
-use std::collections::HashSet;
+pub mod nauthy;
 
 use bifrost::{Discovery, Node, NodeId, Session, Transport};
 use clap::Args;
@@ -16,20 +17,25 @@ use futures::stream::FuturesUnordered;
 use tokio::io::{self, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::nauthy::{Approvals, Gate, parse_allowed};
+
 /// Expose a local service to peers who hold this node's key.
 #[derive(Debug, Args)]
 pub struct ExposeCmd {
     /// The local address inbound streams are forwarded to, e.g. `127.0.0.1:22`.
     pub local_addr: String,
-    /// Only allow these node ids to connect (repeatable). Empty allows any peer that has the key.
+    /// Only allow these node ids to connect (repeatable). Overrides `--pair`.
     #[arg(long = "allow")]
     pub allow: Vec<String>,
+    /// Pairing mode: permit only approved peers, and print unknown attempts to approve later.
+    #[arg(long)]
+    pub pair: bool,
 }
 
 impl ExposeCmd {
     /// Accept overlay sessions from permitted peers and forward each inbound stream to the service.
     pub async fn run<T: Transport, D: Discovery>(&self, node: &Node<T, D>) -> eyre::Result<()> {
-        let allowed = parse_allowed(&self.allow)?;
+        let gate = self.gate().await?;
         println!("exposing {} as {}", self.local_addr, node.node_id());
         let mut sessions = FuturesUnordered::new();
         loop {
@@ -37,8 +43,8 @@ impl ExposeCmd {
                 accepted = node.accept() => {
                     let session = accepted?;
                     let peer = session.peer();
-                    if !permitted(&allowed, peer) {
-                        tracing::warn!(%peer, "rejected: not in allowlist");
+                    if !gate.permits(peer) {
+                        self.reject(peer);
                         continue;
                     }
                     sessions.push(serve_session(session, self.local_addr.clone()));
@@ -51,18 +57,29 @@ impl ExposeCmd {
             }
         }
     }
-}
 
-/// Parse node ids into an allowlist set.
-fn parse_allowed(ids: &[String]) -> eyre::Result<HashSet<NodeId>> {
-    ids.iter()
-        .map(|id| id.parse::<NodeId>().map_err(Into::into))
-        .collect()
-}
+    /// Build the authorization gate from the flags: `--allow` (strict) wins, then `--pair`, else open.
+    async fn gate(&self) -> eyre::Result<Gate> {
+        if !self.allow.is_empty() {
+            Ok(Gate::Strict(parse_allowed(&self.allow)?))
+        } else if self.pair {
+            Ok(Gate::Paired(Approvals::load().await?))
+        } else {
+            Ok(Gate::Open)
+        }
+    }
 
-/// Whether a peer is permitted: an empty allowlist permits any peer that reached this key.
-fn permitted(allowed: &HashSet<NodeId>, peer: NodeId) -> bool {
-    allowed.is_empty() || allowed.contains(&peer)
+    /// Report a rejected peer: a reviewable pending line in pairing mode, otherwise a warning.
+    fn reject(&self, peer: NodeId) {
+        if self.pair {
+            println!(
+                "pending: {peer} tried to reach {} (approve: tightbeam approve {peer})",
+                self.local_addr
+            );
+        } else {
+            tracing::warn!(%peer, "rejected: not permitted");
+        }
+    }
 }
 
 /// Reach a peer's exposed service and bind it to a local port.
@@ -97,6 +114,24 @@ impl ConnectCmd {
                 }
             }
         }
+    }
+}
+
+/// Approve a peer key so it may connect in pairing mode.
+#[derive(Debug, Args)]
+pub struct ApproveCmd {
+    /// The node id to approve.
+    pub node: String,
+}
+
+impl ApproveCmd {
+    /// Add a peer to the persisted approved set.
+    pub async fn run(&self) -> eyre::Result<()> {
+        let peer: NodeId = self.node.parse()?;
+        let mut approvals = Approvals::load().await?;
+        approvals.approve(peer).await?;
+        println!("approved {peer} ({})", approvals.path().display());
+        Ok(())
     }
 }
 
@@ -136,26 +171,4 @@ where
     };
     tokio::try_join!(upstream, downstream)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use bifrost::Transport as _;
-    use bifrost_mem::MemTransport;
-
-    use super::*;
-
-    #[test]
-    fn empty_allowlist_permits_any() {
-        assert!(permitted(&HashSet::new(), MemTransport::bind().node_id()));
-    }
-
-    #[test]
-    fn allowlist_restricts_to_listed_peers() {
-        let allowed_peer = MemTransport::bind().node_id();
-        let other_peer = MemTransport::bind().node_id();
-        let allowed = parse_allowed(&[allowed_peer.to_string()]).unwrap();
-        assert!(permitted(&allowed, allowed_peer));
-        assert!(!permitted(&allowed, other_peer));
-    }
 }

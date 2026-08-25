@@ -43,6 +43,7 @@ async fn tunnels_tcp_over_bifrost() {
                 ExposeCmd {
                     local_addr: echo_addr.to_string(),
                     allow: Vec::new(),
+                    pair: false,
                 }
                 .run(&exposer)
                 .await
