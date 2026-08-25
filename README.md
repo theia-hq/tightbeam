@@ -16,24 +16,35 @@ cargo install --path .
 
 ## Usage
 
-Expose a local service (on the machine that has it):
+Expose one or more local services (on the machine that has them):
 
 ```sh
-tightbeam expose 127.0.0.1:22
+tightbeam expose ssh=127.0.0.1:22 web=127.0.0.1:80
 ```
 
-Reach it from another machine, bound to a local port:
+Reach a service from another machine, bound to a local port:
 
 ```sh
+tightbeam connect <node-id> --service ssh --to 2222
+```
+
+A bare address exposes the `default` service, which `connect` reaches without `--service`:
+
+```sh
+tightbeam expose 127.0.0.1:22      # on the host
 tightbeam connect <node-id> --to 2222
 ```
+
+Restrict who may connect with `--allow <node-id>` (repeatable), or `--pair` to approve peers on
+first contact (`tightbeam approve <node-id>`).
 
 ## Things to know
 
 - Built on `bifrost` (reach): each proxied connection is one bidirectional stream. It is transport-blind
   and rides any bifrost transport.
-- Only a peer holding the target's key can dial it; reach is the authorization.
-- TCP first; unix sockets and named services come later.
+- Only a peer holding the key can dial, and authorization (allowlist / pairing) is enforced by nauthy on
+  the identity the handshake proves.
+- TCP today; unix sockets later.
 
 ## License
 
