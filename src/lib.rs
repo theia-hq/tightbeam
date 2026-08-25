@@ -5,7 +5,7 @@
 //! may connect is decided by [`nauthy`], the authorization gate.
 //!
 //! Concurrency uses `FuturesUnordered` + `select!` (structured concurrency on one task) rather than
-//! `tokio::spawn`, because the bifrost seam's futures are not `Send`-bounded. This keeps the tool
+//! `tokio::spawn`, because the bifrost interface's futures are not `Send`-bounded. This keeps the tool
 //! generic over any transport; see DECISIONS.md for the trade-off.
 
 pub mod nauthy;

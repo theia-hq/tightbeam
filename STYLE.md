@@ -20,12 +20,12 @@ _How this codebase is built. It is the contract: reviewers (human or machine) sh
 - **In trait impls, name associated types via `Self::Assoc` in signatures**, not the concrete type: `fn from_row(value: Self::Row)`, not `fn from_row(value: i64)`. The associated type stays the single source of truth, so changing it propagates to every signature.
 
 ## Three representations: wire, domain, storage
-- **A domain type is not a wire type is not a DB row.** Keep three distinct representations and map explicitly between them at the seams.
+- **A domain type is not a wire type is not a DB row.** Keep three distinct representations and map explicitly between them at the boundaries.
   - **Wire**, the codec-generated types (transport concern: field numbers, optionality, serialization quirks).
   - **Domain**, pure Rust, the currency of the business logic. Carries **no codec derives at all**, no ORM/row derives, no serde. It answers to correctness, not to any transport or storage format.
   - **Storage**, row structs owned by the repo layer, carrying the persistence derives.
 - **Do not compound codec derives onto one struct.** A single type wearing both a row-mapping derive and the wire/serde derives couples persistence and transport into the domain and lets each layer's constraints leak into the others. Conversions live at the boundary (`From`/`TryFrom` in the repo and the service layer), never as derives on the domain type.
-- **A cohesive class of conversions is a local trait, not a bag of free functions.** When several functions perform the same kind of transformation (domain to wire, row to domain, primitive to scalar), group them under one small local trait with an associated type naming the counterpart, rather than scattering `to_x` / `from_x` free functions. The trait names the relationship, keeps the impls discoverable together, and, when the two types live in different crates, sidesteps the orphan rule that forbids a foreign `From` / `TryFrom` (e.g. a `FromRow` trait for storage, a `ToWire`/`FromWire` pair for the transport seam).
+- **A cohesive class of conversions is a local trait, not a bag of free functions.** When several functions perform the same kind of transformation (domain to wire, row to domain, primitive to scalar), group them under one small local trait with an associated type naming the counterpart, rather than scattering `to_x` / `from_x` free functions. The trait names the relationship, keeps the impls discoverable together, and, when the two types live in different crates, sidesteps the orphan rule that forbids a foreign `From` / `TryFrom` (e.g. a `FromRow` trait for storage, a `ToWire`/`FromWire` pair for the transport interface).
 
 ## Ownership, memory & performance
 - **No unnecessary clones or allocations.** Prefer borrowing; prefer streaming and iteration over materializing collections.
@@ -111,7 +111,7 @@ _How this codebase is built. It is the contract: reviewers (human or machine) sh
 - **Dependencies introduced sparingly**, every one indisputable and absolutely necessary.
 
 ## Commits & PRs (read like a story)
-- **Each commit is one coherent step, builds and passes on its own,** and its message says what it did *and* what it sets up, earlier commits visibly lay the seams a later feature clicks into.
+- **Each commit is one coherent step, builds and passes on its own,** and its message says what it did *and* what it sets up, earlier commits visibly lay the groundwork a later feature clicks into.
 - **PR body uses the house template:** Motivation / In this PR / Test Plan / Backwards compatibility / Future Work. Narrate the correctness invariants so review questions are pre-answered.
 - **Small, reviewable diffs.** An "and also" section means it was two PRs.
 
