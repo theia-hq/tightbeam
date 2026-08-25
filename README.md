@@ -16,10 +16,11 @@ cargo install --path .
 
 ## Usage
 
-Expose one or more local services (on the machine that has them):
+Expose one or more local services (on the machine that has them). A target may be a `host:port` or a
+`unix:<path>` socket:
 
 ```sh
-tightbeam expose ssh=127.0.0.1:22 web=127.0.0.1:80
+tightbeam expose ssh=127.0.0.1:22 web=127.0.0.1:80 docker=unix:/var/run/docker.sock
 ```
 
 Reach a service from another machine, bound to a local port:
@@ -44,7 +45,7 @@ first contact (`tightbeam approve <node-id>`).
   and rides any bifrost transport.
 - Only a peer holding the key can dial, and authorization (allowlist / pairing) is enforced by nauthy on
   the identity the handshake proves.
-- TCP today; unix sockets later.
+- TCP and unix-socket (`unix:<path>`) targets are supported.
 
 ## License
 
