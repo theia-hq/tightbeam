@@ -33,8 +33,22 @@ impl ConnectCmd {
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
-                    let (tcp, _) = accepted?;
-                    let (writer, reader) = session.open_bi().await?;
+                    // One local accept or stream-open failing must not drop the pipes already in
+                    // flight: log the transient error and keep the local listener up.
+                    let (tcp, _) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            tracing::warn!(%error, "local accept failed; still listening");
+                            continue;
+                        }
+                    };
+                    let (writer, reader) = match session.open_bi().await {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            tracing::warn!(%error, "opening a stream to the peer failed; still listening");
+                            continue;
+                        }
+                    };
                     pipes.push(request_service(String::clone(&self.service), tcp, writer, reader));
                 }
                 Some(result) = pipes.next(), if !pipes.is_empty() => {

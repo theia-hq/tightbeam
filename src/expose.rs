@@ -42,7 +42,15 @@ impl ExposeCmd {
         loop {
             tokio::select! {
                 accepted = node.accept() => {
-                    let session = accepted?;
+                    // The listener outlives any one peer: a transient accept error must not tear down
+                    // the sessions already being served, so log it and keep accepting.
+                    let session = match accepted {
+                        Ok(session) => session,
+                        Err(error) => {
+                            tracing::warn!(%error, "accept failed; still listening");
+                            continue;
+                        }
+                    };
                     let peer = session.peer();
                     if !gate.permits(peer) {
                         self.reject(peer);
