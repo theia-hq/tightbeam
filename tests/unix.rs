@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use std::time::Duration;
+use core::time::Duration;
 
 use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;

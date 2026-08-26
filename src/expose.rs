@@ -48,7 +48,7 @@ impl ExposeCmd {
                         self.reject(peer);
                         continue;
                     }
-                    sessions.push(serve_session(session, services.clone()));
+                    sessions.push(serve_session(session, Arc::clone(&services)));
                 }
                 Some(result) = sessions.next(), if !sessions.is_empty() => {
                     if let Err(error) = result {
@@ -90,7 +90,7 @@ async fn serve_session<S: Session>(
         tokio::select! {
             accepted = session.accept_bi() => {
                 let (writer, reader) = accepted?;
-                pipes.push(serve_request(writer, reader, services.clone()));
+                pipes.push(serve_request(writer, reader, Arc::clone(&services)));
             }
             Some(result) = pipes.next(), if !pipes.is_empty() => {
                 if let Err(error) = result {
@@ -131,7 +131,7 @@ fn parse_services(entries: &[String]) -> eyre::Result<HashMap<String, String>> {
     for entry in entries {
         let (name, addr) = match entry.split_once('=') {
             Some((name, addr)) => (name.to_owned(), addr.to_owned()),
-            None => ("default".to_owned(), entry.clone()),
+            None => ("default".to_owned(), String::clone(entry)),
         };
         services.insert(name, addr);
     }

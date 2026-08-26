@@ -35,7 +35,7 @@ impl ConnectCmd {
                 accepted = listener.accept() => {
                     let (tcp, _) = accepted?;
                     let (writer, reader) = session.open_bi().await?;
-                    pipes.push(request_service(self.service.clone(), tcp, writer, reader));
+                    pipes.push(request_service(String::clone(&self.service), tcp, writer, reader));
                 }
                 Some(result) = pipes.next(), if !pipes.is_empty() => {
                     if let Err(error) = result {

@@ -7,7 +7,6 @@
 //! ABOVE bifrost: reach stays policy-free; authorization is policy on proven identities.
 
 use std::collections::HashSet;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use bifrost::NodeId;
@@ -56,6 +55,9 @@ impl Approvals {
 
     /// Load the approved set from an explicit path. `pub(crate)` so `nauthy_tests` can point it at a
     /// scratch file instead of the user's real config.
+    // `core::io::ErrorKind` is still unstable (the core_io feature), so the NotFound check below reads
+    // from `std`; drop this once it lands in core.
+    #[allow(clippy::std_instead_of_core)]
     pub(crate) async fn load_from(path: PathBuf) -> eyre::Result<Self> {
         let keys = match tokio::fs::read_to_string(&path).await {
             Ok(text) => text
@@ -64,7 +66,7 @@ impl Approvals {
                 .filter(|line| !line.is_empty())
                 .map(|line| line.parse::<NodeId>().map_err(Into::into))
                 .collect::<eyre::Result<HashSet<NodeId>>>()?,
-            Err(error) if error.kind() == ErrorKind::NotFound => HashSet::new(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
             Err(error) => return Err(error.into()),
         };
         Ok(Self { path, keys })

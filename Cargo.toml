@@ -17,3 +17,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 bifrost-mem = { path = "../bifrost/crates/transports/bifrost-mem" }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+wildcard_imports = "deny"
+std_instead_of_core = "warn"
+alloc_instead_of_core = "warn"
+
+[lints.rust]
+unused_must_use = "deny"
