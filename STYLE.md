@@ -105,7 +105,7 @@ _How this codebase is built. It is the contract: reviewers (human or machine) sh
 
 ## Tooling & dependencies
 - **`cargo fmt`, `cargo clippy -D warnings`, `cargo sort`** all clean before every commit, part of the definition of done.
-- **Prefer `core::` / `alloc::` over `std::`** wherever the item exists there. Enforced by `clippy::std_instead_of_core` and `clippy::alloc_instead_of_core` (restriction lints, enabled to `warn`).
+- **Prefer `core::` over `std::`** wherever the item exists in `core`. Do not prefer `alloc::` over `std::`: if an item lives only in `alloc` (not `core`), just use `std::`. Enforced by `clippy::std_instead_of_core` (restriction lint, `warn`).
 - **Explicitly-sized integer types over arch-specific** (`u64`/`u32`, not `usize`) wherever the width is semantic rather than a container index.
 - **Macros defined sparingly.** Great power, great responsibility: only with irrefutable rationale.
 - **Dependencies introduced sparingly**, every one indisputable and absolutely necessary.
