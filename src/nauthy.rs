@@ -2,8 +2,8 @@
 //! whether it may connect.
 //!
 //! Three policies today: `open` (any peer with the key), `strict` (a fixed allowlist), and `paired`
-//! (a persisted approved set grown by consent). This is cross-cutting — any server-shaped product
-//! wants it — so it is written to lift out into its own `nauthy` crate at the second consumer. It sits
+//! (a persisted approved set grown by consent). This is cross-cutting (any server-shaped product
+//! wants it), so it is written to lift out into its own `nauthy` crate at the second consumer. It sits
 //! ABOVE bifrost: reach stays policy-free; authorization is policy on proven identities.
 
 use std::collections::HashSet;

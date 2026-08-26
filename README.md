@@ -1,8 +1,8 @@
 # tightbeam
 
-Private peer-to-peer tunnels over the bifrost overlay. Expose a local service by its public key on one
-machine, and reach it as a local port on another, with no public internet in between. `ssh -L` /
-cloudflared shaped, but p2p and pubkey-addressed.
+Reach a service on a machine with no public IP: no port forwarding, no VPN, no cloudflared. Expose a
+local service by its public key on one machine, reach it as a local port on another, peer to peer with
+nothing in between. `ssh -L` shaped, but pubkey-addressed.
 
 > Experimental. Works for TCP over the iroh transport; not ready for production use.
 
