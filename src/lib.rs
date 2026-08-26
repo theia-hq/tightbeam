@@ -15,6 +15,11 @@ pub mod nauthy;
 
 mod protocol;
 
+#[cfg(test)]
+mod nauthy_tests;
+#[cfg(test)]
+mod protocol_tests;
+
 use tokio::io::{self, AsyncWriteExt as _};
 
 pub use crate::approve::ApproveCmd;

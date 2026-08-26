@@ -54,7 +54,9 @@ impl Approvals {
         Self::load_from(default_path()?).await
     }
 
-    async fn load_from(path: PathBuf) -> eyre::Result<Self> {
+    /// Load the approved set from an explicit path. `pub(crate)` so `nauthy_tests` can point it at a
+    /// scratch file instead of the user's real config.
+    pub(crate) async fn load_from(path: PathBuf) -> eyre::Result<Self> {
         let keys = match tokio::fs::read_to_string(&path).await {
             Ok(text) => text
                 .lines()
@@ -111,43 +113,4 @@ fn default_path() -> eyre::Result<PathBuf> {
         .join(".config")
         .join("tightbeam")
         .join("approved"))
-}
-
-#[cfg(test)]
-mod tests {
-    use bifrost::Transport as _;
-    use bifrost_mem::MemTransport;
-
-    use super::*;
-
-    #[test]
-    fn open_permits_any_and_strict_restricts() {
-        let listed = MemTransport::bind().node_id();
-        let other = MemTransport::bind().node_id();
-
-        assert!(Gate::Open.permits(other));
-
-        let strict = Gate::Strict(HashSet::from([listed]));
-        assert!(strict.permits(listed));
-        assert!(!strict.permits(other));
-    }
-
-    #[tokio::test]
-    async fn approvals_persist_and_gate_pairs() {
-        let path = std::env::temp_dir().join("tightbeam-nauthy-test");
-        let _ = tokio::fs::remove_file(&path).await;
-
-        let approved = MemTransport::bind().node_id();
-        let other = MemTransport::bind().node_id();
-
-        let mut approvals = Approvals::load_from(path.clone()).await.unwrap();
-        approvals.approve(approved).await.unwrap();
-
-        let reloaded = Approvals::load_from(path.clone()).await.unwrap();
-        let gate = Gate::Paired(reloaded);
-        assert!(gate.permits(approved));
-        assert!(!gate.permits(other));
-
-        tokio::fs::remove_file(&path).await.unwrap();
-    }
 }
