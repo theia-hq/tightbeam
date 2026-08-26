@@ -39,6 +39,20 @@ tightbeam connect <node-id> --to 2222
 Restrict who may connect with `--allow <node-id>` (repeatable), or `--pair` to approve peers on
 first contact (`tightbeam approve <node-id>`).
 
+## Compose an overlay exit
+
+tightbeam does not ship a proxy; it tunnels any existing one. To route traffic out through a remote
+peer, run a proxy on the exit host and expose it (`ssh` provides a SOCKS5 proxy on any machine):
+
+```sh
+# on the exit host
+ssh -D 1080 -N localhost        # or dante / Caddy / mitmproxy
+tightbeam expose 127.0.0.1:1080
+
+# on your machine
+tightbeam connect <exit-node-id> --to 1080   # then point apps at socks5://127.0.0.1:1080
+```
+
 ## Things to know
 
 - Built on `bifrost` (reach): each proxied connection is one bidirectional stream. It is transport-blind
