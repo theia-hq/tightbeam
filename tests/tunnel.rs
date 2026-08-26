@@ -51,7 +51,7 @@ async fn tunnels_tcp_over_bifrost() {
             });
             tokio::task::spawn_local(async move {
                 ConnectCmd {
-                    node: exposer_id.to_string(),
+                    node: exposer_id,
                     to: local_port,
                     service: "default".to_string(),
                 }

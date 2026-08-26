@@ -9,16 +9,15 @@ use crate::nauthy::Approvals;
 #[derive(Debug, Args)]
 pub struct ApproveCmd {
     /// The node id to approve.
-    pub node: String,
+    pub node: NodeId,
 }
 
 impl ApproveCmd {
     /// Add a peer to the persisted approved set.
     pub async fn run(self) -> eyre::Result<()> {
-        let peer: NodeId = self.node.parse()?;
         let mut approvals = Approvals::load().await?;
-        approvals.approve(peer).await?;
-        println!("approved {peer} ({})", approvals.path().display());
+        approvals.approve(self.node).await?;
+        println!("approved {} ({})", self.node, approvals.path().display());
         Ok(())
     }
 }

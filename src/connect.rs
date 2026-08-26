@@ -14,7 +14,7 @@ use crate::splice;
 #[derive(Debug, Args)]
 pub struct ConnectCmd {
     /// The node id to dial.
-    pub node: String,
+    pub node: NodeId,
     /// The local port to listen on and forward to the peer.
     #[arg(long)]
     pub to: u16,
@@ -26,10 +26,9 @@ pub struct ConnectCmd {
 impl ConnectCmd {
     /// Listen locally and forward each accepted connection to the peer over one stream.
     pub async fn run<T: Transport, D: Discovery>(self, node: &Node<T, D>) -> eyre::Result<()> {
-        let peer: NodeId = self.node.parse()?;
-        let session = node.connect(peer).await?;
+        let session = node.connect(self.node).await?;
         let listener = TcpListener::bind(("127.0.0.1", self.to)).await?;
-        println!("forwarding 127.0.0.1:{} to {peer}", self.to);
+        println!("forwarding 127.0.0.1:{} to {}", self.to, self.node);
         let mut pipes = FuturesUnordered::new();
         loop {
             tokio::select! {
