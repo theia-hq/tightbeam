@@ -1,21 +1,25 @@
 use crate::protocol::{Request, Response};
 
 #[tokio::test]
-async fn request_roundtrips() {
-    let mut buf = Vec::new();
-    Request {
+async fn request_roundtrips_without_a_capability() {
+    let request = Request {
         service: "ssh".to_owned(),
-    }
-    .write(&mut buf)
-    .await
-    .unwrap();
-    let decoded = Request::read(&mut buf.as_slice()).await.unwrap();
-    assert_eq!(
-        decoded,
-        Request {
-            service: "ssh".to_owned()
-        }
-    );
+        capability: None,
+    };
+    let mut buf = Vec::new();
+    request.write(&mut buf).await.unwrap();
+    assert_eq!(Request::read(&mut buf.as_slice()).await.unwrap(), request);
+}
+
+#[tokio::test]
+async fn request_roundtrips_with_a_capability() {
+    let request = Request {
+        service: "ssh".to_owned(),
+        capability: Some("sheer:bf01abc.def".to_owned()),
+    };
+    let mut buf = Vec::new();
+    request.write(&mut buf).await.unwrap();
+    assert_eq!(Request::read(&mut buf.as_slice()).await.unwrap(), request);
 }
 
 #[tokio::test]

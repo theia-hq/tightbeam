@@ -2,6 +2,9 @@ use core::time::Duration;
 
 use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
+use nauthy::Identity;
+use tightbeam::connect::Target;
+use tightbeam::expose::GateMode;
 use tightbeam::{ConnectCmd, ExposeCmd};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -39,21 +42,26 @@ async fn tunnels_tcp_over_bifrost() {
             let exposer_id = exposer.node_id();
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
 
+            // The open gate ignores the identity, so any valid secret serves for these identity-path
+            // tests; the approved path is unused because the gate is not paired.
+            let identity = Identity::from_secret(&[0u8; 32]).unwrap();
+            let approved = std::env::temp_dir().join("tightbeam-tunnel-test-unused");
             tokio::task::spawn_local(async move {
                 ExposeCmd {
                     services: vec![echo_addr.to_string()],
+                    gate: GateMode::Open,
                     allow: Vec::new(),
-                    pair: false,
                 }
-                .run(&exposer)
+                .run(&exposer, identity, approved)
                 .await
                 .unwrap();
             });
             tokio::task::spawn_local(async move {
                 ConnectCmd {
-                    node: exposer_id,
+                    target: Target::Node(exposer_id),
                     to: local_port,
                     service: "default".to_string(),
+                    present: None,
                 }
                 .run(&consumer)
                 .await

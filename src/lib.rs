@@ -1,30 +1,37 @@
 //! tightbeam: private peer-to-peer tunnels over the bifrost overlay.
 //!
 //! `expose` forwards inbound overlay streams to a local TCP service; `connect` binds a peer's exposed
-//! service to a local port. Each proxied TCP connection rides one bifrost bidirectional stream. Who
-//! may connect is decided by [`nauthy`], the authorization gate.
+//! service to a local port. Each proxied TCP connection rides one bifrost bidirectional stream. Who may
+//! connect is decided by the [`nauthy`] crate's authorization gate: an allowlist, a paired set, or a
+//! presented capability. `share` and `attenuate` mint and narrow those capabilities.
 //!
 //! Concurrency uses `FuturesUnordered` + `select!` (structured concurrency on one task) rather than
 //! `tokio::spawn`, because the bifrost interface's futures are not `Send`-bounded. This keeps the tool
 //! generic over any transport; see DECISIONS.md for the trade-off.
 
 pub mod approve;
+pub mod attenuate;
+pub mod config;
 pub mod connect;
+pub mod duration;
 pub mod expose;
-pub mod nauthy;
+pub mod identity;
+pub mod share;
 
 mod protocol;
 
 #[cfg(test)]
-mod nauthy_tests;
+mod duration_tests;
 #[cfg(test)]
 mod protocol_tests;
 
 use tokio::io::{self, AsyncWriteExt as _};
 
 pub use crate::approve::ApproveCmd;
+pub use crate::attenuate::AttenuateCmd;
 pub use crate::connect::ConnectCmd;
 pub use crate::expose::ExposeCmd;
+pub use crate::share::ShareCmd;
 
 /// Copy bytes both ways between a local stream and a bifrost stream until both sides close.
 ///

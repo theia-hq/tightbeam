@@ -2,8 +2,9 @@
 
 use bifrost::NodeId;
 use clap::Args;
+use nauthy::Approvals;
 
-use crate::nauthy::Approvals;
+use crate::config::approved_path;
 
 /// Approve a peer key so it may connect in pairing mode.
 #[derive(Debug, Args)]
@@ -15,7 +16,7 @@ pub struct ApproveCmd {
 impl ApproveCmd {
     /// Add a peer to the persisted approved set.
     pub async fn run(self) -> eyre::Result<()> {
-        let mut approvals = Approvals::load().await?;
+        let mut approvals = Approvals::load(approved_path()?).await?;
         approvals.approve(self.node).await?;
         println!("approved {} ({})", self.node, approvals.path().display());
         Ok(())

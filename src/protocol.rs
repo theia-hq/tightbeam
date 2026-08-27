@@ -1,17 +1,22 @@
 //! tightbeam's stream protocol: a small, versioned preamble on each bifrost stream that selects a
-//! service and reports whether it was reached, before the transparent byte pipe begins. Pure framing;
-//! the payload after it is raw bytes (the point of a tunnel).
+//! service, optionally presents a capability, and reports whether it was reached, before the transparent
+//! byte pipe begins. Pure framing; the payload after it is raw bytes (the point of a tunnel).
 
 use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
 
-/// Magic + version prefixing a request; a foreign or mismatched-version stream is rejected.
-const MAGIC: [u8; 4] = *b"TB01";
+/// Magic + version prefixing a request; a foreign or mismatched-version stream is rejected. `TB02` adds
+/// an optional capability field after the service; a `TB01` peer that omitted it is no longer wire
+/// compatible, which is correct: the two ends of one tunnel are one release.
+const MAGIC: [u8; 4] = *b"TB02";
 
-/// A connector's opening frame: reach the named service.
+/// A connector's opening frame: reach the named service, optionally presenting a capability.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Request {
     /// The service to reach, as named in `expose`.
     pub service: String,
+    /// A presented capability link (`sheer:…`), when the host gates on capabilities. Absent when the
+    /// host gates on identity (open/strict/paired), where the proven `NodeId` is the whole story.
+    pub capability: Option<String>,
 }
 
 /// The host's reply, sent before any bytes are piped.
@@ -27,7 +32,8 @@ impl Request {
     /// Write the request to the stream.
     pub async fn write<W: io::AsyncWrite + Unpin>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(&MAGIC).await?;
-        write_str(writer, &self.service).await
+        write_str(writer, &self.service).await?;
+        write_opt(writer, self.capability.as_deref()).await
     }
 
     /// Read a request from the stream.
@@ -39,6 +45,7 @@ impl Request {
         }
         Ok(Request {
             service: read_str(reader).await?,
+            capability: read_opt(reader).await?,
         })
     }
 }
@@ -66,6 +73,33 @@ impl Response {
                 "unknown response tag {other:#04x}"
             ))),
         }
+    }
+}
+
+/// Write an optional string as a presence byte followed by the string when present.
+async fn write_opt<W: io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    value: Option<&str>,
+) -> io::Result<()> {
+    match value {
+        Some(value) => {
+            writer.write_all(&[1]).await?;
+            write_str(writer, value).await
+        }
+        None => writer.write_all(&[0]).await,
+    }
+}
+
+/// Read an optional string written by [`write_opt`].
+async fn read_opt<R: io::AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<String>> {
+    let mut present = [0u8; 1];
+    reader.read_exact(&mut present).await?;
+    match present[0] {
+        0 => Ok(None),
+        1 => Ok(Some(read_str(reader).await?)),
+        other => Err(io::Error::other(format!(
+            "unknown presence tag {other:#04x}"
+        ))),
     }
 }
 

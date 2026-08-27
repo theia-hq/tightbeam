@@ -1,16 +1,17 @@
 //! `tightbeam expose`: publish local services under this node's key and forward inbound streams.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bifrost::{Discovery, Node, NodeId, Session, Transport};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
+use nauthy::{Approvals, Cap, Decision, Gate, Identity, Refusal, Service};
 use tokio::io;
 use tokio::net::TcpStream;
 
-use crate::nauthy::{Approvals, Gate, parse_allowed};
 use crate::protocol::{Request, Response};
 use crate::splice;
 
@@ -20,18 +21,40 @@ pub struct ExposeCmd {
     /// Services to expose as `name=addr` (e.g. `ssh=127.0.0.1:22`), or a bare `addr` for `default`.
     #[arg(required = true)]
     pub services: Vec<String>,
-    /// Only allow these node ids to connect (repeatable). Overrides `--pair`.
+    /// How to authorize connectors. `open` (any peer), `strict` (the `--allow` list), `paired`
+    /// (approved peers), or `cap` (a presented capability that verifies against this node's identity).
+    #[arg(long, value_enum, default_value_t = GateMode::Open)]
+    pub gate: GateMode,
+    /// Only allow these node ids to connect (repeatable). Used by `--gate strict`.
     #[arg(long = "allow")]
     pub allow: Vec<String>,
-    /// Pairing mode: permit only approved peers, and print unknown attempts to approve later.
-    #[arg(long)]
-    pub pair: bool,
+}
+
+/// How `expose` authorizes an inbound connector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum GateMode {
+    /// Permit any peer that reached the key.
+    Open,
+    /// Permit only the node ids passed with `--allow`.
+    Strict,
+    /// Permit only peers in the persisted approved set (approve with `tightbeam approve`).
+    Paired,
+    /// Permit only peers that present a capability rooted at this node's identity.
+    Cap,
 }
 
 impl ExposeCmd {
     /// Accept overlay sessions from permitted peers and forward each inbound stream to the service.
-    pub async fn run<T: Transport, D: Discovery>(self, node: &Node<T, D>) -> eyre::Result<()> {
-        let gate = self.gate().await?;
+    ///
+    /// `identity` is the exposer's cap-signing identity, rooted at the same secret bifrost bound the node
+    /// under, so a `cap` gate verifies presented tokens against the key peers dial.
+    pub async fn run<T: Transport, D: Discovery>(
+        self,
+        node: &Node<T, D>,
+        identity: Identity,
+        approved_path: PathBuf,
+    ) -> eyre::Result<()> {
+        let gate = Arc::new(self.gate(identity, approved_path).await?);
         let services = Arc::new(parse_services(&self.services)?);
         println!(
             "exposing {} service(s) as {}",
@@ -51,12 +74,11 @@ impl ExposeCmd {
                             continue;
                         }
                     };
-                    let peer = session.peer();
-                    if !gate.permits(peer) {
-                        self.reject(peer);
-                        continue;
-                    }
-                    sessions.push(serve_session(session, Arc::clone(&services)));
+                    sessions.push(serve_session(
+                        session,
+                        Arc::clone(&gate),
+                        Arc::clone(&services),
+                    ));
                 }
                 Some(result) = sessions.next(), if !sessions.is_empty() => {
                     if let Err(error) = result {
@@ -67,38 +89,30 @@ impl ExposeCmd {
         }
     }
 
-    /// Build the authorization gate from the flags: `--allow` (strict) wins, then `--pair`, else open.
-    async fn gate(&self) -> eyre::Result<Gate> {
-        if !self.allow.is_empty() {
-            Ok(Gate::Strict(parse_allowed(&self.allow)?))
-        } else if self.pair {
-            Ok(Gate::Paired(Approvals::load().await?))
-        } else {
-            Ok(Gate::Open)
-        }
-    }
-
-    /// Report a rejected peer: a reviewable pending line in pairing mode, otherwise a warning.
-    fn reject(&self, peer: NodeId) {
-        if self.pair {
-            println!("pending: {peer} tried to connect (approve: tightbeam approve {peer})");
-        } else {
-            tracing::warn!(%peer, "rejected: not permitted");
+    /// Build the authorization gate from the flags.
+    async fn gate(&self, identity: Identity, approved_path: PathBuf) -> eyre::Result<Gate> {
+        match self.gate {
+            GateMode::Open => Ok(Gate::Open),
+            GateMode::Strict => Ok(Gate::Strict(parse_allowed(&self.allow)?)),
+            GateMode::Paired => Ok(Gate::Paired(Approvals::load(approved_path).await?)),
+            GateMode::Cap => Ok(Gate::Cap(identity)),
         }
     }
 }
 
-/// Serve one accepted session: handle each inbound stream's service request.
+/// Serve one accepted session: handle each inbound stream's service request under the gate.
 async fn serve_session<S: Session>(
     session: S,
+    gate: Arc<Gate>,
     services: Arc<HashMap<String, String>>,
 ) -> eyre::Result<()> {
+    let peer = session.peer();
     let mut pipes = FuturesUnordered::new();
     loop {
         tokio::select! {
             accepted = session.accept_bi() => {
                 let (writer, reader) = accepted?;
-                pipes.push(serve_request(writer, reader, Arc::clone(&services)));
+                pipes.push(serve_request(peer, writer, reader, Arc::clone(&gate), Arc::clone(&services)));
             }
             Some(result) = pipes.next(), if !pipes.is_empty() => {
                 if let Err(error) = result {
@@ -109,10 +123,16 @@ async fn serve_session<S: Session>(
     }
 }
 
-/// Serve one inbound stream: read the requested service, reply, and pipe on success.
+/// Serve one inbound stream: read the request, apply the gate, reply, and pipe on success.
+///
+/// The gate decides per stream, not per session, because the requested service (and any presented
+/// capability) is a property of the stream: one session may carry several service requests, each gated on
+/// its own merits.
 async fn serve_request<W, R>(
+    peer: NodeId,
     mut writer: W,
     mut reader: R,
+    gate: Arc<Gate>,
     services: Arc<HashMap<String, String>>,
 ) -> eyre::Result<()>
 where
@@ -120,17 +140,59 @@ where
     R: io::AsyncRead + Unpin,
 {
     let request = Request::read(&mut reader).await?;
-    match services.get(&request.service) {
+    let Ok(service) = request.service.parse::<Service>() else {
+        let message = format!("invalid service name {:?}", request.service);
+        return Response::Error(message)
+            .write(&mut writer)
+            .await
+            .map_err(Into::into);
+    };
+
+    match admit(&gate, peer, request.capability.as_deref(), &service) {
+        Ok(()) => {}
+        Err(refusal) => {
+            tracing::warn!(%peer, service = %service, %refusal, "refused");
+            return Response::Error(refusal)
+                .write(&mut writer)
+                .await
+                .map_err(Into::into);
+        }
+    }
+
+    match services.get(service.as_str()) {
         Some(addr) => {
             Response::Ok.write(&mut writer).await?;
             dial_and_splice(addr, writer, reader).await?;
         }
         None => {
-            let message = format!("unknown service {:?}", request.service);
+            let message = format!("unknown service {:?}", service.as_str());
             Response::Error(message).write(&mut writer).await?;
         }
     }
     Ok(())
+}
+
+/// Apply the gate to a request, mapping a refusal to a peer-facing reason string.
+fn admit(
+    gate: &Gate,
+    peer: NodeId,
+    capability: Option<&str>,
+    service: &Service,
+) -> Result<(), String> {
+    // Parse a presented capability at the edge; a malformed token is a refusal, not a hard error, so the
+    // connector gets a clean "not permitted" rather than a dropped stream.
+    let cap = match capability.map(Cap::parse).transpose() {
+        Ok(cap) => cap,
+        Err(_) => return Err("malformed capability".to_owned()),
+    };
+    match gate.admit(peer, cap.as_ref(), service) {
+        Decision::Admit => Ok(()),
+        Decision::Refuse(Refusal::Missing) => Err("this service requires a capability".to_owned()),
+        Decision::Refuse(Refusal::NotGranted) => {
+            Err("capability does not grant this service".to_owned())
+        }
+        Decision::Refuse(Refusal::NotPermitted) => Err("not permitted".to_owned()),
+    }
 }
 
 /// Parse `name=addr` service entries; a bare `addr` becomes the `default` service.
@@ -141,9 +203,19 @@ fn parse_services(entries: &[String]) -> eyre::Result<HashMap<String, String>> {
             Some((name, addr)) => (name.to_owned(), addr.to_owned()),
             None => ("default".to_owned(), String::clone(entry)),
         };
+        // Validate the name through the same domain type the wire uses, so an exposed name and a
+        // requested name are compared as the same kind of thing.
+        name.parse::<Service>()?;
         services.insert(name, addr);
     }
     Ok(services)
+}
+
+/// Parse node ids into an allowlist set.
+fn parse_allowed(ids: &[String]) -> eyre::Result<std::collections::HashSet<NodeId>> {
+    ids.iter()
+        .map(|id| id.parse::<NodeId>().map_err(Into::into))
+        .collect()
 }
 
 /// Dial a service target (a `unix:<path>` socket or a `host:port`) and pipe it to the bifrost stream.
