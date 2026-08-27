@@ -20,10 +20,13 @@ pub mod identity;
 pub mod share;
 pub mod tree;
 
+mod fetch;
 mod protocol;
 
 #[cfg(test)]
 mod duration_tests;
+#[cfg(test)]
+mod fetch_tests;
 #[cfg(test)]
 mod http_tests;
 #[cfg(test)]

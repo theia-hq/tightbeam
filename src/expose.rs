@@ -171,6 +171,12 @@ where
     }
 
     match services.get(service.as_str()) {
+        // `fetch:` is the HTTP egress target: rather than splice to a fixed local socket, the node acts
+        // as an HTTP client and streams an origin response back (see `crate::fetch`).
+        Some(addr) if addr == "fetch:" => {
+            Response::Ok.write(&mut writer).await?;
+            crate::fetch::serve_fetch(&mut writer, &mut reader).await?;
+        }
         Some(addr) => {
             Response::Ok.write(&mut writer).await?;
             dial_and_splice(addr, writer, reader).await?;
