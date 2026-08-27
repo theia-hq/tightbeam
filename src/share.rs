@@ -17,8 +17,7 @@ pub struct ShareCmd {
     /// How long the link is valid, e.g. `2h`, `30m`, `90s`. Short-expiry is the v1 revocation story.
     #[arg(long, default_value = "1h")]
     pub expires: Lifetime,
-    /// Leave the link open to further attenuation and delegation. By default a link is sealed, so its
-    /// recipient may use it but not narrow-and-re-share it; `--delegable` lets them hand a tighter copy on.
+    /// allow the holder to narrow and re-share the link
     #[arg(long)]
     pub delegable: bool,
 }

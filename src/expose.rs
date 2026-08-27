@@ -18,8 +18,8 @@ use crate::splice;
 /// Expose a local service to peers who hold this node's key.
 #[derive(Debug, Args)]
 pub struct ExposeCmd {
-    /// Services to expose as `name=addr` (e.g. `ssh=127.0.0.1:22`), or a bare `addr` for `default`.
-    #[arg(required = true)]
+    /// expose local services as `name=addr` (bare `addr` = `default`)
+    #[arg(required = true, value_name = "name=addr")]
     pub services: Vec<String>,
     /// How to authorize connectors. `open` (any peer), `strict` (the `--allow` list), `paired`
     /// (approved peers), or `cap` (a presented capability that verifies against this node's identity).
@@ -56,11 +56,14 @@ impl ExposeCmd {
     ) -> eyre::Result<()> {
         let gate = Arc::new(self.gate(identity, approved_path).await?);
         let services = Arc::new(parse_services(&self.services)?);
+        println!("tightbeam ready. peers can reach these services at:\n");
         println!(
-            "exposing {} service(s) as {}",
-            services.len(),
+            "    {}                     (share this key, or mint a link with `tightbeam share`)\n",
             node.node_id()
         );
+        let mut names: Vec<&str> = services.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        println!("exposing {}. press ctrl-c to stop.", names.join(", "));
         let mut sessions = FuturesUnordered::new();
         loop {
             tokio::select! {

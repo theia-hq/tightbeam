@@ -1,26 +1,32 @@
-//! tightbeam: private peer-to-peer tunnels over the bifrost overlay.
+//! tightbeam: reach a service on a machine that has no public IP, addressed by its public key.
 //!
-//! `tightbeam expose <local-addr>` publishes a local service under this node's key;
-//! `tightbeam connect <node-id|sheer-link> --to <port>` binds that service to a local port on another
-//! machine; `tightbeam approve <node-id>` permits a peer in pairing mode; `tightbeam share <service>`
-//! mints a `sheer:` capability link and `tightbeam attenuate <link>` narrows one offline.
+//! `tightbeam expose <target>...` publishes local services (a `host:port` or a `unix:<path>`, named
+//! `name=target` or bare for the `default` service) under this machine's key. `tightbeam connect
+//! <node-id|sheer-link> --to <port> [--service <name>]` reaches an exposed service from another machine
+//! and binds it to a local port. Peer to peer, with nothing in between; `ssh -L` shaped, but you address
+//! the far machine by its key, not an IP.
+//!
+//! Who may connect is set by a gate on `expose`: `--gate open` (anyone who reaches the key), `strict`
+//! with an `--allow <node-id>` allowlist, `paired` (approve peers as they arrive, `tightbeam approve
+//! <node-id>`), or `cap` (a presented capability token). A capability is a signed, expiring link rooted
+//! at this machine's own key: `tightbeam share <service>` mints one, `tightbeam attenuate <link>` narrows
+//! one offline, and a holder connects with the link directly. The identity is always persisted (it is
+//! both the address peers dial and the root a share-link is signed under): `--key` or `TIGHTBEAM_KEY`.
 
 use std::path::PathBuf;
 
 use bifrost::{NoDiscovery, Node};
 use bifrost_iroh::Endpoint;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use tightbeam::config::approved_path;
 use tightbeam::identity::{self, Secret};
-use tightbeam::{ApproveCmd, AttenuateCmd, ConnectCmd, ExposeCmd, ShareCmd};
+use tightbeam::{ApproveCmd, AttenuateCmd, ConnectCmd, ExposeCmd, ShareCmd, TreeCmd};
 
-/// Private peer-to-peer tunnels over the bifrost overlay.
+/// Reach a service on another machine by its public key, no public IP needed.
 #[derive(Debug, Parser)]
 #[command(name = "tightbeam", version, about)]
 struct Cli {
-    /// Pin this node to a persisted identity at the given file, creating it if absent. Without it, the
-    /// default `~/.config/tightbeam/identity.key` (or `TIGHTBEAM_KEY`) is used. The identity is both the
-    /// address peers dial and the root a `share` link is signed under, so it is always persisted.
+    /// pin a persisted identity file [env: TIGHTBEAM_KEY]
     #[arg(long = "key", env = "TIGHTBEAM_KEY", global = true)]
     key: Option<PathBuf>,
     #[command(subcommand)]
@@ -39,6 +45,8 @@ enum Command {
     Share(ShareCmd),
     /// Narrow an existing `sheer:` link offline before handing it on.
     Attenuate(AttenuateCmd),
+    /// Print this command tree (spec vs binary).
+    Tree(TreeCmd),
 }
 
 #[tokio::main]
@@ -49,9 +57,11 @@ async fn main() -> eyre::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        // Offline verbs: no node, no network. `attenuate` needs no identity at all; `approve` grows the
-        // local approved set.
+        // Local verbs: no node, no network, no identity. `tree` is pure introspection over clap's own
+        // model; `attenuate` narrows a link offline.
+        Command::Tree(cmd) => cmd.run(&Cli::command()),
         Command::Attenuate(cmd) => cmd.run(),
+        // `approve` grows the local approved set; still no node.
         Command::Approve(cmd) => cmd.run().await,
         // `share` needs the signing identity but no bound node: minting is offline.
         Command::Share(cmd) => {

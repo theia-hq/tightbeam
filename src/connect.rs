@@ -16,19 +16,17 @@ use crate::splice;
 /// Reach a peer's exposed service and bind it to a local port.
 #[derive(Debug, Args)]
 pub struct ConnectCmd {
-    /// Who to reach: a raw node id, or a `sheer:` capability link (which carries the node to dial and the
-    /// token to present).
+    /// who to reach: a raw node id, or a `sheer:` capability link
+    #[arg(value_name = "peer")]
     pub target: Target,
-    /// The local port to listen on and forward to the peer.
-    #[arg(long)]
+    /// local port to forward to the peer
+    #[arg(long, value_name = "port")]
     pub to: u16,
-    /// Which exposed service to reach. With a capability link, the host verifies the token grants this
-    /// exact service, so it must match what the link was minted or narrowed for.
+    /// which exposed service to reach
     #[arg(long, default_value = "default")]
     pub service: String,
-    /// Present this capability link while dialing a raw node id. Rarely needed: a `sheer:` target already
-    /// carries its token. Use it when you hold a token but were also given the node id directly.
-    #[arg(long)]
+    /// present a capability link alongside a raw node id
+    #[arg(long, value_name = "link")]
     pub present: Option<String>,
 }
 

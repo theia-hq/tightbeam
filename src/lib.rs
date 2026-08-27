@@ -17,6 +17,7 @@ pub mod duration;
 pub mod expose;
 pub mod identity;
 pub mod share;
+pub mod tree;
 
 mod protocol;
 
@@ -32,6 +33,7 @@ pub use crate::attenuate::AttenuateCmd;
 pub use crate::connect::ConnectCmd;
 pub use crate::expose::ExposeCmd;
 pub use crate::share::ShareCmd;
+pub use crate::tree::TreeCmd;
 
 /// Copy bytes both ways between a local stream and a bifrost stream until both sides close.
 ///
