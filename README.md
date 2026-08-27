@@ -64,6 +64,38 @@ without the host's involvement. Drop `--delegable` to seal a link so its recipie
 re-share it. Short expiry is the v1 revocation story; there is no server to ask. See
 [DEMO-WEDGE.md](DEMO-WEDGE.md) for a full run over iroh.
 
+## ssh over the overlay
+
+ssh to a machine with no public IP, by its key. Expose its sshd as a service on the host, then point
+ssh's `ProxyCommand` at `connect --stdio`: tightbeam pipes the overlay stream over ssh's stdin/stdout,
+so ssh talks to the far sshd as if it were local.
+
+On the host, expose sshd:
+
+```sh
+tightbeam expose ssh=127.0.0.1:22
+```
+
+`--stdio` pipes the service over stdin/stdout instead of binding a local port, which is exactly what an
+ssh `ProxyCommand` wants. You cannot type `ssh alice/desk` directly: `/` is not legal in a hostname (and
+it is theia's device separator), so ssh cannot parse it. Give ssh a legal alias in `~/.ssh/config`
+instead:
+
+```
+Host alice-desk
+    ProxyCommand tightbeam connect <peer> --service ssh --stdio
+```
+
+Then:
+
+```sh
+ssh alice-desk
+```
+
+`<peer>` is the host's node id, or a `sheer:` capability link (`tightbeam share ssh …`). With a link,
+auth composes for free: the link names the node to dial and carries the token, so a link that reaches
+only ssh and expires in an hour becomes an ssh `ProxyCommand` with nothing else to configure.
+
 ## Compose an overlay exit
 
 tightbeam does not ship a proxy; it tunnels any existing one. To route traffic out through a remote
@@ -77,6 +109,30 @@ tightbeam expose 127.0.0.1:1080
 # on your machine
 tightbeam connect <exit-node-id> --to 1080   # then point apps at socks5://127.0.0.1:1080
 ```
+
+## Where this is heading: names you can type anywhere
+
+> Not shipped. This is the target, not what runs today. The `ProxyCommand` alias above is what works
+> now.
+
+The alias works, but you still edit `~/.ssh/config`, and only ssh benefits. The goal is a real name you
+type into any app and it resolves:
+
+```sh
+ssh desk.alice
+ssh desk.alice.<user>.theia.net
+curl http://desk.alice
+```
+
+No ssh-config, no `ProxyCommand`. This is the Tailscale MagicDNS model: a local DNS resolver answers the
+overlay's names, and a DNS search domain lets you type the short form (`desk.alice`) instead of the full
+one. `desk.alice.<user>.theia.net` is a right-to-left reading of the internal `alice/desk` address, so
+`/` never has to appear in a hostname.
+
+This needs a background daemon, because a resolver holds OS-level DNS state and a name-to-peer map that
+must outlive any one command. That is why the `ProxyCommand` recipe ships first and this is roadmapped
+(P10). The suffix has to be safe: a domain we own (`theia.net`) or the reserved-for-private-use
+`.internal`. Not `.id`, which is a real country-code TLD (Indonesia), not ours to take.
 
 ## Things to know
 
