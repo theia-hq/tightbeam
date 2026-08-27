@@ -59,7 +59,8 @@ async fn tunnels_to_a_unix_socket() {
             tokio::task::spawn_local(async move {
                 ConnectCmd {
                     target: Target::Node(exposer_id),
-                    to: local_port,
+                    to: Some(local_port),
+                    stdio: false,
                     service: "default".to_string(),
                     present: None,
                 }

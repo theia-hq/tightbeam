@@ -3,7 +3,7 @@
 use core::str::FromStr;
 
 use bifrost::{Discovery, Node, NodeId, Session, Transport};
-use clap::Args;
+use clap::{ArgGroup, Args};
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
 use nauthy::{Cap, SCHEME};
@@ -11,17 +11,21 @@ use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::protocol::{Request, Response};
-use crate::splice;
+use crate::{splice, splice_halves};
 
-/// Reach a peer's exposed service and bind it to a local port.
+/// Reach a peer's exposed service and bind it to a local port, or pipe it over stdin/stdout.
 #[derive(Debug, Args)]
+#[command(group = ArgGroup::new("dest").required(true).args(["to", "stdio"]))]
 pub struct ConnectCmd {
     /// who to reach: a raw node id, or a `sheer:` capability link
     #[arg(value_name = "peer")]
     pub target: Target,
     /// local port to forward to the peer
     #[arg(long, value_name = "port")]
-    pub to: u16,
+    pub to: Option<u16>,
+    /// pipe the peer's service over stdin/stdout instead of a local port (for ssh ProxyCommand)
+    #[arg(long)]
+    pub stdio: bool,
     /// which exposed service to reach
     #[arg(long, default_value = "default")]
     pub service: String,
@@ -59,47 +63,15 @@ impl FromStr for Target {
 }
 
 impl ConnectCmd {
-    /// Listen locally and forward each accepted connection to the peer over one stream.
+    /// Reach the peer, then either bind a local port and forward each accepted connection, or (`--stdio`)
+    /// pipe the single service stream against this process's stdin/stdout, the ssh `ProxyCommand` shape.
     pub async fn run<T: Transport, D: Discovery>(self, node: &Node<T, D>) -> eyre::Result<()> {
         let plan = self.plan()?;
         let session = node.connect(plan.dial).await?;
-        let listener = TcpListener::bind(("127.0.0.1", self.to)).await?;
-        println!(
-            "forwarding 127.0.0.1:{} to {} ({})",
-            self.to, plan.dial, plan.service
-        );
-        let mut pipes = FuturesUnordered::new();
-        loop {
-            tokio::select! {
-                accepted = listener.accept() => {
-                    // One local accept or stream-open failing must not drop the pipes already in
-                    // flight: log the transient error and keep the local listener up.
-                    let (tcp, _) = match accepted {
-                        Ok(accepted) => accepted,
-                        Err(error) => {
-                            tracing::warn!(%error, "local accept failed; still listening");
-                            continue;
-                        }
-                    };
-                    let (writer, reader) = match session.open_bi().await {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            tracing::warn!(%error, "opening a stream to the peer failed; still listening");
-                            continue;
-                        }
-                    };
-                    let request = Request {
-                        service: String::clone(&plan.service),
-                        capability: plan.capability.clone(),
-                    };
-                    pipes.push(request_service(request, tcp, writer, reader));
-                }
-                Some(result) = pipes.next(), if !pipes.is_empty() => {
-                    if let Err(error) = result {
-                        tracing::warn!(%error, "pipe ended");
-                    }
-                }
-            }
+        // The arg group makes exactly one of `--to`/`--stdio` present, so a missing port means stdio.
+        match self.to {
+            Some(port) => serve_port(&session, &plan, port).await,
+            None => stdio_pipe(&session, &plan).await,
         }
     }
 
@@ -134,6 +106,62 @@ struct Plan {
     capability: Option<String>,
 }
 
+impl Plan {
+    /// The opening request this plan sends on each stream: the service to reach and any token.
+    fn request(&self) -> Request {
+        Request {
+            service: String::clone(&self.service),
+            capability: self.capability.clone(),
+        }
+    }
+}
+
+/// Bind a local port and forward each accepted TCP connection to the peer over its own stream.
+async fn serve_port<S: Session>(session: &S, plan: &Plan, port: u16) -> eyre::Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+    println!(
+        "forwarding 127.0.0.1:{port} to {} ({})",
+        plan.dial, plan.service
+    );
+    let mut pipes = FuturesUnordered::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                // One local accept or stream-open failing must not drop the pipes already in flight:
+                // log the transient error and keep the local listener up.
+                let (tcp, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        tracing::warn!(%error, "local accept failed; still listening");
+                        continue;
+                    }
+                };
+                let (writer, reader) = match session.open_bi().await {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        tracing::warn!(%error, "opening a stream to the peer failed; still listening");
+                        continue;
+                    }
+                };
+                pipes.push(request_service(plan.request(), tcp, writer, reader));
+            }
+            Some(result) = pipes.next(), if !pipes.is_empty() => {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "pipe ended");
+                }
+            }
+        }
+    }
+}
+
+/// Reach the service over one stream and pipe it against this process's stdin/stdout: the ssh
+/// `ProxyCommand` shape, where ssh speaks its protocol over our stdio and we carry it to the peer. No
+/// stdout prints here, since stdout IS the data channel.
+async fn stdio_pipe<S: Session>(session: &S, plan: &Plan) -> eyre::Result<()> {
+    let (writer, reader) = session.open_bi().await?;
+    request_stdio(plan.request(), writer, reader).await
+}
+
 /// Open a stream to a service: send the request, and if the host accepts, pipe the connection.
 async fn request_service<W, R>(
     request: Request,
@@ -148,6 +176,21 @@ where
     request.write(&mut writer).await?;
     match Response::read(&mut reader).await? {
         Response::Ok => splice(tcp, writer, reader).await?,
+        Response::Error(message) => eyre::bail!("service refused: {message}"),
+    }
+    Ok(())
+}
+
+/// Open a service and, if the host accepts, pipe it against this process's stdin/stdout (the `--stdio`
+/// path). Same handshake as [`request_service`], but the local ends are the process's own std streams.
+async fn request_stdio<W, R>(request: Request, mut writer: W, mut reader: R) -> eyre::Result<()>
+where
+    W: io::AsyncWrite + Unpin,
+    R: io::AsyncRead + Unpin,
+{
+    request.write(&mut writer).await?;
+    match Response::read(&mut reader).await? {
+        Response::Ok => splice_halves(io::stdin(), io::stdout(), writer, reader).await?,
         Response::Error(message) => eyre::bail!("service refused: {message}"),
     }
     Ok(())

@@ -113,7 +113,8 @@ async fn connect_and_echo(
     tokio::task::spawn_local(async move {
         let _ = ConnectCmd {
             target: Target::Node(exposer),
-            to: port,
+            to: Some(port),
+            stdio: false,
             service,
             present,
         }
