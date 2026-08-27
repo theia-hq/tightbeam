@@ -21,7 +21,7 @@ pub mod share;
 pub mod tree;
 
 mod fetch;
-mod protocol;
+pub mod protocol;
 
 #[cfg(test)]
 mod duration_tests;
