@@ -103,14 +103,17 @@ async fn read_opt<R: io::AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option
     }
 }
 
-async fn write_str<W: io::AsyncWrite + Unpin>(writer: &mut W, value: &str) -> io::Result<()> {
+pub(crate) async fn write_str<W: io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    value: &str,
+) -> io::Result<()> {
     let bytes = value.as_bytes();
     let len = u16::try_from(bytes.len()).map_err(|_| io::Error::other("string too long"))?;
     writer.write_all(&len.to_be_bytes()).await?;
     writer.write_all(bytes).await
 }
 
-async fn read_str<R: io::AsyncRead + Unpin>(reader: &mut R) -> io::Result<String> {
+pub(crate) async fn read_str<R: io::AsyncRead + Unpin>(reader: &mut R) -> io::Result<String> {
     let mut len = [0u8; 2];
     reader.read_exact(&mut len).await?;
     let mut bytes = vec![0u8; u16::from_be_bytes(len) as usize];

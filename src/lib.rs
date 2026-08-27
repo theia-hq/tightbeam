@@ -15,6 +15,7 @@ pub mod config;
 pub mod connect;
 pub mod duration;
 pub mod expose;
+pub mod http;
 pub mod identity;
 pub mod share;
 pub mod tree;
@@ -23,6 +24,8 @@ mod protocol;
 
 #[cfg(test)]
 mod duration_tests;
+#[cfg(test)]
+mod http_tests;
 #[cfg(test)]
 mod protocol_tests;
 
