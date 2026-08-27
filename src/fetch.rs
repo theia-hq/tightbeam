@@ -16,11 +16,14 @@ where
     R: io::AsyncRead + Unpin,
 {
     let request = FetchRequest::read(reader).await?;
-    match fetch_origin(&request).await {
-        Ok(response) => stream_response(writer, response).await?,
-        Err(message) => FetchResponse::Error(message).write(writer).await?,
-    }
-    writer.shutdown().await
+    let served = match fetch_origin(&request).await {
+        Ok(response) => stream_response(writer, response).await,
+        Err(message) => FetchResponse::Error(message).write(writer).await,
+    };
+    // Always close the write half, even if the body errored mid-stream, so the requester sees a clean
+    // EOF and can distinguish a complete response from a truncated one.
+    let closed = writer.shutdown().await;
+    served.and(closed)
 }
 
 /// Perform the origin request. Redirects are forwarded to the requester verbatim (not followed here), so
