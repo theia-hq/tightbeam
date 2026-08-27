@@ -80,8 +80,8 @@ tightbeam connect <exit-node-id> --to 1080   # then point apps at socks5://127.0
 
 ## Things to know
 
-- Built on `bifrost` (reach): each proxied connection is one bidirectional stream. It is transport-blind
-  and rides any bifrost transport.
+- Built on [`bifrost`](https://github.com/theia-hq/bifrost) (reach): each proxied connection is one
+  bidirectional stream. It is transport-blind and rides any bifrost transport.
 - Only a peer holding the key can dial, and authorization (allowlist / pairing / capability) is enforced
   by the [`nauthy`](https://github.com/theia-hq/nauthy) crate: the first two on the identity the handshake
   proves, the capability gate on a presented `sheer:` token.
