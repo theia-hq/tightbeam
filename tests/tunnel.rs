@@ -51,6 +51,7 @@ async fn tunnels_tcp_over_bifrost() {
                     services: vec![echo_addr.to_string()],
                     gate: GateMode::Open,
                     allow: Vec::new(),
+                    quiet: false,
                 }
                 .run(&exposer, identity, approved)
                 .await

@@ -28,6 +28,10 @@ pub struct ExposeCmd {
     /// Only allow these node ids to connect (repeatable). Used by `--gate strict`.
     #[arg(long = "allow")]
     pub allow: Vec<String>,
+    /// Suppress the readiness banner (the node id and service list). For unattended/CI use where the key
+    /// must never land in a log; the tunnel still runs.
+    #[arg(long)]
+    pub quiet: bool,
 }
 
 /// How `expose` authorizes an inbound connector.
@@ -56,14 +60,18 @@ impl ExposeCmd {
     ) -> eyre::Result<()> {
         let gate = Arc::new(self.gate(identity, approved_path).await?);
         let services = Arc::new(parse_services(&self.services)?);
-        println!("tightbeam ready. peers can reach these services at:\n");
-        println!(
-            "    {}                     (share this key, or mint a link with `tightbeam share`)\n",
-            node.node_id()
-        );
-        let mut names: Vec<&str> = services.keys().map(String::as_str).collect();
-        names.sort_unstable();
-        println!("exposing {}. press ctrl-c to stop.", names.join(", "));
+        // The readiness banner names the node id; `--quiet` withholds it so a key never lands in an
+        // unattended log. The tunnel is unaffected either way.
+        if !self.quiet {
+            println!("tightbeam ready. peers can reach these services at:\n");
+            println!(
+                "    {}                     (share this key, or mint a link with `tightbeam share`)\n",
+                node.node_id()
+            );
+            let mut names: Vec<&str> = services.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            println!("exposing {}. press ctrl-c to stop.", names.join(", "));
+        }
         let mut sessions = FuturesUnordered::new();
         loop {
             tokio::select! {
