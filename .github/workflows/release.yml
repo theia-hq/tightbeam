@@ -29,13 +29,19 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-        with: { path: tightbeam }
+        with:
+          path: tightbeam
       - uses: actions/checkout@v4
-        with: { repository: theia-hq/bifrost, path: bifrost }
+        with:
+          repository: theia-hq/bifrost
+          path: bifrost
       - uses: actions/checkout@v4
-        with: { repository: theia-hq/nauthy, path: nauthy }
+        with:
+          repository: theia-hq/nauthy
+          path: nauthy
       - uses: dtolnay/rust-toolchain@stable
-        with: { targets: ${{ matrix.target }} }
+        with:
+          targets: ${{ matrix.target }}
       - name: build
         working-directory: tightbeam
         run: cargo build --release -p tightbeam --target ${{ matrix.target }}
