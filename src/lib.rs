@@ -17,6 +17,7 @@ pub mod duration;
 pub mod expose;
 pub mod http;
 pub mod identity;
+pub mod peer;
 pub mod share;
 pub mod tree;
 

@@ -15,11 +15,12 @@
 
 use std::path::PathBuf;
 
-use bifrost::{NoDiscovery, Node};
+use bifrost::Node;
 use bifrost_iroh::Endpoint;
 use clap::{CommandFactory, Parser, Subcommand};
 use tightbeam::config::approved_path;
 use tightbeam::identity::{self, Secret};
+use tightbeam::peer::{Discovery, Peer};
 use tightbeam::{ApproveCmd, AttenuateCmd, ConnectCmd, ExposeCmd, ShareCmd, TreeCmd};
 
 /// Reach a service on another machine by its public key, no public IP needed.
@@ -29,6 +30,9 @@ struct Cli {
     /// pin a persisted identity file [env: TIGHTBEAM_KEY]
     #[arg(long = "key", env = "TIGHTBEAM_KEY", global = true)]
     key: Option<PathBuf>,
+    /// direct address hint for a peer, `<key>=<addr>` (repeatable); reaches it directly, without n0
+    #[arg(long, value_name = "key=addr", global = true)]
+    peer: Vec<Peer>,
     #[command(subcommand)]
     command: Command,
 }
@@ -73,12 +77,12 @@ async fn main() -> eyre::Result<()> {
         Command::Expose(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
             let cap_identity = secret.cap_identity()?;
-            let node = bind_node(secret).await?;
+            let node = bind_node(secret, cli.peer).await?;
             cmd.run(&node, cap_identity, approved_path()?).await
         }
         Command::Connect(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
-            let node = bind_node(secret).await?;
+            let node = bind_node(secret, cli.peer).await?;
             cmd.run(&node).await
         }
     }
@@ -87,7 +91,10 @@ async fn main() -> eyre::Result<()> {
 /// Bind the overlay node under the persisted secret. The one place a concrete transport is named;
 /// everything else speaks `bifrost`. Binding under the same secret the cap identity roots at is what
 /// makes a minted cap verify against the identity peers dial.
-async fn bind_node(secret: Secret) -> eyre::Result<Node<Endpoint, NoDiscovery>> {
+async fn bind_node(secret: Secret, peers: Vec<Peer>) -> eyre::Result<Node<Endpoint, Discovery>> {
     let endpoint = Endpoint::bind_with_secret(secret.into_bytes()).await?;
-    Ok(Node::new(endpoint, NoDiscovery))
+    // Compose local discovery (--peer hints + LAN mDNS) so a nearby peer is reached directly; iroh keeps
+    // n0 as the fallback for a remote peer with no local hint.
+    let discovery = Peer::discovery(&endpoint, peers);
+    Ok(Node::new(endpoint, discovery))
 }
