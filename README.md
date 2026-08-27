@@ -4,6 +4,9 @@ Reach a service on a machine with no public IP: no port forwarding, no VPN, no c
 local service by its public key on one machine, reach it as a local port on another, peer to peer with
 nothing in between. `ssh -L` shaped, but pubkey-addressed.
 
+Powered by [bifrost](https://github.com/theia-hq/bifrost) for the keyed connection and
+[nauthy](https://github.com/theia-hq/nauthy) for authorizing who may connect.
+
 > Experimental. Works for TCP over the iroh transport; not ready for production use.
 
 ## Installation
@@ -39,6 +42,9 @@ tightbeam connect <node-id> --to 2222
 Restrict who may connect with a gate: `--gate strict --allow <node-id>` (an allowlist, repeatable),
 `--gate paired` (approve peers on first contact, `tightbeam approve <node-id>`), or `--gate cap` (a
 presented capability, below). The default is `--gate open`.
+
+`expose --quiet` suppresses the readiness banner, so the node's key never lands in a log, for unattended
+or CI use. The tunnel runs the same either way.
 
 ## Share a service as a capability
 
@@ -109,6 +115,22 @@ tightbeam expose 127.0.0.1:1080
 # on your machine
 tightbeam connect <exit-node-id> --to 1080   # then point apps at socks5://127.0.0.1:1080
 ```
+
+## Fetch a URL through a peer
+
+The `fetch:` target is a built-in egress: instead of splicing to a local socket, the exposing node acts
+as an HTTP client, fetches an origin URL, and streams the response back. TLS terminates at the exit, not
+at the requester. It is GET/HEAD only and scoped to the URL asked for, so it is a fetch, not an open
+proxy.
+
+```sh
+# on the exit host: gate the fetch service on a capability
+tightbeam expose fetch=fetch: --gate cap
+```
+
+A requester hands the exit an origin URL and receives the body over the stream. `swoosh fetch <url>
+--via <peer>` drives this end, minting a plain local URL that anything (`curl`, a browser) can pull,
+`Range` intact so a resumable download resumes.
 
 ## Where this is heading: names you can type anywhere
 
