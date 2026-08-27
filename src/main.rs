@@ -13,6 +13,7 @@
 //! one offline, and a holder connects with the link directly. The identity is always persisted (it is
 //! both the address peers dial and the root a share-link is signed under): `--key` or `TIGHTBEAM_KEY`.
 
+use core::net::SocketAddr;
 use std::path::PathBuf;
 
 use bifrost::Node;
@@ -33,6 +34,12 @@ struct Cli {
     /// direct address hint for a peer, `<key>=<addr>` (repeatable); reaches it directly, without n0
     #[arg(long, value_name = "key=addr", global = true)]
     peer: Vec<Peer>,
+    /// bind offline: no n0 discovery, no relays; reach peers only via --peer hints (LAN, Docker, air-gap)
+    #[arg(long, global = true)]
+    offline: bool,
+    /// fixed local bind address, e.g. `0.0.0.0:9000`; implies --offline so a peer can hardcode host:port
+    #[arg(long, value_name = "addr", global = true)]
+    bind_addr: Option<SocketAddr>,
     #[command(subcommand)]
     command: Command,
 }
@@ -77,12 +84,12 @@ async fn main() -> eyre::Result<()> {
         Command::Expose(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
             let cap_identity = secret.cap_identity()?;
-            let node = bind_node(secret, cli.peer).await?;
+            let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
             cmd.run(&node, cap_identity, approved_path()?).await
         }
         Command::Connect(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
-            let node = bind_node(secret, cli.peer).await?;
+            let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
             cmd.run(&node).await
         }
     }
@@ -91,10 +98,23 @@ async fn main() -> eyre::Result<()> {
 /// Bind the overlay node under the persisted secret. The one place a concrete transport is named;
 /// everything else speaks `bifrost`. Binding under the same secret the cap identity roots at is what
 /// makes a minted cap verify against the identity peers dial.
-async fn bind_node(secret: Secret, peers: Vec<Peer>) -> eyre::Result<Node<Endpoint, Discovery>> {
-    let endpoint = Endpoint::bind_with_secret(secret.into_bytes()).await?;
-    // Compose local discovery (--peer hints + LAN mDNS) so a nearby peer is reached directly; iroh keeps
-    // n0 as the fallback for a remote peer with no local hint.
+async fn bind_node(
+    secret: Secret,
+    peers: Vec<Peer>,
+    offline: bool,
+    bind_addr: Option<SocketAddr>,
+) -> eyre::Result<Node<Endpoint, Discovery>> {
+    // Offline (implied by a fixed --bind-addr) binds iroh's minimal preset: no n0, no relays, reachable
+    // only via the --peer hints below. Otherwise bind under n0 discovery, with hints as a direct-path
+    // shortcut. A fixed bind address defaults to an ephemeral port, which suits a dial-only client.
+    let endpoint = if offline || bind_addr.is_some() {
+        let addr = bind_addr.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+        Endpoint::bind_offline(secret.into_bytes(), addr).await?
+    } else {
+        Endpoint::bind_with_secret(secret.into_bytes()).await?
+    };
+    // Compose local discovery (--peer hints + LAN mDNS) so a nearby peer is reached directly; under n0
+    // it keeps the internet as the fallback for a remote peer with no local hint.
     let discovery = Peer::discovery(&endpoint, peers);
     Ok(Node::new(endpoint, discovery))
 }
