@@ -29,6 +29,17 @@ pub async fn load_anchor() -> eyre::Result<Option<NodeId>> {
     }
 }
 
+/// Write this node's signet anchor: the public [`NodeId`] its default gate will trust, as `adopt` sets
+/// it from an authkey. Overwrites any prior anchor (re-provisioning re-anchors), creating the config dir.
+pub async fn write_anchor(signet: NodeId) -> eyre::Result<()> {
+    let path = anchor_path()?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&path, format!("{signet}\n")).await?;
+    Ok(())
+}
+
 /// The persisted revocation-denylist location, `~/.config/tightbeam/revoked`, overridable with
 /// `TIGHTBEAM_REVOKED`. Records the biscuit revocation ids of caps this node has revoked.
 pub fn revoked_path() -> eyre::Result<PathBuf> {

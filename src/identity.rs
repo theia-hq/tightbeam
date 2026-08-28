@@ -52,6 +52,22 @@ impl Secret {
     }
 }
 
+/// Write a provided secret as this node's persisted identity: how a machine ADOPTS a minted device seed
+/// to BECOME that identity. Overwrites any key at the path (adopting replaces this node's identity),
+/// mode 0600. The path is `--key` / `TIGHTBEAM_KEY` or the default; `expose` then binds under it.
+pub async fn write(secret: &[u8; 32], explicit: Option<&Path>) -> eyre::Result<()> {
+    let path = match explicit {
+        Some(path) => path.to_owned(),
+        None => default_path()?,
+    };
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&path, secret).await?;
+    restrict(&path).await?;
+    Ok(())
+}
+
 /// Load the persisted secret, creating and saving a fresh one on first use.
 ///
 /// An explicit path (`--key` / `TIGHTBEAM_KEY`) overrides the default location. tightbeam's identity is
