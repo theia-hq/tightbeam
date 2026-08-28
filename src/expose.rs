@@ -19,6 +19,13 @@ use crate::splice;
 /// pre-gate work an unauthenticated peer can pin (a slow-loris that opens a stream and never speaks).
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The maximum number of peer sessions served concurrently. Past this, `accept` stops being polled so new
+/// connections queue at the transport (backpressure), bounding the memory a flood of peers can pin.
+const MAX_SESSIONS: usize = 256;
+
+/// The maximum number of in-flight streams per session, bounding what a single connected peer can pin.
+const MAX_STREAMS_PER_SESSION: usize = 256;
+
 /// Expose a local service to peers.
 ///
 /// Authorization is a property of the node, not a per-expose choice: by default a service is gated to this
@@ -95,7 +102,9 @@ impl ExposeCmd {
         let mut sessions = FuturesUnordered::new();
         loop {
             tokio::select! {
-                accepted = node.accept() => {
+                // Cap concurrent sessions: past the cap, stop polling `accept` so new connections queue at
+                // the transport (backpressure) rather than each pinning a task set, bounding a peer flood.
+                accepted = node.accept(), if sessions.len() < MAX_SESSIONS => {
                     // The listener outlives any one peer: a transient accept error must not tear down
                     // the sessions already being served, so log it and keep accepting.
                     let session = match accepted {
@@ -172,26 +181,40 @@ where
 {
     let peer = session.peer();
     let mut pipes = FuturesUnordered::new();
+    // Stop accepting new streams once `accept_bi` errors (the session is closing): drain the in-flight
+    // pipes rather than reaping them with `?`, the same courtesy `connect` gives its local listener.
+    let mut accepting = true;
     loop {
         tokio::select! {
-            accepted = session.accept_bi() => {
-                let (writer, reader) = accepted?;
-                pipes.push(serve_request(
-                    peer,
-                    writer,
-                    reader,
-                    Arc::clone(&gate),
-                    Arc::clone(&services),
-                    host_seed,
-                ));
+            // Cap in-flight streams per session: past the cap, stop polling `accept_bi` so the peer's
+            // further streams queue at the transport (backpressure) instead of each pinning a task and a
+            // buffer. A single peer cannot exhaust the node with unbounded concurrent streams.
+            accepted = session.accept_bi(), if accepting && pipes.len() < MAX_STREAMS_PER_SESSION => {
+                match accepted {
+                    Ok((writer, reader)) => pipes.push(serve_request(
+                        peer,
+                        writer,
+                        reader,
+                        Arc::clone(&gate),
+                        Arc::clone(&services),
+                        host_seed,
+                    )),
+                    Err(error) => {
+                        tracing::warn!(%peer, %error, "accept_bi failed; draining in-flight streams");
+                        accepting = false;
+                    }
+                }
             }
             Some(result) = pipes.next(), if !pipes.is_empty() => {
                 if let Err(error) = result {
                     tracing::warn!(%error, "pipe ended");
                 }
             }
+            // No more streams to accept and none in flight: the session is done.
+            else => break,
         }
     }
+    Ok(())
 }
 
 /// Serve one inbound stream: read the request, apply the gate, reply, and pipe on success.
