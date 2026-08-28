@@ -1,5 +1,6 @@
 //! `tightbeam expose`: publish local services under this node's key and forward inbound streams.
 
+use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -13,6 +14,10 @@ use tokio::net::TcpStream;
 
 use crate::protocol::{Request, Response};
 use crate::splice;
+
+/// How long to wait for a connector to send its opening request before dropping the stream. Bounds the
+/// pre-gate work an unauthenticated peer can pin (a slow-loris that opens a stream and never speaks).
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Expose a local service to peers.
 ///
@@ -207,7 +212,17 @@ where
     W: io::AsyncWrite + Unpin + Send + 'static,
     R: io::AsyncRead + Unpin + Send + 'static,
 {
-    let request = Request::read(&mut reader).await?;
+    // Bound the pre-gate read: a peer that opens a stream but never sends its request would otherwise
+    // park this task (and its buffer) indefinitely, BEFORE the gate runs, so unauthenticated peers could
+    // exhaust the node one slow stream at a time. Time out and drop a silent stream.
+    let request = match tokio::time::timeout(REQUEST_READ_TIMEOUT, Request::read(&mut reader)).await
+    {
+        Ok(result) => result?,
+        Err(_elapsed) => {
+            tracing::warn!(%peer, "request read timed out before the gate; dropping the stream");
+            return Ok(());
+        }
+    };
     let Ok(service) = request.service.parse::<Service>() else {
         let message = format!("invalid service name {:?}", request.service);
         return Response::Error(message)
