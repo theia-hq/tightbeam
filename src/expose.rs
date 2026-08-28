@@ -8,7 +8,7 @@ use bifrost::{Discovery, Node, NodeId, Session, Transport};
 use clap::{Args, ValueEnum};
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
-use nauthy::{Approvals, Cap, Decision, Gate, Identity, Refusal, Service};
+use nauthy::{Approvals, Cap, Decision, Denylist, Gate, Identity, Refusal, Service};
 use tokio::io;
 use tokio::net::TcpStream;
 
@@ -120,7 +120,12 @@ impl ExposeCmd {
             GateMode::Open => Ok(Gate::Open),
             GateMode::Strict => Ok(Gate::Strict(parse_allowed(&self.allow)?)),
             GateMode::Paired => Ok(Gate::Paired(Approvals::load(approved_path).await?)),
-            GateMode::Cap => Ok(Gate::Cap(identity)),
+            GateMode::Cap => {
+                // The revocation denylist is loaded once at expose; a `tightbeam revoke` adds to the file,
+                // which the next exposer run reads. Offline recall, node-local, no server.
+                let denylist = Denylist::load(crate::config::revoked_path()?).await?;
+                Ok(Gate::Cap(identity, Box::new(denylist)))
+            }
         }
     }
 }
@@ -254,6 +259,7 @@ fn admit(
             Err("capability does not grant this service".to_owned())
         }
         Decision::Refuse(Refusal::NotPermitted) => Err("not permitted".to_owned()),
+        Decision::Refuse(Refusal::Revoked) => Err("capability has been revoked".to_owned()),
     }
 }
 

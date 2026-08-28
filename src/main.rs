@@ -22,7 +22,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use tightbeam::config::approved_path;
 use tightbeam::identity::{self, Secret};
 use tightbeam::peer::{Discovery, Peer};
-use tightbeam::{ApproveCmd, AttenuateCmd, ConnectCmd, ExposeCmd, ShareCmd, TreeCmd};
+use tightbeam::{ApproveCmd, AttenuateCmd, ConnectCmd, ExposeCmd, RevokeCmd, ShareCmd, TreeCmd};
 
 /// Reach a service on another machine by its public key, no public IP needed.
 #[derive(Debug, Parser)]
@@ -56,6 +56,8 @@ enum Command {
     Share(ShareCmd),
     /// Narrow an existing `sheer:` link offline before handing it on.
     Attenuate(AttenuateCmd),
+    /// Revoke a `sheer:` link so this node refuses it at once, without waiting for expiry.
+    Revoke(RevokeCmd),
     /// Print this command tree (spec vs binary).
     Tree(TreeCmd),
 }
@@ -74,6 +76,8 @@ async fn main() -> eyre::Result<()> {
         Command::Attenuate(cmd) => cmd.run(),
         // `approve` grows the local approved set; still no node.
         Command::Approve(cmd) => cmd.run().await,
+        // `revoke` adds to the local revocation denylist; local, no node, no identity.
+        Command::Revoke(cmd) => cmd.run().await,
         // `share` needs the signing identity but no bound node: minting is offline.
         Command::Share(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;

@@ -18,6 +18,7 @@ pub mod expose;
 pub mod http;
 pub mod identity;
 pub mod peer;
+pub mod revoke;
 pub mod share;
 pub mod tree;
 
@@ -39,6 +40,7 @@ pub use crate::approve::ApproveCmd;
 pub use crate::attenuate::AttenuateCmd;
 pub use crate::connect::ConnectCmd;
 pub use crate::expose::ExposeCmd;
+pub use crate::revoke::RevokeCmd;
 pub use crate::share::ShareCmd;
 pub use crate::tree::TreeCmd;
 

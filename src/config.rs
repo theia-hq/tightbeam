@@ -13,6 +13,15 @@ pub fn approved_path() -> eyre::Result<PathBuf> {
     Ok(config_dir()?.join("approved"))
 }
 
+/// The persisted revocation-denylist location, `~/.config/tightbeam/revoked`, overridable with
+/// `TIGHTBEAM_REVOKED`. Records the biscuit revocation ids of caps this node has revoked.
+pub fn revoked_path() -> eyre::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("TIGHTBEAM_REVOKED") {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(config_dir()?.join("revoked"))
+}
+
 /// The tightbeam config directory, `~/.config/tightbeam`.
 fn config_dir() -> eyre::Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| eyre!("HOME is not set"))?;
