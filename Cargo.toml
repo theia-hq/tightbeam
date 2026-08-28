@@ -7,11 +7,11 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # theia
-bifrost = { path = "../bifrost/crates/bifrost" }
-bifrost-iroh = { path = "../bifrost/crates/transports/bifrost-iroh" }
-bifrost-mdns = { path = "../bifrost/crates/bifrost-mdns" }
-nauthy = { path = "../nauthy" }
-sshh = { path = "../sshh", optional = true }
+bifrost = { git = "https://github.com/theia-hq/bifrost" }
+bifrost-iroh = { git = "https://github.com/theia-hq/bifrost" }
+bifrost-mdns = { git = "https://github.com/theia-hq/bifrost" }
+nauthy = { git = "https://github.com/theia-hq/nauthy" }
+sshh = { git = "https://github.com/theia-hq/sshh", optional = true }
 
 blake3 = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -31,7 +31,7 @@ zeroize = { version = "1", features = ["derive"] }
 ssh = ["dep:sshh"]
 
 [dev-dependencies]
-bifrost-mem = { path = "../bifrost/crates/transports/bifrost-mem" }
+bifrost-mem = { git = "https://github.com/theia-hq/bifrost" }
 
 [lints.clippy]
 unwrap_used = "deny"
