@@ -6,12 +6,14 @@
 //! and binds it to a local port. Peer to peer, with nothing in between; `ssh -L` shaped, but you address
 //! the far machine by its key, not an IP.
 //!
-//! Who may connect is set by a gate on `expose`: `--gate open` (anyone who reaches the key), `strict`
-//! with an `--allow <node-id>` allowlist, `paired` (approve peers as they arrive, `tightbeam approve
-//! <node-id>`), or `cap` (a presented capability token). A capability is a signed, expiring link rooted
-//! at this machine's own key: `tightbeam share <service>` mints one, `tightbeam attenuate <link>` narrows
-//! one offline, and a holder connects with the link directly. The identity is always persisted (it is
-//! both the address peers dial and the root a share-link is signed under): `--key` or `TIGHTBEAM_KEY`.
+//! Who may connect is a property of the node, not a per-expose choice: by default `expose` gates a
+//! service to the machine's signet ANCHOR (the key it trusts, set by `swoosh adopt`), admitting the
+//! owner's own devices and anyone they delegate to. `--allow <node-id>` is the signet-less raw allowlist,
+//! `--public` opens a service to anyone (never a shell), and `--trust-root <key>` trusts a signet other
+//! than the provisioned one. A capability is a signed, expiring link rooted at a signet: `tightbeam share
+//! <service>` mints one, `tightbeam attenuate <link>` narrows it offline, `tightbeam revoke <link>`
+//! recalls it, and a holder connects with the link directly. The identity is always persisted (it is both
+//! the address peers dial and the key a share-link roots at): `--key` or `TIGHTBEAM_KEY`.
 
 use core::net::SocketAddr;
 use std::path::PathBuf;
@@ -19,10 +21,10 @@ use std::path::PathBuf;
 use bifrost::Node;
 use bifrost_iroh::Endpoint;
 use clap::{CommandFactory, Parser, Subcommand};
-use tightbeam::config::approved_path;
+use tightbeam::config::load_anchor;
 use tightbeam::identity::{self, Secret};
 use tightbeam::peer::{Discovery, Peer};
-use tightbeam::{ApproveCmd, AttenuateCmd, ConnectCmd, ExposeCmd, RevokeCmd, ShareCmd, TreeCmd};
+use tightbeam::{AttenuateCmd, ConnectCmd, ExposeCmd, RevokeCmd, ShareCmd, TreeCmd};
 
 /// Reach a service on another machine by its public key, no public IP needed.
 #[derive(Debug, Parser)]
@@ -50,8 +52,6 @@ enum Command {
     Expose(ExposeCmd),
     /// Reach a peer's exposed service and bind it to a local port.
     Connect(ConnectCmd),
-    /// Approve a peer key so it may connect in pairing mode.
-    Approve(ApproveCmd),
     /// Mint a `sheer:` capability link granting one service, expiring, attenuable, delegable.
     Share(ShareCmd),
     /// Narrow an existing `sheer:` link offline before handing it on.
@@ -74,8 +74,6 @@ async fn main() -> eyre::Result<()> {
         // model; `attenuate` narrows a link offline.
         Command::Tree(cmd) => cmd.run(&Cli::command()),
         Command::Attenuate(cmd) => cmd.run(),
-        // `approve` grows the local approved set; still no node.
-        Command::Approve(cmd) => cmd.run().await,
         // `revoke` adds to the local revocation denylist; local, no node, no identity.
         Command::Revoke(cmd) => cmd.run().await,
         // `share` needs the signing identity but no bound node: minting is offline.
@@ -83,17 +81,16 @@ async fn main() -> eyre::Result<()> {
             let secret = identity::load(cli.key.as_deref()).await?;
             cmd.run(&secret.cap_identity()?)
         }
-        // `expose`/`connect` bind a node. The exposer also carries its cap identity so a `cap` gate can
-        // verify presented tokens against the same key the node is bound under.
+        // `expose`/`connect` bind a node. `expose` also reads the persisted signet anchor: the key its
+        // default gate trusts (a family gate admits the owner's devices and their delegates).
         Command::Expose(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
-            let cap_identity = secret.cap_identity()?;
             // Derive the ssh host-key seed before the secret is consumed by the bind. Only a `sshd:`
             // service uses it, but it is cheap and keeps the secret's raw bytes from leaving for it.
             let host_seed = secret.ssh_host_seed();
+            let anchor = load_anchor().await?;
             let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
-            cmd.run(&node, cap_identity, host_seed, approved_path()?)
-                .await
+            cmd.run(&node, host_seed, anchor).await
         }
         Command::Connect(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;

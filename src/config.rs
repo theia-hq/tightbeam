@@ -2,15 +2,31 @@
 
 use std::path::PathBuf;
 
+use bifrost::NodeId;
 use eyre::eyre;
 
-/// The persisted approved-set location for pairing mode, `~/.config/tightbeam/approved`, overridable
-/// with `TIGHTBEAM_APPROVED`. nauthy owns the load/persist logic; the location is tightbeam's to choose.
-pub fn approved_path() -> eyre::Result<PathBuf> {
-    if let Some(path) = std::env::var_os("TIGHTBEAM_APPROVED") {
+/// The persisted signet-anchor location, `~/.config/tightbeam/anchor`, overridable with
+/// `TIGHTBEAM_ANCHOR`. Holds one thing: the public [`NodeId`] of the signet this node trusts, written
+/// once by provisioning (`swoosh adopt`). Public material (a key you already share), so it sits beside
+/// the secret identity, never inside it.
+pub fn anchor_path() -> eyre::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("TIGHTBEAM_ANCHOR") {
         return Ok(PathBuf::from(path));
     }
-    Ok(config_dir()?.join("approved"))
+    Ok(config_dir()?.join("anchor"))
+}
+
+/// Load this node's signet anchor: the [`NodeId`] of the signet it was provisioned to trust, or `None`
+/// if it was never provisioned. The file is a single public node id; an absent file means unprovisioned,
+/// which `expose` treats as "no default gate" (a loud error), never a silent open.
+// `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
+#[allow(clippy::std_instead_of_core)]
+pub async fn load_anchor() -> eyre::Result<Option<NodeId>> {
+    match tokio::fs::read_to_string(anchor_path()?).await {
+        Ok(text) => Ok(Some(text.trim().parse::<NodeId>()?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// The persisted revocation-denylist location, `~/.config/tightbeam/revoked`, overridable with

@@ -4,9 +4,7 @@ use core::time::Duration;
 
 use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
-use nauthy::Identity;
 use tightbeam::connect::Target;
-use tightbeam::expose::GateMode;
 use tightbeam::{ConnectCmd, ExposeCmd};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
@@ -44,17 +42,15 @@ async fn tunnels_to_a_unix_socket() {
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
 
             let service = format!("unix:{}", sock.display());
-            let identity = Identity::from_secret(&[0u8; 32]).unwrap();
-            let approved = std::env::temp_dir().join("tightbeam-unix-test-unused");
             tokio::task::spawn_local(async move {
                 ExposeCmd {
                     services: vec![service],
-                    gate: GateMode::Open,
                     allow: Vec::new(),
                     trust_root: None,
+                    public: true,
                     quiet: false,
                 }
-                .run(&exposer, identity, [0u8; 32], approved)
+                .run(&exposer, [0u8; 32], None)
                 .await
                 .unwrap();
             });

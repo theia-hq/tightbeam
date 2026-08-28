@@ -16,7 +16,6 @@ use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
 use nauthy::{Identity, Service};
 use tightbeam::connect::Target;
-use tightbeam::expose::GateMode;
 use tightbeam::{ConnectCmd, ExposeCmd};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -34,17 +33,18 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
             let exposer_id = exposer.node_id();
 
             // Expose `ssh=<echo>` behind a capability gate rooted at the exposer's cap identity.
-            let gate_identity = Identity::from_secret(&EXPOSER_SECRET).unwrap();
-            let approved = std::env::temp_dir().join("tightbeam-cap-test-unused");
+            // The runner is provisioned to trust the exposer's signet: its family gate admits tokens
+            // rooted at that key (badges or slips), which is what these cap tests present.
+            let anchor = Identity::from_secret(&EXPOSER_SECRET).unwrap().node_id();
             tokio::task::spawn_local(async move {
                 ExposeCmd {
                     services: vec![format!("ssh={echo_addr}")],
-                    gate: GateMode::Cap,
                     allow: Vec::new(),
                     trust_root: None,
+                    public: false,
                     quiet: false,
                 }
-                .run(&exposer, gate_identity, [0u8; 32], approved)
+                .run(&exposer, [0u8; 32], Some(anchor))
                 .await
                 .unwrap();
             });

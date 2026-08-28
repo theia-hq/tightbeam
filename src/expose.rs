@@ -1,86 +1,78 @@
 //! `tightbeam expose`: publish local services under this node's key and forward inbound streams.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use bifrost::{Discovery, Node, NodeId, Session, Transport};
-use clap::{Args, ValueEnum};
+use clap::Args;
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
-use nauthy::{Approvals, Cap, Decision, Denylist, Gate, Identity, Refusal, Service};
+use nauthy::{Cap, Decision, Denylist, Gate, Refusal, Service};
 use tokio::io;
 use tokio::net::TcpStream;
 
 use crate::protocol::{Request, Response};
 use crate::splice;
 
-/// Expose a local service to peers who hold this node's key.
+/// Expose a local service to peers.
+///
+/// Authorization is a property of the node, not a per-expose choice: by default a service is gated to this
+/// node's signet ANCHOR (set once by `swoosh adopt`), admitting the owner's own devices (membership
+/// badges) and anyone they delegate a slip to. The flags are deliberate exceptions to that default, not a
+/// menu of policies: `--allow` for a signet-less raw allowlist, `--public` to open a service to anyone,
+/// `--trust-root` to trust a signet other than the provisioned one.
 #[derive(Debug, Args)]
 pub struct ExposeCmd {
     /// expose local services as `name=addr` (bare `addr` = `default`)
     #[arg(required = true, value_name = "name=addr")]
     pub services: Vec<String>,
-    /// How to authorize connectors. `open` (any peer), `strict` (the `--allow` list), `paired`
-    /// (approved peers), or `cap` (a presented capability that verifies against this node's identity).
-    #[arg(long, value_enum, default_value_t = GateMode::Open)]
-    pub gate: GateMode,
-    /// Only allow these node ids to connect (repeatable). Used by `--gate strict`.
-    #[arg(long = "allow")]
+    /// Admit exactly these keys, no signet needed (the raw allowlist floor). Repeatable. Presence of
+    /// `--allow` gates on the list instead of the node's signet anchor.
+    #[arg(long = "allow", value_name = "node-id")]
     pub allow: Vec<String>,
-    /// For `--gate cap`: trust caps rooted at THIS node id (an issuer's key) instead of this node's own.
-    /// The CI model: a runner accepts caps you minted from your key, without ever holding your secret, so a
-    /// compromised runner can never mint access. Defaults to this node's own identity (a self-issued grant).
+    /// Trust this signet instead of the node's provisioned anchor: the foreign-issuer hatch (a runner
+    /// trusting YOUR key without ever holding your secret, so a compromised runner can mint no access).
     #[arg(long, value_name = "node-id")]
     pub trust_root: Option<NodeId>,
-    /// Suppress the readiness banner (the node id and service list). For unattended/CI use where the key
-    /// must never land in a log; the tunnel still runs.
+    /// Expose to ANYONE, unauthenticated: the one deliberate opt-out from the signet. Refused for a shell
+    /// service (`sshd:`), which has no auth of its own.
+    #[arg(long)]
+    pub public: bool,
+    /// Suppress the readiness banner (the node id, services, and gate). For unattended/CI use where the
+    /// key must never land in a log; the tunnel still runs.
     #[arg(long)]
     pub quiet: bool,
-}
-
-/// How `expose` authorizes an inbound connector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum GateMode {
-    /// Permit any peer that reached the key.
-    Open,
-    /// Permit only the node ids passed with `--allow`.
-    Strict,
-    /// Permit only peers in the persisted approved set (approve with `tightbeam approve`).
-    Paired,
-    /// Permit only peers that present a capability rooted at the trusted root (this node's identity, or a
-    /// `--trust-root` issuer key). The capability is the auth; no allowlist to keep in sync.
-    Cap,
 }
 
 impl ExposeCmd {
     /// Accept overlay sessions from permitted peers and forward each inbound stream to the service.
     ///
-    /// `identity` is the exposer's cap-signing identity, rooted at the same secret bifrost bound the node
-    /// under, so a `cap` gate verifies presented tokens against the key peers dial.
+    /// `anchor` is this node's provisioned signet: the [`NodeId`] it trusts, or `None` if it was never
+    /// provisioned. The default gate verifies presented tokens against it; the flags override it.
     pub async fn run<T: Transport, D: Discovery>(
         self,
         node: &Node<T, D>,
-        identity: Identity,
         host_seed: [u8; 32],
-        approved_path: PathBuf,
+        anchor: Option<NodeId>,
     ) -> eyre::Result<()>
     where
         <T::Session as Session>::Write: Send + 'static,
         <T::Session as Session>::Read: Send + 'static,
     {
-        let gate = Arc::new(self.gate(identity, approved_path).await?);
         let services = Arc::new(parse_services(&self.services)?);
-        // A shell service has no auth of its own, so the gate IS its authentication: refuse to expose one
-        // with an open gate, which would hand a keyless shell to anyone who reaches this node.
-        if matches!(self.gate, GateMode::Open) && services.values().any(|addr| addr == "sshd:") {
+        // A shell service has no auth of its own, so the gate IS its authentication: refuse to open one to
+        // the world, which would hand a keyless shell to anyone who reaches this node.
+        if self.public && services.values().any(|addr| addr == "sshd:") {
             eyre::bail!(
                 "a shell service (sshd:) has no auth of its own and must be gated; \
-                 use --gate cap or --gate strict, not open"
+                 drop --public, which would expose an unauthenticated shell to anyone"
             );
         }
-        // The readiness banner names the node id; `--quiet` withholds it so a key never lands in an
-        // unattended log. The tunnel is unaffected either way.
+        // Build the gate before announcing readiness: an unprovisioned node with no explicit override
+        // fails HERE, loudly, rather than ever serving on a permissive default.
+        let gate = Arc::new(self.gate(anchor).await?);
+        // The readiness banner names the node id AND the effective gate, so "who can reach this right now?"
+        // is answerable at a glance. `--quiet` withholds it so a key never lands in an unattended log.
         if !self.quiet {
             println!("tightbeam ready. peers can reach these services at:\n");
             println!(
@@ -89,7 +81,11 @@ impl ExposeCmd {
             );
             let mut names: Vec<&str> = services.keys().map(String::as_str).collect();
             names.sort_unstable();
-            println!("exposing {}. press ctrl-c to stop.", names.join(", "));
+            println!(
+                "exposing {} \u{2014} gate: {}. press ctrl-c to stop.",
+                names.join(", "),
+                self.gate_description(anchor)
+            );
         }
         let mut sessions = FuturesUnordered::new();
         loop {
@@ -120,19 +116,39 @@ impl ExposeCmd {
         }
     }
 
-    /// Build the authorization gate from the flags.
-    async fn gate(&self, identity: Identity, approved_path: PathBuf) -> eyre::Result<Gate> {
-        match self.gate {
-            GateMode::Open => Ok(Gate::Open),
-            GateMode::Strict => Ok(Gate::Strict(parse_allowed(&self.allow)?)),
-            GateMode::Paired => Ok(Gate::Paired(Approvals::load(approved_path).await?)),
-            GateMode::Cap => {
-                // The trusted root defaults to this node's own identity (a self-issued grant); `--trust-root`
-                // names a foreign issuer (the CI model). The revocation denylist is loaded once here; a
-                // `tightbeam revoke` adds to the file, which the next exposer run reads. Offline, no server.
-                let root = self.trust_root.unwrap_or_else(|| identity.node_id());
-                let denylist = Denylist::load(crate::config::revoked_path()?).await?;
-                Ok(Gate::Cap(root, Box::new(denylist)))
+    /// Build the authorization gate. Not a policy menu: the default is the node's signet anchor, and the
+    /// flags are exceptions. `--public` opens the door to anyone; `--allow` names a raw allowlist;
+    /// otherwise the gate is the signet (an explicit `--trust-root`, else the provisioned anchor), which
+    /// fails LOUDLY if neither is set rather than falling back to anything permissive.
+    async fn gate(&self, anchor: Option<NodeId>) -> eyre::Result<Gate> {
+        if self.public {
+            return Ok(Gate::Open);
+        }
+        if !self.allow.is_empty() {
+            return Ok(Gate::Strict(parse_allowed(&self.allow)?));
+        }
+        let root = self.trust_root.or(anchor).ok_or_else(|| {
+            eyre::eyre!(
+                "this node has no signet to gate on: provision it with `swoosh adopt <authkey>`, \
+                 or pass --trust-root <signet>, --allow <key>, or --public"
+            )
+        })?;
+        // The revocation denylist is loaded once here; a `tightbeam revoke` adds to the file, which the
+        // next exposer run reads. Offline, no server.
+        let denylist = Denylist::load(crate::config::revoked_path()?).await?;
+        Ok(Gate::Family(root, Box::new(denylist)))
+    }
+
+    /// A one-line description of the effective gate, for the readiness banner: trust made visible.
+    fn gate_description(&self, anchor: Option<NodeId>) -> String {
+        if self.public {
+            "public (anyone, unauthenticated)".to_owned()
+        } else if !self.allow.is_empty() {
+            format!("allowlist ({} key(s))", self.allow.len())
+        } else {
+            match self.trust_root.or(anchor) {
+                Some(root) => format!("signet {}", root.short()),
+                None => "unprovisioned".to_owned(),
             }
         }
     }

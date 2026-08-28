@@ -2,14 +2,14 @@
 //!
 //! `expose` forwards inbound overlay streams to a local TCP service; `connect` binds a peer's exposed
 //! service to a local port. Each proxied TCP connection rides one bifrost bidirectional stream. Who may
-//! connect is decided by the [`nauthy`] crate's authorization gate: an allowlist, a paired set, or a
-//! presented capability. `share` and `attenuate` mint and narrow those capabilities.
+//! connect is decided by the [`nauthy`] crate's authorization gate: by default the node's signet anchor
+//! (its own devices and their delegates), else a raw allowlist or open. `share` and `attenuate` mint and
+//! narrow the capabilities that gate honors.
 //!
 //! Concurrency uses `FuturesUnordered` + `select!` (structured concurrency on one task) rather than
 //! `tokio::spawn`, because the bifrost interface's futures are not `Send`-bounded. This keeps the tool
 //! generic over any transport; see DECISIONS.md for the trade-off.
 
-pub mod approve;
 pub mod attenuate;
 pub mod config;
 pub mod connect;
@@ -36,7 +36,6 @@ mod protocol_tests;
 
 use tokio::io::{self, AsyncWriteExt as _};
 
-pub use crate::approve::ApproveCmd;
 pub use crate::attenuate::AttenuateCmd;
 pub use crate::connect::ConnectCmd;
 pub use crate::expose::ExposeCmd;
