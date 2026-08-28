@@ -253,6 +253,10 @@ where
             .await
             .map_err(Into::into);
     };
+    // A node exposing exactly one service should not require `--service`: if the request names no exposed
+    // service (a connector defaulting to `default`) and there is only one, resolve to it. Done BEFORE the
+    // gate so a delegated slip for that service still matches (the gate checks the RESOLVED service).
+    let service = resolve_single_service(service, &services);
 
     let admitted = match admit(&gate, peer, request.capability.as_deref(), &service) {
         Ok(admitted) => admitted,
@@ -335,6 +339,22 @@ fn admit(
         })
 }
 
+/// Resolve the requested service against what is exposed: if it names no exposed service but exactly one
+/// service is exposed, return that one, so a single-service node needs no `--service`. Otherwise return
+/// the request unchanged (a multi-service node keeps it, to fail later with the "unknown service; this node
+/// exposes: …" hint rather than guessing which one was meant).
+fn resolve_single_service(requested: Service, services: &HashMap<String, String>) -> Service {
+    if services.contains_key(requested.as_str()) || services.len() != 1 {
+        return requested;
+    }
+    // The sole service's name is already a validated `Service` (parse_services checked it), so this parse
+    // cannot fail; fall back to the request if it somehow does rather than unwrap.
+    match services.keys().next().map(|only| only.parse::<Service>()) {
+        Some(Ok(only)) => only,
+        _ => requested,
+    }
+}
+
 /// Parse `name=addr` service entries; a bare `addr` becomes the `default` service.
 fn parse_services(entries: &[String]) -> eyre::Result<HashMap<String, String>> {
     let mut services = HashMap::new();
@@ -409,7 +429,33 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::parse_services;
+    use std::collections::HashMap;
+
+    use nauthy::Service;
+
+    use super::{parse_services, resolve_single_service};
+
+    #[test]
+    fn a_single_service_node_needs_no_service_name() {
+        let svc =
+            |n: &str| -> Service { n.parse().unwrap_or_else(|_| panic!("valid service: {n}")) };
+        let one: HashMap<String, String> = [("web".to_owned(), "127.0.0.1:80".to_owned())].into();
+        // A connector defaulting to `default` on a single-service node resolves to that one service.
+        assert_eq!(resolve_single_service(svc("default"), &one).as_str(), "web");
+        // A request that already names the exposed service is unchanged.
+        assert_eq!(resolve_single_service(svc("web"), &one).as_str(), "web");
+
+        let two: HashMap<String, String> = [
+            ("web".to_owned(), "127.0.0.1:80".to_owned()),
+            ("ssh".to_owned(), "sshd:".to_owned()),
+        ]
+        .into();
+        // With two services, an unmatched request is left as-is (fails later with the hint, never guesses).
+        assert_eq!(
+            resolve_single_service(svc("default"), &two).as_str(),
+            "default"
+        );
+    }
 
     #[test]
     fn a_bare_service_name_is_rejected_with_a_hint() {
