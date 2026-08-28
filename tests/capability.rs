@@ -41,6 +41,7 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
                     services: vec![format!("ssh={echo_addr}")],
                     gate: GateMode::Cap,
                     allow: Vec::new(),
+                    trust_root: None,
                     quiet: false,
                 }
                 .run(&exposer, gate_identity, [0u8; 32], approved)

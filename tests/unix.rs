@@ -51,6 +51,7 @@ async fn tunnels_to_a_unix_socket() {
                     services: vec![service],
                     gate: GateMode::Open,
                     allow: Vec::new(),
+                    trust_root: None,
                     quiet: false,
                 }
                 .run(&exposer, identity, [0u8; 32], approved)

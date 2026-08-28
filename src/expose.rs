@@ -28,6 +28,11 @@ pub struct ExposeCmd {
     /// Only allow these node ids to connect (repeatable). Used by `--gate strict`.
     #[arg(long = "allow")]
     pub allow: Vec<String>,
+    /// For `--gate cap`: trust caps rooted at THIS node id (an issuer's key) instead of this node's own.
+    /// The CI model: a runner accepts caps you minted from your key, without ever holding your secret, so a
+    /// compromised runner can never mint access. Defaults to this node's own identity (a self-issued grant).
+    #[arg(long, value_name = "node-id")]
+    pub trust_root: Option<NodeId>,
     /// Suppress the readiness banner (the node id and service list). For unattended/CI use where the key
     /// must never land in a log; the tunnel still runs.
     #[arg(long)]
@@ -43,7 +48,8 @@ pub enum GateMode {
     Strict,
     /// Permit only peers in the persisted approved set (approve with `tightbeam approve`).
     Paired,
-    /// Permit only peers that present a capability rooted at this node's identity.
+    /// Permit only peers that present a capability rooted at the trusted root (this node's identity, or a
+    /// `--trust-root` issuer key). The capability is the auth; no allowlist to keep in sync.
     Cap,
 }
 
@@ -121,10 +127,12 @@ impl ExposeCmd {
             GateMode::Strict => Ok(Gate::Strict(parse_allowed(&self.allow)?)),
             GateMode::Paired => Ok(Gate::Paired(Approvals::load(approved_path).await?)),
             GateMode::Cap => {
-                // The revocation denylist is loaded once at expose; a `tightbeam revoke` adds to the file,
-                // which the next exposer run reads. Offline recall, node-local, no server.
+                // The trusted root defaults to this node's own identity (a self-issued grant); `--trust-root`
+                // names a foreign issuer (the CI model). The revocation denylist is loaded once here; a
+                // `tightbeam revoke` adds to the file, which the next exposer run reads. Offline, no server.
+                let root = self.trust_root.unwrap_or_else(|| identity.node_id());
                 let denylist = Denylist::load(crate::config::revoked_path()?).await?;
-                Ok(Gate::Cap(identity, Box::new(denylist)))
+                Ok(Gate::Cap(root, Box::new(denylist)))
             }
         }
     }
