@@ -346,9 +346,34 @@ fn parse_services(entries: &[String]) -> eyre::Result<HashMap<String, String>> {
         // Validate the name through the same domain type the wire uses, so an exposed name and a
         // requested name are compared as the same kind of thing.
         name.parse::<Service>()?;
+        // Validate the ADDR too: without this, `expose web` silently maps the `default` service to the
+        // literal address "web", which only fails at dial time as an opaque reset. Fail HERE instead.
+        validate_addr(&addr, entry)?;
         services.insert(name, addr);
     }
     Ok(services)
+}
+
+/// Reject an addr that is not a real forwarding target, so a bare service name (`expose web`) fails at
+/// parse with a teaching message instead of silently pointing the `default` service at an undialable
+/// host. Valid targets: `sshd:` (keyless shell), `fetch:` (HTTP egress), `unix:<path>`, or a `host:port`.
+fn validate_addr(addr: &str, entry: &str) -> eyre::Result<()> {
+    let is_host_port = addr
+        .rsplit_once(':')
+        .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
+    if addr == "sshd:" || addr == "fetch:" || addr.starts_with("unix:") || is_host_port {
+        return Ok(());
+    }
+    // A bare token with no `=` was almost certainly meant as a service NAME, not an address.
+    if !entry.contains('=') {
+        eyre::bail!(
+            "`{entry}` is not an address to forward to. Did you mean a service pointing at one, e.g. \
+             `{entry}=127.0.0.1:8080`? (an address is host:port, unix:<path>, sshd:, or fetch:)"
+        );
+    }
+    eyre::bail!(
+        "`{addr}` is not a valid forwarding address (host:port, unix:<path>, sshd:, or fetch:)"
+    )
 }
 
 /// Parse node ids into an allowlist set.
@@ -380,4 +405,42 @@ where
         splice(local, writer, reader).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_services;
+
+    #[test]
+    fn a_bare_service_name_is_rejected_with_a_hint() {
+        // `expose web` was silently mapped to the `default` service at addr "web"; now it fails at parse.
+        let Err(err) = parse_services(&["web".to_owned()]) else {
+            panic!("bare `web` should be rejected, not treated as addr \"web\"");
+        };
+        assert!(
+            err.to_string().contains("web=127.0.0.1:8080"),
+            "the error should teach the grammar: {err}"
+        );
+    }
+
+    #[test]
+    fn real_targets_parse() {
+        for entry in [
+            "web=127.0.0.1:8080",
+            "ssh=sshd:",
+            "proxy=fetch:",
+            "db=unix:/run/db.sock",
+            "127.0.0.1:5000",
+        ] {
+            assert!(
+                parse_services(&[entry.to_owned()]).is_ok(),
+                "{entry} should parse"
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_service_pointed_at_a_bogus_addr_is_rejected() {
+        assert!(parse_services(&["web=nonsense".to_owned()]).is_err());
+    }
 }
