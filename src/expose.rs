@@ -8,7 +8,7 @@ use bifrost::{Discovery, Node, NodeId, Session, Transport};
 use clap::Args;
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
-use nauthy::{Cap, Decision, Denylist, Gate, Refusal, Service};
+use nauthy::{Admitted, Cap, Denylist, Gate, Refusal, Service};
 use tokio::io;
 use tokio::net::TcpStream;
 
@@ -254,8 +254,8 @@ where
             .map_err(Into::into);
     };
 
-    match admit(&gate, peer, request.capability.as_deref(), &service) {
-        Ok(()) => {}
+    let admitted = match admit(&gate, peer, request.capability.as_deref(), &service) {
+        Ok(admitted) => admitted,
         Err(refusal) => {
             tracing::warn!(%peer, service = %service, %refusal, "refused");
             return Response::Error(refusal)
@@ -263,7 +263,7 @@ where
                 .await
                 .map_err(Into::into);
         }
-    }
+    };
 
     match services.get(service.as_str()) {
         // `fetch:` is the HTTP egress target: rather than splice to a fixed local socket, the node acts
@@ -280,7 +280,9 @@ where
             #[cfg(feature = "ssh")]
             {
                 Response::Ok.write(&mut writer).await?;
-                sshh::serve(host_seed, writer, reader).await?;
+                // The gate admitted this peer; the `Admitted` witness proves it at the type level, so a
+                // keyless shell can never be reached un-gated.
+                sshh::serve(&admitted, host_seed, writer, reader).await?;
             }
             #[cfg(not(feature = "ssh"))]
             Response::Error(
@@ -309,28 +311,28 @@ where
     Ok(())
 }
 
-/// Apply the gate to a request, mapping a refusal to a peer-facing reason string.
+/// Apply the gate to a request, returning the [`Admitted`] witness on success or a peer-facing refusal
+/// string. The witness is required to reach a service handler, so "authorize before serve" is a
+/// compile-time precondition (see [`nauthy::Admitted`]).
 fn admit(
     gate: &Gate,
     peer: NodeId,
     capability: Option<&str>,
     service: &Service,
-) -> Result<(), String> {
+) -> Result<Admitted, String> {
     // Parse a presented capability at the edge; a malformed token is a refusal, not a hard error, so the
     // connector gets a clean "not permitted" rather than a dropped stream.
     let cap = match capability.map(Cap::parse).transpose() {
         Ok(cap) => cap,
         Err(_) => return Err("malformed capability".to_owned()),
     };
-    match gate.admit(peer, cap.as_ref(), service) {
-        Decision::Admit => Ok(()),
-        Decision::Refuse(Refusal::Missing) => Err("this service requires a capability".to_owned()),
-        Decision::Refuse(Refusal::NotGranted) => {
-            Err("capability does not grant this service".to_owned())
-        }
-        Decision::Refuse(Refusal::NotPermitted) => Err("not permitted".to_owned()),
-        Decision::Refuse(Refusal::Revoked) => Err("capability has been revoked".to_owned()),
-    }
+    gate.admit_witnessed(peer, cap.as_ref(), service)
+        .map_err(|refusal| match refusal {
+            Refusal::Missing => "this service requires a capability".to_owned(),
+            Refusal::NotGranted => "capability does not grant this service".to_owned(),
+            Refusal::NotPermitted => "not permitted".to_owned(),
+            Refusal::Revoked => "capability has been revoked".to_owned(),
+        })
 }
 
 /// Parse `name=addr` service entries; a bare `addr` becomes the `default` service.
