@@ -8,9 +8,10 @@ use crate::config::revoked_path;
 /// Revoke a `sheer:` capability link so this node refuses it from now on.
 ///
 /// A cap is a bearer token verified offline, so there is no server to tell "stop honoring this". Instead
-/// the node keeps a denylist of revoked ids: this records the link's id (and every narrower cap delegated
-/// from it), so the gate refuses it at once rather than waiting for its expiry. Local and offline; no node
-/// is bound and no identity is needed.
+/// the node keeps a denylist of revoked ids: this records the link's id, so the gate refuses it at once
+/// rather than waiting for its expiry. It revokes EXACTLY the link you pass and every narrower cap
+/// delegated from it, NOT the wider grant it was attenuated from (paste the root link to kill the whole
+/// tree). Local and offline; no node is bound and no identity is needed.
 #[derive(Debug, Args)]
 pub struct RevokeCmd {
     /// The `sheer:` link to revoke (revokes it and everything attenuated from it).
