@@ -53,7 +53,7 @@ async fn tunnels_to_a_unix_socket() {
                     allow: Vec::new(),
                     quiet: false,
                 }
-                .run(&exposer, identity, approved)
+                .run(&exposer, identity, [0u8; 32], approved)
                 .await
                 .unwrap();
             });

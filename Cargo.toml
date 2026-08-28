@@ -6,13 +6,17 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+# theia
 bifrost = { path = "../bifrost/crates/bifrost" }
 bifrost-iroh = { path = "../bifrost/crates/transports/bifrost-iroh" }
 bifrost-mdns = { path = "../bifrost/crates/bifrost-mdns" }
+nauthy = { path = "../nauthy" }
+sshh = { path = "../sshh", optional = true }
+
+blake3 = "1"
 clap = { version = "4", features = ["derive", "env"] }
 eyre = "0.6"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
-nauthy = { path = "../nauthy" }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 thiserror = "2"
@@ -20,6 +24,11 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = { version = "1", features = ["derive"] }
+
+[features]
+# `ssh` bundles the `sshh` keyless-ssh service as an `expose ssh=sshd:` target. Off by default so the
+# tunnel stays lean: russh/ssh-key/pty-process live in `sshh` and are only pulled in with this feature.
+ssh = ["dep:sshh"]
 
 [dev-dependencies]
 bifrost-mem = { path = "../bifrost/crates/transports/bifrost-mem" }

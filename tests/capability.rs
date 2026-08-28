@@ -43,7 +43,7 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
                     allow: Vec::new(),
                     quiet: false,
                 }
-                .run(&exposer, gate_identity, approved)
+                .run(&exposer, gate_identity, [0u8; 32], approved)
                 .await
                 .unwrap();
             });

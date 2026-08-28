@@ -84,8 +84,12 @@ async fn main() -> eyre::Result<()> {
         Command::Expose(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
             let cap_identity = secret.cap_identity()?;
+            // Derive the ssh host-key seed before the secret is consumed by the bind. Only a `sshd:`
+            // service uses it, but it is cheap and keeps the secret's raw bytes from leaving for it.
+            let host_seed = secret.ssh_host_seed();
             let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
-            cmd.run(&node, cap_identity, approved_path()?).await
+            cmd.run(&node, cap_identity, host_seed, approved_path()?)
+                .await
         }
         Command::Connect(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;

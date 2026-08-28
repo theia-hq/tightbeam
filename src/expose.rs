@@ -56,10 +56,23 @@ impl ExposeCmd {
         self,
         node: &Node<T, D>,
         identity: Identity,
+        host_seed: [u8; 32],
         approved_path: PathBuf,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<()>
+    where
+        <T::Session as Session>::Write: Send + 'static,
+        <T::Session as Session>::Read: Send + 'static,
+    {
         let gate = Arc::new(self.gate(identity, approved_path).await?);
         let services = Arc::new(parse_services(&self.services)?);
+        // A shell service has no auth of its own, so the gate IS its authentication: refuse to expose one
+        // with an open gate, which would hand a keyless shell to anyone who reaches this node.
+        if matches!(self.gate, GateMode::Open) && services.values().any(|addr| addr == "sshd:") {
+            eyre::bail!(
+                "a shell service (sshd:) has no auth of its own and must be gated; \
+                 use --gate cap or --gate strict, not open"
+            );
+        }
         // The readiness banner names the node id; `--quiet` withholds it so a key never lands in an
         // unattended log. The tunnel is unaffected either way.
         if !self.quiet {
@@ -89,6 +102,7 @@ impl ExposeCmd {
                         session,
                         Arc::clone(&gate),
                         Arc::clone(&services),
+                        host_seed,
                     ));
                 }
                 Some(result) = sessions.next(), if !sessions.is_empty() => {
@@ -116,14 +130,26 @@ async fn serve_session<S: Session>(
     session: S,
     gate: Arc<Gate>,
     services: Arc<HashMap<String, String>>,
-) -> eyre::Result<()> {
+    host_seed: [u8; 32],
+) -> eyre::Result<()>
+where
+    S::Write: Send + 'static,
+    S::Read: Send + 'static,
+{
     let peer = session.peer();
     let mut pipes = FuturesUnordered::new();
     loop {
         tokio::select! {
             accepted = session.accept_bi() => {
                 let (writer, reader) = accepted?;
-                pipes.push(serve_request(peer, writer, reader, Arc::clone(&gate), Arc::clone(&services)));
+                pipes.push(serve_request(
+                    peer,
+                    writer,
+                    reader,
+                    Arc::clone(&gate),
+                    Arc::clone(&services),
+                    host_seed,
+                ));
             }
             Some(result) = pipes.next(), if !pipes.is_empty() => {
                 if let Err(error) = result {
@@ -139,16 +165,18 @@ async fn serve_session<S: Session>(
 /// The gate decides per stream, not per session, because the requested service (and any presented
 /// capability) is a property of the stream: one session may carry several service requests, each gated on
 /// its own merits.
+#[cfg_attr(not(feature = "ssh"), allow(unused_variables))]
 async fn serve_request<W, R>(
     peer: NodeId,
     mut writer: W,
     mut reader: R,
     gate: Arc<Gate>,
     services: Arc<HashMap<String, String>>,
+    host_seed: [u8; 32],
 ) -> eyre::Result<()>
 where
-    W: io::AsyncWrite + Unpin,
-    R: io::AsyncRead + Unpin,
+    W: io::AsyncWrite + Unpin + Send + 'static,
+    R: io::AsyncRead + Unpin + Send + 'static,
 {
     let request = Request::read(&mut reader).await?;
     let Ok(service) = request.service.parse::<Service>() else {
@@ -176,6 +204,23 @@ where
         Some(addr) if addr == "fetch:" => {
             Response::Ok.write(&mut writer).await?;
             crate::fetch::serve_fetch(&mut writer, &mut reader).await?;
+        }
+        // `sshd:` is a keyless SSH server (the `sshh` crate): the cap gate already authorized the peer, so
+        // the ssh server accepts auth `none`. A standard `ssh`/`scp` client reaches a shell with no ssh
+        // keys, the way Tailscale SSH is keyless behind WireGuard. Built only with `--features ssh`, so the
+        // heavy russh/pty dependency tree stays out of the default tunnel binary.
+        Some(addr) if addr == "sshd:" => {
+            #[cfg(feature = "ssh")]
+            {
+                Response::Ok.write(&mut writer).await?;
+                sshh::serve(host_seed, writer, reader).await?;
+            }
+            #[cfg(not(feature = "ssh"))]
+            Response::Error(
+                "ssh support not built in; rebuild tightbeam with --features ssh".to_owned(),
+            )
+            .write(&mut writer)
+            .await?;
         }
         Some(addr) => {
             Response::Ok.write(&mut writer).await?;
