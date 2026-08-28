@@ -256,7 +256,15 @@ where
             dial_and_splice(addr, writer, reader).await?;
         }
         None => {
-            let message = format!("unknown service {:?}", service.as_str());
+            // Name what this node DOES expose, so a service-name mismatch (the connector defaulting to
+            // `default` while the exposer named `web`) reads as a fixable error, not an opaque reset.
+            let mut available: Vec<&str> = services.keys().map(String::as_str).collect();
+            available.sort_unstable();
+            let message = format!(
+                "unknown service {:?}; this node exposes: {}",
+                service.as_str(),
+                available.join(", ")
+            );
             Response::Error(message).write(&mut writer).await?;
         }
     }

@@ -147,7 +147,10 @@ async fn serve_port<S: Session>(session: &S, plan: &Plan, port: u16) -> eyre::Re
             }
             Some(result) = pipes.next(), if !pipes.is_empty() => {
                 if let Err(error) = result {
-                    tracing::warn!(%error, "pipe ended");
+                    // A refused stream (wrong `--service`, a revoked or non-granting cap) is
+                    // user-actionable, not a transient to bury in a log: surface it, so a silent
+                    // "connection reset" on the local port always carries the reason the peer gave.
+                    eprintln!("connection failed: {error:#}");
                 }
             }
         }
