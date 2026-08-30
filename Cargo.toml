@@ -7,14 +7,11 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # theia
-# Pinned to a rev for reproducible releases: a tag builds the exact sibling commits, not floating HEAD.
-# The root .cargo/config.toml [patch] overrides these with local paths for dev, so rev is dev-irrelevant.
-# Bump on release: `cargo update -p <crate>` (or edit the rev) to advance deliberately.
-bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "ba4fa897c80eae95ebdf874940dca2aac47100d7" }
-bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "ba4fa897c80eae95ebdf874940dca2aac47100d7" }
-bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "ba4fa897c80eae95ebdf874940dca2aac47100d7" }
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "1c1a15b43789a50925d06361d7a8a4cc856abedd" }
-sshh = { git = "https://github.com/theia-hq/sshh", rev = "e1f6e0eff68568686a1ffa2b5b2a40f910c646fc", optional = true }
+bifrost = { git = "https://github.com/theia-hq/bifrost" }
+bifrost-iroh = { git = "https://github.com/theia-hq/bifrost" }
+bifrost-mdns = { git = "https://github.com/theia-hq/bifrost" }
+nauthy = { git = "https://github.com/theia-hq/nauthy" }
+sshh = { git = "https://github.com/theia-hq/sshh", optional = true }
 
 blake3 = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -34,7 +31,7 @@ zeroize = { version = "1", features = ["derive"] }
 ssh = ["dep:sshh"]
 
 [dev-dependencies]
-bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "ba4fa897c80eae95ebdf874940dca2aac47100d7" }
+bifrost-mem = { git = "https://github.com/theia-hq/bifrost" }
 
 [lints.clippy]
 unwrap_used = "deny"
