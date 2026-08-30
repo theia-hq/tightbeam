@@ -40,6 +40,40 @@ pub async fn write_anchor(signet: NodeId) -> eyre::Result<()> {
     Ok(())
 }
 
+/// The persisted membership-badge location, `~/.config/tightbeam/badge`, overridable with
+/// `TIGHTBEAM_BADGE`. Holds one `sheer:` link: the badge the signet signed for this device at `mint`,
+/// which the device presents when it dials a family-gated node. A bearer cap, but bound to this device's
+/// key, so it sits beside the anchor rather than inside the secret identity.
+pub fn badge_path() -> eyre::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("TIGHTBEAM_BADGE") {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(config_dir()?.join("badge"))
+}
+
+/// Load this device's membership badge (a `sheer:` link), or `None` if it was never provisioned with one.
+/// The signet holder self-signs instead of storing one, and an unprovisioned node simply has none.
+// `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
+#[allow(clippy::std_instead_of_core)]
+pub async fn load_badge() -> eyre::Result<Option<String>> {
+    match tokio::fs::read_to_string(badge_path()?).await {
+        Ok(text) => Ok(Some(text.trim().to_owned())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Write this device's membership badge, as `adopt` stores it from an authkey. Overwrites any prior badge
+/// (re-provisioning re-badges), creating the config dir.
+pub async fn write_badge(badge: &str) -> eyre::Result<()> {
+    let path = badge_path()?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&path, format!("{badge}\n")).await?;
+    Ok(())
+}
+
 /// The persisted revocation-denylist location, `~/.config/tightbeam/revoked`, overridable with
 /// `TIGHTBEAM_REVOKED`. Records the biscuit revocation ids of caps this node has revoked.
 pub fn revoked_path() -> eyre::Result<PathBuf> {
