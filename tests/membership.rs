@@ -2,10 +2,10 @@
 // only test-attributed functions); panicking on failed test setup is exactly the intent.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-//! The membership badge, end to end over the in-process transport: a device presenting a `theia:member`
-//! badge its signet signed reaches ANY service on a family-gated node — no `--allow`, no per-service slip.
-//! And a badge BOUND to one device (`mint_member`) is refused when a different device presents it, so a
-//! leaked badge is useless off its key.
+//! The membership badge, end to end over the in-process transport: a device presenting a badge its signet
+//! signed — a cap carrying a `member(true)` fact in its authority block — reaches ANY service on a
+//! family-gated node, with no per-service slip. And a badge BOUND to one device (`mint_member`) is
+//! refused when a different device presents it, so a leaked badge is useless off its key.
 //!
 //! The family gate rules on the presented token AND the proven dialer: `admit_family` injects the peer the
 //! transport proved as a `bound_device` fact, and a bound badge grants only when that fact matches its
