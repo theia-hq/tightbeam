@@ -45,8 +45,6 @@ async fn tunnels_tcp_over_bifrost() {
             tokio::task::spawn_local(async move {
                 ExposeCmd {
                     services: vec![echo_addr.to_string()],
-                    allow: Vec::new(),
-                    trust_root: None,
                     public: true,
                     quiet: false,
                 }

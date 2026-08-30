@@ -39,8 +39,6 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
             tokio::task::spawn_local(async move {
                 ExposeCmd {
                     services: vec![format!("ssh={echo_addr}")],
-                    allow: Vec::new(),
-                    trust_root: None,
                     public: false,
                     quiet: false,
                 }

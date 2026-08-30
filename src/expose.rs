@@ -38,14 +38,6 @@ pub struct ExposeCmd {
     /// expose local services as `name=addr` (bare `addr` = `default`)
     #[arg(required = true, value_name = "name=addr")]
     pub services: Vec<String>,
-    /// Admit exactly these keys, no signet needed (the raw allowlist floor). Repeatable. Presence of
-    /// `--allow` gates on the list instead of the node's signet anchor.
-    #[arg(long = "allow", value_name = "node-id")]
-    pub allow: Vec<String>,
-    /// Trust this signet instead of the node's provisioned anchor: the foreign-issuer hatch (a runner
-    /// trusting YOUR key without ever holding your secret, so a compromised runner can mint no access).
-    #[arg(long, value_name = "node-id")]
-    pub trust_root: Option<NodeId>,
     /// Expose to ANYONE, unauthenticated: the one deliberate opt-out from the signet. Refused for a shell
     /// service (`sshd:`), which has no auth of its own.
     #[arg(long)]
@@ -130,21 +122,17 @@ impl ExposeCmd {
         }
     }
 
-    /// Build the authorization gate. Not a policy menu: the default is the node's signet anchor, and the
-    /// flags are exceptions. `--public` opens the door to anyone; `--allow` names a raw allowlist;
-    /// otherwise the gate is the signet (an explicit `--trust-root`, else the provisioned anchor), which
-    /// fails LOUDLY if neither is set rather than falling back to anything permissive.
+    /// Build the authorization gate. Two modes, no policy menu: the default gates on the node's signet
+    /// anchor (admitting its members and delegates), and `--public` is the one deliberate opt-out to
+    /// anyone. Unprovisioned + not public fails LOUDLY rather than falling back to anything permissive.
     async fn gate(&self, anchor: Option<NodeId>) -> eyre::Result<Gate> {
         if self.public {
             return Ok(Gate::Open);
         }
-        if !self.allow.is_empty() {
-            return Ok(Gate::Strict(parse_allowed(&self.allow)?));
-        }
-        let root = self.trust_root.or(anchor).ok_or_else(|| {
+        let root = anchor.ok_or_else(|| {
             eyre::eyre!(
                 "this node has no signet to gate on: provision it with `swoosh adopt <authkey>`, \
-                 or pass --trust-root <signet>, --allow <key>, or --public"
+                 or pass --public to expose to anyone"
             )
         })?;
         // The revocation denylist is loaded once here; a `tightbeam revoke` adds to the file, which the
@@ -157,10 +145,8 @@ impl ExposeCmd {
     fn gate_description(&self, anchor: Option<NodeId>) -> String {
         if self.public {
             "public (anyone, unauthenticated)".to_owned()
-        } else if !self.allow.is_empty() {
-            format!("allowlist ({} key(s))", self.allow.len())
         } else {
-            match self.trust_root.or(anchor) {
+            match anchor {
                 Some(root) => format!("signet {}", root.short()),
                 None => "unprovisioned".to_owned(),
             }
@@ -334,7 +320,6 @@ fn admit(
         .map_err(|refusal| match refusal {
             Refusal::Missing => "this service requires a capability".to_owned(),
             Refusal::NotGranted => "capability does not grant this service".to_owned(),
-            Refusal::NotPermitted => "not permitted".to_owned(),
             Refusal::Revoked => "capability has been revoked".to_owned(),
         })
 }
@@ -394,13 +379,6 @@ fn validate_addr(addr: &str, entry: &str) -> eyre::Result<()> {
     eyre::bail!(
         "`{addr}` is not a valid forwarding address (host:port, unix:<path>, sshd:, or fetch:)"
     )
-}
-
-/// Parse node ids into an allowlist set.
-fn parse_allowed(ids: &[String]) -> eyre::Result<std::collections::HashSet<NodeId>> {
-    ids.iter()
-        .map(|id| id.parse::<NodeId>().map_err(Into::into))
-        .collect()
 }
 
 /// Dial a service target (a `unix:<path>` socket or a `host:port`) and pipe it to the bifrost stream.

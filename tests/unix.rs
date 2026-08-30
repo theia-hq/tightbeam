@@ -45,8 +45,6 @@ async fn tunnels_to_a_unix_socket() {
             tokio::task::spawn_local(async move {
                 ExposeCmd {
                     services: vec![service],
-                    allow: Vec::new(),
-                    trust_root: None,
                     public: true,
                     quiet: false,
                 }

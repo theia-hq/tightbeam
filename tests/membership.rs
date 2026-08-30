@@ -44,8 +44,6 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             tokio::task::spawn_local(async move {
                 ExposeCmd {
                     services: vec![format!("web={echo_addr}")],
-                    allow: Vec::new(),
-                    trust_root: None,
                     public: false,
                     quiet: false,
                 }
