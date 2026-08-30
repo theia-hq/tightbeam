@@ -43,7 +43,7 @@ where
 /// the client decides; TLS terminates at this node.
 ///
 /// The origin is vetted before any connection: only `http`/`https`, and the host must resolve ENTIRELY to
-/// public addresses. This stops a slip-holder from turning the node into an SSRF pivot — fetching its
+/// public addresses. This stops a slip-holder from turning the node into an SSRF pivot: fetching its
 /// loopback, its LAN (RFC1918), or the cloud metadata endpoint (`169.254.169.254`) to steal instance
 /// credentials. The vetted address is pinned into the client so a DNS rebind between the check and the
 /// connect cannot swap a public answer for a private one.
@@ -144,8 +144,8 @@ pub(crate) fn forward_headers(headers: &[(String, String)]) -> Vec<(&str, &str)>
 }
 
 /// Resolve `host:port` and require EVERY resolved address to be public, returning the first. A host that
-/// resolves to any non-public address is refused wholesale — that mix is the classic SSRF / DNS-rebinding
-/// shape — while a legitimately public host resolves only to public IPs. The returned address is what the
+/// resolves to any non-public address is refused wholesale (that mix is the classic SSRF / DNS-rebinding
+/// shape), while a legitimately public host resolves only to public IPs. The returned address is what the
 /// client is pinned to, so the connection lands on a vetted IP.
 async fn resolve_public(host: &str, port: u16) -> Result<SocketAddr, String> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
@@ -164,7 +164,7 @@ async fn resolve_public(host: &str, port: u16) -> Result<SocketAddr, String> {
     Ok(first)
 }
 
-/// Whether an IP is a public (globally routable) unicast address — the only kind `fetch:` will reach.
+/// Whether an IP is a public (globally routable) unicast address: the only kind `fetch:` will reach.
 /// Conservative: loopback, private, link-local, shared (CGNAT), unspecified, and multicast are all NOT
 /// public. Any IPv6 that EMBEDS an IPv4 address (mapped, NAT64, or the deprecated compatible form) is
 /// unwrapped and judged as IPv4, so `::ffff:169.254.169.254` AND the NAT64 `64:ff9b::169.254.169.254`
@@ -204,7 +204,7 @@ fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
         return Some(low(seg[6], seg[7]));
     }
     // IPv4-translatable `::ffff:0:0/96` (RFC 6052): the `ffff` sits in seg[4] (seg[5]==0), so
-    // `to_ipv4_mapped` — which matches `ffff` in seg[5] — does not catch it.
+    // `to_ipv4_mapped` (which matches `ffff` in seg[5]) does not catch it.
     if seg[0..4] == [0, 0, 0, 0] && seg[4] == 0xffff && seg[5] == 0 {
         return Some(low(seg[6], seg[7]));
     }

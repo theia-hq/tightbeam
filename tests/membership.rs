@@ -3,14 +3,14 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 //! The membership badge, end to end over the in-process transport: a device presenting a badge its signet
-//! signed — a cap carrying a `member(true)` fact in its authority block — reaches ANY service on a
+//! signed (a cap carrying a `member(true)` fact in its authority block) reaches ANY service on a
 //! family-gated node, with no per-service slip. And a badge BOUND to one device (`mint_member`) is
 //! refused when a different device presents it, so a leaked badge is useless off its key.
 //!
 //! The family gate rules on the presented token AND the proven dialer: `admit_family` injects the peer the
 //! transport proved as a `bound_device` fact, and a bound badge grants only when that fact matches its
 //! binding. Over `mem` the proven peer is the transport's synthetic node id, independent of the signet's
-//! cap key — which is exactly what lets this test bind a badge to the connector's proven id and exercise
+//! cap key, which is exactly what lets this test bind a badge to the connector's proven id and exercise
 //! the binding check without a keyed transport. Over iroh/quirk the two coincide (the node binds under the
 //! signet secret), so the same badge both proves membership and matches its own binding.
 
@@ -55,7 +55,7 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             let signet = Identity::from_secret(&SIGNET_SECRET).unwrap();
 
             // The owner's device: a consumer node whose PROVEN id the signet binds the badge to. The badge
-            // grants membership (whole-node), bound to this device — the `swoosh mint` shape.
+            // grants membership (whole-node), bound to this device: the `swoosh mint` shape.
             let device = Node::new(MemTransport::bind(), NoDiscovery);
             let device_badge = signet
                 .mint_member(device.node_id(), nauthy::expires_in(Duration::from_secs(3600)))
