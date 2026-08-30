@@ -2,6 +2,8 @@
 # tightbeam depends on its theia siblings (bifrost, nauthy, sshh, ...) by git URL, so cargo fetches
 # them during the build: no sibling checkouts needed. Built with `--features ssh` so the released
 # binary can `expose ssh=sshd:` out of the box.
+# NOTE: those git deps are unpinned (default-branch HEAD), so a tag is not yet fully reproducible; pin a
+# rev per release to fix (see the release-reproducibility entry in notes/02-DECISIONS.md).
 name: release
 on:
   push:
