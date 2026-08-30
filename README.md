@@ -7,6 +7,10 @@ nothing in between. `ssh -L` shaped, but pubkey-addressed.
 Powered by [bifrost](https://github.com/theia-hq/bifrost) for the keyed connection and
 [nauthy](https://github.com/theia-hq/nauthy) for authorizing who may connect.
 
+**The name.** A tightbeam is a tight, aimed beam: a private point-to-point link that goes only where
+you point it, not out to everyone. That is what this does, one machine's service reaching exactly
+one other, addressed by key.
+
 > Experimental. Works for TCP over the iroh transport; not ready for production use.
 
 ## Installation
@@ -39,21 +43,22 @@ tightbeam expose 127.0.0.1:22      # on the host
 tightbeam connect <node-id> --to 2222
 ```
 
-Restrict who may connect with a gate: `--gate strict --allow <node-id>` (an allowlist, repeatable),
-`--gate paired` (approve peers on first contact, `tightbeam approve <node-id>`), or `--gate cap` (a
-presented capability, below). The default is `--gate open`.
+By default a service is gated to this node's signet, set once by `swoosh adopt`: it admits the owner's
+own devices and anyone they delegate a capability to (below), and refuses everyone else. Pass
+`--public` to open a service to anyone, unauthenticated, the one deliberate opt-out.
 
 `expose --quiet` suppresses the readiness banner, so the node's key never lands in a log, for unattended
 or CI use. The tunnel runs the same either way.
 
 ## Share a service as a capability
 
-`--gate cap` turns access into a bearer capability: a signed, expiring, attenuable link rooted at this
-node's own identity, verified offline with no server and no allowlist to sync.
+The default gate already accepts capabilities: a signed, expiring, attenuable link rooted at this
+node's signet, verified offline with no server and no allowlist to sync. Mint one with `share` and
+hand it to someone outside your own devices.
 
 ```sh
-# on the host: gate ssh on a capability
-tightbeam expose ssh=127.0.0.1:22 --gate cap
+# on the host: expose ssh, gated to your signet by default
+tightbeam expose ssh=127.0.0.1:22
 
 # mint a share-link for ssh, valid two hours, that the holder may narrow and hand on
 tightbeam share ssh --expires 2h --delegable      # prints sheer:<node>.<token>
@@ -67,7 +72,8 @@ tightbeam connect <link> --to 2222
 
 The link works only for the service it grants, expires on its own, and can be narrowed and delegated
 without the host's involvement. Drop `--delegable` to seal a link so its recipient can use but not
-re-share it. Short expiry is the v1 revocation story; there is no server to ask. See
+re-share it. `tightbeam revoke <link>` cuts a link off at once, without waiting for its expiry; short
+expiry backs that up. There is no server to ask, only a node-local denylist. See
 [DEMO-WEDGE.md](DEMO-WEDGE.md) for a full run over iroh.
 
 ## ssh over the overlay
@@ -124,8 +130,8 @@ at the requester. It is GET/HEAD only and scoped to the URL asked for, so it is 
 proxy.
 
 ```sh
-# on the exit host: gate the fetch service on a capability
-tightbeam expose fetch=fetch: --gate cap
+# on the exit host: expose the fetch service, gated to your signet by default
+tightbeam expose fetch=fetch:
 ```
 
 A requester hands the exit an origin URL and receives the body over the stream. `swoosh fetch <url>
@@ -160,9 +166,10 @@ must outlive any one command. That is why the `ProxyCommand` recipe ships first 
 
 - Built on [`bifrost`](https://github.com/theia-hq/bifrost) (reach): each proxied connection is one
   bidirectional stream. It is transport-blind and rides any bifrost transport.
-- Only a peer holding the key can dial, and authorization (allowlist / pairing / capability) is enforced
-  by the [`nauthy`](https://github.com/theia-hq/nauthy) crate: the first two on the identity the handshake
-  proves, the capability gate on a presented `sheer:` token.
+- Only a peer holding the key can dial, and authorization is enforced by the
+  [`nauthy`](https://github.com/theia-hq/nauthy) crate: the default gate admits a presented `sheer:`
+  token rooted at this node's signet (a device's membership badge or a delegated service slip);
+  `--public` is the only opt-out.
 - TCP and unix-socket (`unix:<path>`) targets are supported.
 
 ## License

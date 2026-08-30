@@ -1,6 +1,6 @@
 [package]
 name = "tightbeam"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -43,7 +43,7 @@ std_instead_of_core = "warn"
 unused_must_use = "deny"
 
 # Ship a lean release binary: strip symbols, whole-program LTO, single codegen unit. Halves the artifact
-# (~26MB -> ~13-15MB) at no runtime cost — only a longer release link, which is a CI concern, not a user's.
+# (~26MB -> ~13-15MB) at no runtime cost: only a longer release link, which is a CI concern, not a user's.
 [profile.release]
 strip = true
 lto = true
