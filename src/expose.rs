@@ -28,12 +28,12 @@ const MAX_STREAMS_PER_SESSION: usize = 256;
 
 /// How the readiness banner names the tool exposing the services, so the same code serves both callers
 /// without hardcoding one binary. `tightbeam expose` says "tightbeam ... `tightbeam share`"; `swoosh
-/// tunnel expose` says "swoosh tunnel ... `swoosh share`". Two `&str`s, not one, because the ready-name
-/// and the share-verb differ (`swoosh tunnel` vs `swoosh share`).
+/// tunnel expose` says "swoosh tunnel ... `swoosh grant issue`". Two `&str`s, not one, because the
+/// ready-name and the mint-verb differ (`swoosh tunnel` vs `swoosh grant issue`).
 pub struct Brand {
     /// The name that leads the readiness banner, e.g. `tightbeam` or `swoosh tunnel`.
     pub ready: &'static str,
-    /// The exact command that mints a link for this node, e.g. `tightbeam share` or `swoosh share`.
+    /// The exact command that mints a link for this node, e.g. `tightbeam share` or `swoosh grant issue`.
     pub share: &'static str,
 }
 
