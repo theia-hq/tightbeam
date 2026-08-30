@@ -295,7 +295,10 @@ where
             {
                 Response::Ok.write(&mut writer).await?;
                 // The gate admitted this peer; the `Admitted` witness proves it at the type level, so a
-                // keyless shell can never be reached un-gated.
+                // keyless shell can never be reached un-gated. The witness binds no peer itself, so this
+                // guarantee holds only because the admit (above) and this serve share one stream frame:
+                // never hoist the admit to session scope, or one witness would cover streams the gate
+                // never ruled on.
                 sshh::serve(&admitted, host_seed, writer, reader).await?;
             }
             #[cfg(not(feature = "ssh"))]
