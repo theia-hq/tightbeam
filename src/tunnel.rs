@@ -148,6 +148,16 @@ impl Registry {
         self
     }
 
+    /// Absorb another registry's handlers into this one, so a caller can merge its injected handlers with
+    /// the defaults the embedder built (an entry from `other` wins on a scheme collision).
+    #[must_use]
+    pub fn extend(mut self, other: Registry) -> Self {
+        let Self(handlers) = &mut self;
+        let Registry(others) = other;
+        handlers.extend(others);
+        self
+    }
+
     /// Look up a handler by scheme.
     fn get(&self, scheme: &str) -> Option<&Handler> {
         let Self(handlers) = self;

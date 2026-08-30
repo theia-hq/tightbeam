@@ -76,6 +76,7 @@ impl ExposeCmd {
         host_seed: [u8; 32],
         signet: Option<NodeId>,
         brand: Brand,
+        extra: tunnel::Registry,
     ) -> eyre::Result<()>
     where
         <T::Session as Session>::Write: Send + 'static,
@@ -93,6 +94,9 @@ impl ExposeCmd {
         let registry = registry.with("sshd", crate::handlers::sshd(host_seed));
         #[cfg(not(feature = "ssh"))]
         let _ = host_seed;
+        // Merge the caller's injected handlers (swoosh's `diag:`) over tightbeam's own; the embedder that
+        // depends on the service crates owns what plugs in, the tunnel names only its raw-forward primitives.
+        let registry = registry.extend(extra);
         // The domain assembles the exposer, enforcing the sshd-cannot-be-public invariant before any
         // banner is printed, so a refused pairing never advertises a shell it will not serve.
         let exposer = Exposer::new(services.clone(), registry, gate)?;

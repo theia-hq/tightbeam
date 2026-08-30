@@ -109,7 +109,10 @@ async fn main() -> eyre::Result<()> {
                 reason = "Brand removed in step 4; tightbeam names itself here for now"
             )]
             let brand = Brand::TIGHTBEAM;
-            cmd.run(&node, host_seed, signet, brand).await
+            // tightbeam's own CLI injects no service crate: only its raw forwards + the sshd/fetch handlers
+            // ExposeCmd builds itself. swoosh is the embedder that adds `diag:`.
+            cmd.run(&node, host_seed, signet, brand, tightbeam::tunnel::Registry::new())
+                .await
         }
         Command::Connect(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
