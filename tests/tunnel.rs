@@ -44,7 +44,7 @@ async fn tunnels_tcp_over_bifrost() {
             // so any peer reaching the key is served (this test exercises the tunnel path, not authorization).
             tokio::task::spawn_local(async move {
                 let services = Services::parse(&[echo_addr.to_string()]).unwrap();
-                Exposer::new(services, Gate::Open, [0u8; 32])
+                Exposer::new(services, tightbeam::tunnel::Registry::new(), Gate::Open)
                     .unwrap()
                     .run(&exposer)
                     .await

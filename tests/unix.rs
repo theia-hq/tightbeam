@@ -44,7 +44,7 @@ async fn tunnels_to_a_unix_socket() {
             let service = format!("unix:{}", sock.display());
             tokio::task::spawn_local(async move {
                 let services = Services::parse(&[service]).unwrap();
-                Exposer::new(services, Gate::Open, [0u8; 32])
+                Exposer::new(services, tightbeam::tunnel::Registry::new(), Gate::Open)
                     .unwrap()
                     .run(&exposer)
                     .await

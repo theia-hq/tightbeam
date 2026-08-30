@@ -15,6 +15,7 @@ pub mod config;
 pub mod connect;
 pub mod duration;
 pub mod expose;
+pub mod handlers;
 pub mod http;
 pub mod identity;
 pub mod peer;

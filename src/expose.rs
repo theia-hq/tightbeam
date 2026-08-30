@@ -85,9 +85,17 @@ impl ExposeCmd {
         // Build the gate before announcing readiness: an unprovisioned node with no explicit override
         // fails HERE, loudly, rather than ever serving on a permissive default.
         let gate = self.gate(signet).await?;
+        // Assemble the handler registry tightbeam ships (the HTTP egress fetch, and the keyless shell behind
+        // the `ssh` feature), then hand it to the exposer. Injecting further handlers (swoosh's `diag:`) is
+        // the caller's job; tightbeam names only its own.
+        let registry = tunnel::Registry::new().with("fetch", crate::handlers::fetch());
+        #[cfg(feature = "ssh")]
+        let registry = registry.with("sshd", crate::handlers::sshd(host_seed));
+        #[cfg(not(feature = "ssh"))]
+        let _ = host_seed;
         // The domain assembles the exposer, enforcing the sshd-cannot-be-public invariant before any
         // banner is printed, so a refused pairing never advertises a shell it will not serve.
-        let exposer = Exposer::new(services.clone(), gate, host_seed)?;
+        let exposer = Exposer::new(services.clone(), registry, gate)?;
         // The readiness banner names the node id AND the effective gate, so "who can reach this right now?"
         // is answerable at a glance. `--quiet` withholds it so a key never lands in an unattended log.
         if !self.quiet {

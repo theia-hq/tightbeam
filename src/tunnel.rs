@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use bifrost::{Discovery, Node, NodeId, Session, Transport};
 use futures::StreamExt as _;
+use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use nauthy::{Admitted, Cap, Denylist, Gate, Identity, Refusal, Service};
 use tokio::io;
@@ -33,14 +34,25 @@ const MAX_SESSIONS: usize = 256;
 /// The maximum number of in-flight streams per session, bounding what a single connected peer can pin.
 const MAX_STREAMS_PER_SESSION: usize = 256;
 
-/// The local services an exposer publishes: a map of service name to forwarding target (`host:port`,
-/// `unix:<path>`, `sshd:`, or `fetch:`), validated once at parse time so the rest of the core receives
-/// names and addresses that are already well-formed.
+/// A forwarding target for one exposed service, resolved once at parse time so `serve_request` matches an
+/// enum rather than a string prefix: either tightbeam's own raw forward (a local socket it splices to) or a
+/// named handler the caller injected into the [`Registry`].
 #[derive(Debug, Clone)]
-pub struct Services(HashMap<String, String>);
+enum Target {
+    /// tightbeam's own primitive: connect a local `host:port` / `unix:<path>` and splice bytes to it.
+    Forward(String),
+    /// A named service handler (`sshd`, `fetch`, `diag`, ...) dispatched through the injected registry.
+    Handler(String),
+}
+
+/// The local services an exposer publishes: a map of service name to its [`Target`], validated once at
+/// parse time so the rest of the core receives names and targets that are already well-formed.
+#[derive(Debug, Clone)]
+pub struct Services(HashMap<String, Target>);
 
 impl Services {
-    /// Parse `name=addr` service entries; a bare `addr` becomes the `default` service.
+    /// Parse `name=addr` service entries; a bare `addr` becomes the `default` service. A bare scheme
+    /// (`sshd:`, `fetch:`, `diag:`) resolves to a handler; a `host:port` / `unix:<path>` to a raw forward.
     pub fn parse(entries: &[String]) -> eyre::Result<Self> {
         let mut services = HashMap::new();
         for entry in entries {
@@ -51,10 +63,9 @@ impl Services {
             // Validate the name through the same domain type the wire uses, so an exposed name and a
             // requested name are compared as the same kind of thing.
             name.parse::<Service>()?;
-            // Validate the ADDR too: without this, `expose web` silently maps the `default` service to the
-            // literal address "web", which only fails at dial time as an opaque reset. Fail HERE instead.
-            validate_addr(&addr, entry)?;
-            services.insert(name, addr);
+            // Resolve (and validate) the addr into a Target: a bare service name (`expose web`) or a bogus
+            // address fails HERE with a teaching message, not at dial time as an opaque reset.
+            services.insert(name, parse_target(&addr, entry)?);
         }
         Ok(Self(services))
     }
@@ -67,11 +78,80 @@ impl Services {
         names.into_iter()
     }
 
-    /// Whether any exposed service is a keyless shell (`sshd:`), which has no auth of its own and so may
-    /// never be opened to the world. The [`Exposer::new`] invariant checks this.
-    pub fn contains_shell(&self) -> bool {
+    /// The handler schemes this exposer names (e.g. `sshd`, `fetch`), so [`Exposer::new`] can check each
+    /// against the injected registry: every named handler must be registered, and a handler with no auth of
+    /// its own may not sit behind an open gate.
+    fn handler_schemes(&self) -> impl Iterator<Item = &str> {
         let Self(services) = self;
-        services.values().any(|addr| addr == "sshd:")
+        services.values().filter_map(|target| match target {
+            Target::Handler(scheme) => Some(scheme.as_str()),
+            Target::Forward(_) => None,
+        })
+    }
+}
+
+/// A boxed writer half handed to a handler (the accepted stream is already `Send + 'static`, so boxing it
+/// as a trait object is a small per-stream allocation, invisible next to the splice it feeds).
+pub type BoxWrite = Box<dyn io::AsyncWrite + Unpin + Send>;
+/// A boxed reader half handed to a handler.
+pub type BoxRead = Box<dyn io::AsyncRead + Unpin + Send>;
+
+/// A service handler: what to DO with one admitted stream. The tunnel knows only this CONTRACT (a name maps
+/// to a thing that consumes an admitted stream), never what a handler does; a caller that depends on the
+/// service crates injects them. The handler receives the gate's [`Admitted`] witness by value (single-use,
+/// so "authorize before serve" is a compile-time precondition) and the raw stream halves for ONE stream.
+pub type ServeFn =
+    Arc<dyn Fn(Admitted, BoxWrite, BoxRead) -> BoxFuture<'static, eyre::Result<()>> + Send + Sync>;
+
+/// One registered service: how to serve it, and whether it MUST be gated. A handler with no auth of its own
+/// (a keyless shell) declares `requires_gate`, so an open gate over it is refused at [`Exposer::new`].
+pub struct Handler {
+    serve: ServeFn,
+    requires_gate: bool,
+}
+
+impl Handler {
+    /// A handler that may be exposed under any gate (it has auth of its own, or is safe to open).
+    pub fn open(serve: ServeFn) -> Self {
+        Self {
+            serve,
+            requires_gate: false,
+        }
+    }
+
+    /// A handler with no auth of its own: the gate IS its authentication, so an open gate over it is refused.
+    pub fn gated(serve: ServeFn) -> Self {
+        Self {
+            serve,
+            requires_gate: true,
+        }
+    }
+}
+
+/// The scheme -> handler map the [`Exposer`] takes at construction. The caller builds it; the tunnel core
+/// depends on no service crate. Keyed by the `<scheme>:` an exposed service resolves to (`sshd`, `fetch`,
+/// `diag`).
+#[derive(Default)]
+pub struct Registry(HashMap<String, Handler>);
+
+impl Registry {
+    /// An empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register `scheme` -> `handler`, returning self for chaining.
+    #[must_use]
+    pub fn with(mut self, scheme: impl Into<String>, handler: Handler) -> Self {
+        let Self(handlers) = &mut self;
+        handlers.insert(scheme.into(), handler);
+        self
+    }
+
+    /// Look up a handler by scheme.
+    fn get(&self, scheme: &str) -> Option<&Handler> {
+        let Self(handlers) = self;
+        handlers.get(scheme)
     }
 }
 
@@ -85,30 +165,39 @@ pub fn family_gate(signet: NodeId, denylist: Denylist) -> Gate {
     Gate::Family(signet.verify_key(), Box::new(denylist))
 }
 
-/// An exposer: the services to publish, the gate that decides who may reach them, and the ssh host seed a
-/// `sshd:` service needs. Accepts overlay sessions and forwards each inbound stream to its service.
+/// An exposer: the services to publish, the caller-injected handler registry that serves the named ones,
+/// and the gate that decides who may reach them. Accepts overlay sessions and forwards each inbound stream
+/// to its service.
 pub struct Exposer {
     services: Services,
+    registry: Arc<Registry>,
     gate: Gate,
-    host_seed: [u8; 32],
 }
 
 impl Exposer {
-    /// Assemble an exposer, enforcing the one domain invariant a tunnel has: a keyless shell (`sshd:`) has
-    /// no auth of its own, so the gate IS its authentication. An [`Gate::Open`] gate over a shell would hand
-    /// a keyless shell to anyone who reaches this node, so that pairing is refused HERE, where the domain
-    /// lives, rather than trusted to each caller to re-check.
-    pub fn new(services: Services, gate: Gate, host_seed: [u8; 32]) -> eyre::Result<Self> {
-        if matches!(gate, Gate::Open) && services.contains_shell() {
-            eyre::bail!(
-                "a shell service (sshd:) has no auth of its own and must be gated; \
-                 drop --public, which would expose an unauthenticated shell to anyone"
-            );
+    /// Assemble an exposer from the parsed services, the caller-injected handler registry, and the gate,
+    /// enforcing two invariants at the door: every named handler is actually registered (a typo or an
+    /// unbuilt feature fails HERE, not at dial time), and a handler with no auth of its own (a keyless
+    /// shell) may not sit behind an [`Gate::Open`] gate, which would hand it to anyone who reaches the node.
+    pub fn new(services: Services, registry: Registry, gate: Gate) -> eyre::Result<Self> {
+        for scheme in services.handler_schemes() {
+            let Some(handler) = registry.get(scheme) else {
+                eyre::bail!(
+                    "no handler is registered for `{scheme}:` \
+                     (is the feature that provides it built in?)"
+                );
+            };
+            if matches!(gate, Gate::Open) && handler.requires_gate {
+                eyre::bail!(
+                    "a `{scheme}:` service has no auth of its own and must be gated; \
+                     drop --public, which would expose it to anyone who reaches this node"
+                );
+            }
         }
         Ok(Self {
             services,
+            registry: Arc::new(registry),
             gate,
-            host_seed,
         })
     }
 
@@ -121,8 +210,8 @@ impl Exposer {
     {
         let Self {
             services,
+            registry,
             gate,
-            host_seed,
         } = self;
         let services = Arc::new(services);
         let gate = Arc::new(gate);
@@ -145,7 +234,7 @@ impl Exposer {
                         session,
                         Arc::clone(&gate),
                         Arc::clone(&services),
-                        host_seed,
+                        Arc::clone(&registry),
                     ));
                 }
                 Some(result) = sessions.next(), if !sessions.is_empty() => {
@@ -163,7 +252,7 @@ async fn serve_session<S: Session>(
     session: S,
     gate: Arc<Gate>,
     services: Arc<Services>,
-    host_seed: [u8; 32],
+    registry: Arc<Registry>,
 ) -> eyre::Result<()>
 where
     S::Write: Send + 'static,
@@ -187,7 +276,7 @@ where
                         reader,
                         Arc::clone(&gate),
                         Arc::clone(&services),
-                        host_seed,
+                        Arc::clone(&registry),
                     )),
                     Err(error) => {
                         tracing::warn!(%peer, %error, "accept_bi failed; draining in-flight streams");
@@ -212,14 +301,13 @@ where
 /// The gate decides per stream, not per session, because the requested service (and any presented
 /// capability) is a property of the stream: one session may carry several service requests, each gated on
 /// its own merits.
-#[cfg_attr(not(feature = "ssh"), allow(unused_variables))]
 async fn serve_request<W, R>(
     peer: NodeId,
     mut writer: W,
     mut reader: R,
     gate: Arc<Gate>,
     services: Arc<Services>,
-    host_seed: [u8; 32],
+    registry: Arc<Registry>,
 ) -> eyre::Result<()>
 where
     W: io::AsyncWrite + Unpin + Send + 'static,
@@ -261,38 +349,27 @@ where
     };
 
     match services.get(service.as_str()) {
-        // `fetch:` is the HTTP egress target: rather than splice to a fixed local socket, the node acts
-        // as an HTTP client and streams an origin response back (see `crate::fetch`).
-        Some(addr) if addr == "fetch:" => {
-            Response::Ok.write(&mut writer).await?;
-            crate::fetch::serve_fetch(&mut writer, &mut reader).await?;
-        }
-        // `sshd:` is a keyless SSH server (the `sshh` crate): the cap gate already authorized the peer, so
-        // the ssh server accepts auth `none`. A standard `ssh`/`scp` client reaches a shell with no ssh
-        // keys, the way Tailscale SSH is keyless behind WireGuard. Built only with `--features ssh`, so the
-        // heavy russh/pty dependency tree stays out of the default tunnel binary.
-        Some(addr) if addr == "sshd:" => {
-            #[cfg(feature = "ssh")]
-            {
-                Response::Ok.write(&mut writer).await?;
-                // The gate admitted this peer; the `Admitted` witness proves it at the type level, so a
-                // keyless shell can never be reached un-gated. The witness binds no peer itself, so this
-                // guarantee holds only because the admit (above) and this serve share one stream frame:
-                // never hoist the admit to session scope, or one witness would cover streams the gate
-                // never ruled on.
-                sshh::serve(admitted, host_seed, writer, reader).await?;
-            }
-            #[cfg(not(feature = "ssh"))]
-            Response::Error(
-                "ssh support not built in; rebuild tightbeam with --features ssh".to_owned(),
-            )
-            .write(&mut writer)
-            .await?;
-        }
-        Some(addr) => {
+        // tightbeam's own primitive: connect the local socket and splice raw bytes to it.
+        Some(Target::Forward(addr)) => {
             Response::Ok.write(&mut writer).await?;
             dial_and_splice(addr, writer, reader).await?;
         }
+        // A named service: hand the admitted stream to the caller-injected handler. The `Admitted` witness
+        // proves the gate ruled on THIS stream and is moved into the handler by value (single-use), so a
+        // handler can never run for an unauthorized peer; the guarantee holds only because the admit
+        // (above) and this serve share one stream frame, never hoisted to session scope.
+        Some(Target::Handler(scheme)) => match registry.get(scheme) {
+            Some(handler) => {
+                Response::Ok.write(&mut writer).await?;
+                (handler.serve)(admitted, Box::new(writer), Box::new(reader)).await?;
+            }
+            // `Exposer::new` proved every exposed handler is registered, so this is unreachable in practice;
+            // answer defensively rather than panic if an exposer was hand-built around that invariant.
+            None => {
+                let message = format!("no handler for service {:?}", service.as_str());
+                Response::Error(message).write(&mut writer).await?;
+            }
+        },
         None => {
             // Name what this node DOES expose, so a service-name mismatch (the connector defaulting to
             // `default` while the exposer named `web`) reads as a fixable error, not an opaque reset.
@@ -336,7 +413,7 @@ fn admit(
 /// service is exposed, return that one, so a single-service node needs no `--service`. Otherwise return
 /// the request unchanged (a multi-service node keeps it, to fail later with the "unknown service; this node
 /// exposes: …" hint rather than guessing which one was meant).
-fn resolve_single_service(requested: Service, services: &HashMap<String, String>) -> Service {
+fn resolve_single_service(requested: Service, services: &HashMap<String, Target>) -> Service {
     if services.contains_key(requested.as_str()) || services.len() != 1 {
         return requested;
     }
@@ -348,25 +425,41 @@ fn resolve_single_service(requested: Service, services: &HashMap<String, String>
     }
 }
 
-/// Reject an addr that is not a real forwarding target, so a bare service name (`expose web`) fails at
-/// parse with a teaching message instead of silently pointing the `default` service at an undialable
-/// host. Valid targets: `sshd:` (keyless shell), `fetch:` (HTTP egress), `unix:<path>`, or a `host:port`.
-fn validate_addr(addr: &str, entry: &str) -> eyre::Result<()> {
+/// Resolve an exposed service's address to a [`Target`]: a bare scheme (`sshd:`, `fetch:`, `diag:` — a word
+/// then a colon with nothing after) names a handler; anything else must be a raw forward (`host:port` or
+/// `unix:<path>`), validated here so a typo fails at parse with a teaching message, not at dial time.
+fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
+    if let Some(scheme) = addr.strip_suffix(':') {
+        // A bare `<scheme>:` (nothing after the colon) is a handler selector. `unix:<path>` and `host:port`
+        // carry a tail and so fall through to the forward grammar; a bare `unix:` (no path) resolves to a
+        // handler named `unix` that no registry holds, failing loudly at `Exposer::new`.
+        if !scheme.is_empty() && scheme.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Ok(Target::Handler(scheme.to_owned()));
+        }
+    }
+    validate_forward(addr, entry)?;
+    Ok(Target::Forward(addr.to_owned()))
+}
+
+/// Reject a forward addr that is not a real target, so a bare service name (`expose web`) fails at parse
+/// with a teaching message instead of silently pointing the `default` service at an undialable host. Valid
+/// forwards: `unix:<path>` or a `host:port` (a handler scheme like `sshd:`/`fetch:` is resolved earlier).
+fn validate_forward(addr: &str, entry: &str) -> eyre::Result<()> {
     let is_host_port = addr
         .rsplit_once(':')
         .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
-    if addr == "sshd:" || addr == "fetch:" || addr.starts_with("unix:") || is_host_port {
+    if addr.starts_with("unix:") || is_host_port {
         return Ok(());
     }
     // A bare token with no `=` was almost certainly meant as a service NAME, not an address.
     if !entry.contains('=') {
         eyre::bail!(
             "`{entry}` is not an address to forward to. Did you mean a service pointing at one, e.g. \
-             `{entry}=127.0.0.1:8080`? (an address is host:port, unix:<path>, sshd:, or fetch:)"
+             `{entry}=127.0.0.1:8080`? (an address is host:port, unix:<path>, or a handler like sshd:/fetch:)"
         );
     }
     eyre::bail!(
-        "`{addr}` is not a valid forwarding address (host:port, unix:<path>, sshd:, or fetch:)"
+        "`{addr}` is not a valid forwarding address (host:port, unix:<path>, or a handler like sshd:/fetch:)"
     )
 }
 
@@ -644,19 +737,36 @@ mod tests {
 
     #[test]
     fn an_exposer_refuses_a_public_shell() {
-        // A keyless shell has no auth of its own, so an open gate over it would hand anyone a shell.
-        // `Exposer::new` must reject that pairing, wherever the caller assembles it.
+        use futures::FutureExt as _;
+        // A gated handler standing in for the keyless shell (it declares `requires_gate`): a shell has no
+        // auth of its own, so an open gate over it would hand anyone a shell. `Exposer::new` must reject
+        // that pairing, wherever the caller assembles it.
+        let noop: super::ServeFn =
+            std::sync::Arc::new(|_admitted, _writer, _reader| async { Ok(()) }.boxed());
         let shell = services(&["ssh=sshd:"]);
+        let registry = super::Registry::new().with("sshd", super::Handler::gated(noop));
         assert!(
-            super::Exposer::new(shell, Gate::Open, [0u8; 32]).is_err(),
+            super::Exposer::new(shell, registry, Gate::Open).is_err(),
             "an open gate over a shell service must be refused"
         );
         // The same shell behind a real gate is fine; only the open-gate pairing is refused. A family gate
-        // needs a signet and denylist, so prove the inverse with a non-shell service under the open gate.
+        // needs a signet and denylist, so prove the inverse with a non-shell service (an empty registry
+        // suffices, since a raw forward needs no handler) under the open gate.
         let web = services(&["web=127.0.0.1:80"]);
         assert!(
-            super::Exposer::new(web, Gate::Open, [0u8; 32]).is_ok(),
+            super::Exposer::new(web, super::Registry::new(), Gate::Open).is_ok(),
             "an open gate over a non-shell service is allowed"
+        );
+    }
+
+    #[test]
+    fn an_exposer_refuses_a_handler_with_no_registration() {
+        // A named service with no handler in the registry is a config error caught at construction, not a
+        // dial-time mystery reset. (Here `sshd:` is exposed but nothing registered it.)
+        let shell = services(&["ssh=sshd:"]);
+        assert!(
+            super::Exposer::new(shell, super::Registry::new(), Gate::Open).is_err(),
+            "exposing a handler scheme with no registered handler must be refused at construction"
         );
     }
 }
