@@ -13,6 +13,12 @@ use crate::protocol::{read_str, write_str};
 /// Magic + version prefixing every fetch frame; distinct from `TB02` so a mismatched peer is rejected.
 const MAGIC: [u8; 4] = *b"TBH1";
 
+/// The most headers a fetch frame may carry. The wire count is a `u16` (up to 65 535) and each string is
+/// up to 64 KiB, so an uncapped frame lets one post-gate request pin gigabytes; a real GET/HEAD needs a
+/// few dozen. Bounds the allocation a single admitted stream can force. Applies to both the request and the
+/// forwarded response headers, so it sits well above any real HTTP message (the largest top out ~100).
+pub(crate) const MAX_HEADERS: usize = 128;
+
 /// A requester's fetch: the method, the absolute origin URL, and the headers to forward verbatim
 /// (including `Range`, which is the whole point: the origin returns `206` and xget's resume works).
 #[derive(Debug, PartialEq, Eq)]
@@ -129,8 +135,15 @@ async fn read_headers<R: io::AsyncRead + Unpin>(
 ) -> io::Result<Vec<(String, String)>> {
     let mut count = [0u8; 2];
     reader.read_exact(&mut count).await?;
-    let count = u16::from_be_bytes(count);
-    let mut headers = Vec::with_capacity(count as usize);
+    let count = u16::from_be_bytes(count) as usize;
+    // Reject an over-large count before allocating, so a hostile frame cannot pin memory or make the node
+    // read gigabytes of header strings off an admitted stream.
+    if count > MAX_HEADERS {
+        return Err(io::Error::other(format!(
+            "fetch frame declares {count} headers (max {MAX_HEADERS})"
+        )));
+    }
+    let mut headers = Vec::with_capacity(count);
     for _ in 0..count {
         let name = read_str(reader).await?;
         let value = read_str(reader).await?;
