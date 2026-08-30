@@ -47,6 +47,7 @@ fn ssrf_guard_refuses_loopback_private_link_local_and_metadata() {
         "64:ff9b::a9fe:a9fe",     // NAT64 well-known -> 169.254.169.254 on a DNS64 host
         "64:ff9b::a00:5",         // NAT64 well-known -> 10.0.0.5 (RFC1918)
         "::7f00:1",               // deprecated IPv4-compatible -> 127.0.0.1
+        "::ffff:0:a9fe:a9fe",     // IPv4-translatable ::ffff:0:0/96 -> 169.254.169.254
     ] {
         let ip: IpAddr = addr.parse().expect("valid ip");
         assert!(!is_public(ip), "{addr} must be judged non-public");

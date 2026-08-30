@@ -203,6 +203,11 @@ fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6] == [0, 0, 0, 0] {
         return Some(low(seg[6], seg[7]));
     }
+    // IPv4-translatable `::ffff:0:0/96` (RFC 6052): the `ffff` sits in seg[4] (seg[5]==0), so
+    // `to_ipv4_mapped` — which matches `ffff` in seg[5] — does not catch it.
+    if seg[0..4] == [0, 0, 0, 0] && seg[4] == 0xffff && seg[5] == 0 {
+        return Some(low(seg[6], seg[7]));
+    }
     // Deprecated IPv4-compatible ::/96, excluding :: and ::1 (handled as unspecified/loopback).
     if seg[0..6] == [0, 0, 0, 0, 0, 0] && !(seg[6] == 0 && (seg[7] == 0 || seg[7] == 1)) {
         return Some(low(seg[6], seg[7]));
