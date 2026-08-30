@@ -478,10 +478,10 @@ impl Connector {
                 }
                 Some(result) = pipes.next(), if !pipes.is_empty() => {
                     if let Err(error) = result {
-                        // A refused stream (wrong `--service`, a revoked or non-granting cap) is
-                        // user-actionable, not a transient to bury in a log: surface it, so a silent
-                        // "connection reset" on the local port always carries the reason the peer gave.
-                        eprintln!("connection failed: {error:#}");
+                        // A refused stream (wrong `--service`, a revoked or non-granting cap) carries a
+                        // user-actionable reason. The core is print-free (a library embedder owns its own
+                        // output), so route it through `tracing`; the CLI adapter surfaces it to the user.
+                        tracing::warn!("connection failed: {error:#}");
                     }
                 }
             }
