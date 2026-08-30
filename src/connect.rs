@@ -10,6 +10,7 @@ use nauthy::{Cap, SCHEME};
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::identity::AsNodeId as _;
 use crate::protocol::{Request, Response};
 use crate::{splice, splice_halves};
 
@@ -91,7 +92,7 @@ impl ConnectCmd {
                 capability: self.present.clone(),
             }),
             Target::Capability(link) => Ok(Plan {
-                dial: Cap::parse(link)?.root(),
+                dial: Cap::parse(link)?.root().node_id(),
                 service,
                 capability: Some(String::clone(link)),
             }),

@@ -12,6 +12,7 @@ use nauthy::{Admitted, Cap, Denylist, Gate, Refusal, Service};
 use tokio::io;
 use tokio::net::TcpStream;
 
+use crate::identity::AsVerifyKey as _;
 use crate::protocol::{Request, Response};
 use crate::splice;
 
@@ -162,7 +163,7 @@ impl ExposeCmd {
         // The revocation denylist is loaded once here; a `tightbeam revoke` adds to the file, which the
         // next exposer run reads. Offline, no server.
         let denylist = Denylist::load(crate::config::revoked_path()?).await?;
-        Ok(Gate::Family(root, Box::new(denylist)))
+        Ok(Gate::Family(root.verify_key(), Box::new(denylist)))
     }
 
     /// A one-line description of the effective gate, for the readiness banner: trust made visible.
@@ -343,7 +344,7 @@ fn admit(
         Ok(cap) => cap,
         Err(_) => return Err("malformed capability".to_owned()),
     };
-    gate.admit_witnessed(peer, cap.as_ref(), service)
+    gate.admit_witnessed(peer.verify_key(), cap.as_ref(), service)
         .map_err(|refusal| match refusal {
             Refusal::Missing => "this service requires a capability".to_owned(),
             Refusal::NotGranted => "capability does not grant this service".to_owned(),

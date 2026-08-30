@@ -12,7 +12,7 @@
 
 use core::time::Duration;
 
-use bifrost::{NoDiscovery, Node};
+use bifrost::{NoDiscovery, Node, NodeId};
 use bifrost_mem::MemTransport;
 use nauthy::{Identity, Service};
 use tightbeam::connect::Target;
@@ -35,7 +35,7 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
             // Expose `ssh=<echo>` behind a capability gate rooted at the exposer's cap identity.
             // The runner is provisioned to trust the exposer's signet: its family gate admits tokens
             // rooted at that key (badges or slips), which is what these cap tests present.
-            let signet = Identity::from_secret(&EXPOSER_SECRET).unwrap().node_id();
+            let signet = NodeId::from_ed25519_secret(&EXPOSER_SECRET);
             tokio::task::spawn_local(async move {
                 ExposeCmd {
                     services: vec![format!("ssh={echo_addr}")],

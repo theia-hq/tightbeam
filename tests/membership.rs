@@ -16,10 +16,11 @@
 
 use core::time::Duration;
 
-use bifrost::{NoDiscovery, Node};
+use bifrost::{NoDiscovery, Node, NodeId};
 use bifrost_mem::MemTransport;
 use nauthy::Identity;
 use tightbeam::connect::Target;
+use tightbeam::identity::AsVerifyKey as _;
 use tightbeam::{Brand, ConnectCmd, ExposeCmd};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -40,7 +41,7 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             // Expose `web=<echo>` behind the DEFAULT family gate, rooted at the signet. Admission is by
             // membership alone, no per-service grant. The service is `web`, NOT the badge's service, to
             // prove a membership badge is whole-node (any service), not a per-service slip.
-            let signet = Identity::from_secret(&SIGNET_SECRET).unwrap().node_id();
+            let signet = NodeId::from_ed25519_secret(&SIGNET_SECRET);
             tokio::task::spawn_local(async move {
                 ExposeCmd {
                     services: vec![format!("web={echo_addr}")],
@@ -58,7 +59,10 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             // grants membership (whole-node), bound to this device: the `swoosh mint` shape.
             let device = Node::new(MemTransport::bind(), NoDiscovery);
             let device_badge = signet
-                .mint_member(device.node_id(), nauthy::expires_in(Duration::from_secs(3600)))
+                .mint_member(
+                    device.node_id().verify_key(),
+                    nauthy::expires_in(Duration::from_secs(3600)),
+                )
                 .unwrap()
                 .link()
                 .unwrap();
@@ -76,7 +80,10 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             // the binding, so the family gate refuses it. A leaked badge is useless off its key.
             let other_device_id = Node::new(MemTransport::bind(), NoDiscovery).node_id();
             let foreign_badge = signet
-                .mint_member(other_device_id, nauthy::expires_in(Duration::from_secs(3600)))
+                .mint_member(
+                    other_device_id.verify_key(),
+                    nauthy::expires_in(Duration::from_secs(3600)),
+                )
                 .unwrap()
                 .link()
                 .unwrap();

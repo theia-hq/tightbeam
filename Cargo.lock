@@ -2681,7 +2681,6 @@ dependencies = [
 name = "nauthy"
 version = "0.0.0"
 dependencies = [
- "bifrost-core",
  "biscuit-auth",
  "data-encoding",
  "thiserror 2.0.20",
@@ -5923,9 +5922,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[patch.unused]]
-name = "quirk"
+name = "bifrost-quirk"
 version = "0.0.0"
 
 [[patch.unused]]
-name = "bifrost-quirk"
+name = "quirk"
 version = "0.0.0"

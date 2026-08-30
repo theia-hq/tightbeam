@@ -13,8 +13,41 @@
 
 use std::path::{Path, PathBuf};
 
+use bifrost::{CryptoKind, NodeId};
 use eyre::eyre;
+use nauthy::VerifyKey;
 use zeroize::{Zeroize as _, ZeroizeOnDrop};
+
+/// The bridge between bifrost's [`NodeId`] and nauthy's [`VerifyKey`]: two names for one ed25519 public
+/// key on either side of the cap/transport boundary.
+///
+/// nauthy is standalone (it carries no bifrost dependency), so it names a key by [`VerifyKey`] while
+/// bifrost names the same key by [`NodeId`]. Both are the same 32 raw bytes under the same `bf01` string
+/// form, so the conversion is an infallible byte copy. It lives here, at the one crate that sees both
+/// types, so no call site open-codes the byte shuffle. The orphan rule forbids a `From` impl (both types
+/// are foreign to tightbeam), hence the extension traits.
+pub trait AsVerifyKey {
+    /// This identity as a nauthy [`VerifyKey`] (the type caps root at and gates admit).
+    fn verify_key(&self) -> VerifyKey;
+}
+
+impl AsVerifyKey for NodeId {
+    fn verify_key(&self) -> VerifyKey {
+        VerifyKey::new(*self.key())
+    }
+}
+
+/// The other direction: a [`VerifyKey`] back to the bifrost [`NodeId`] a peer is dialed at.
+pub trait AsNodeId {
+    /// This key as a bifrost [`NodeId`], tagged ed25519 (the only suite these keys carry).
+    fn node_id(&self) -> NodeId;
+}
+
+impl AsNodeId for VerifyKey {
+    fn node_id(&self) -> NodeId {
+        NodeId::new(CryptoKind::Ed25519, *self.bytes())
+    }
+}
 
 /// The ed25519 secret key the node binds under and roots capabilities at. Wraps the raw bytes so they
 /// zeroize on drop and never cross a boundary as a bare array.
