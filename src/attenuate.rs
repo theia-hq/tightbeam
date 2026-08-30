@@ -13,13 +13,14 @@ use crate::duration::Lifetime;
 #[derive(Debug, Args)]
 pub struct AttenuateCmd {
     /// The `sheer:` link to narrow.
+    #[arg(value_name = "link")]
     pub link: String,
     /// Restrict the link to this service (must be one the link already permits).
-    #[arg(long)]
+    #[arg(long, value_name = "service")]
     pub service: Option<Service>,
     /// Shorten the link to expire within this span from now, e.g. `30m`. Only ever tightens: a span
     /// longer than the link's remaining life does not extend it.
-    #[arg(long)]
+    #[arg(long, value_name = "duration")]
     pub expires: Option<Lifetime>,
 }
 

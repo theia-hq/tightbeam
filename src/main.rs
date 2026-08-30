@@ -30,7 +30,12 @@ use tightbeam::{AttenuateCmd, Brand, ConnectCmd, ExposeCmd, RevokeCmd, ShareCmd,
 #[command(name = "tightbeam", version, about)]
 struct Cli {
     /// pin a persisted identity file [env: TIGHTBEAM_KEY]
-    #[arg(long = "key", env = "TIGHTBEAM_KEY", global = true)]
+    #[arg(
+        long = "key",
+        value_name = "identity-key",
+        env = "TIGHTBEAM_KEY",
+        global = true
+    )]
     key: Option<PathBuf>,
     /// direct address hint for a peer, `<key>=<addr>` (repeatable); reaches it directly, without n0
     #[arg(long, value_name = "key=addr", global = true)]

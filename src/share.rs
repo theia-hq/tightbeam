@@ -13,9 +13,10 @@ use crate::duration::Lifetime;
 #[derive(Debug, Args)]
 pub struct ShareCmd {
     /// The service the link grants (as named in `expose`, e.g. `ssh`).
+    #[arg(value_name = "service")]
     pub service: Service,
     /// How long the link is valid, e.g. `2h`, `30m`, `90s`. Short-expiry is the v1 revocation story.
-    #[arg(long, default_value = "1h")]
+    #[arg(long, value_name = "duration", default_value = "1h")]
     pub expires: Lifetime,
     /// allow the holder to narrow and re-share the link
     #[arg(long)]

@@ -27,7 +27,7 @@ pub struct ConnectCmd {
     #[arg(long)]
     pub stdio: bool,
     /// which exposed service to reach
-    #[arg(long, default_value = "default")]
+    #[arg(long, value_name = "service", default_value = "default")]
     pub service: String,
     /// present a capability link alongside a raw node id
     #[arg(long, value_name = "link")]

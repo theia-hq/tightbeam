@@ -15,6 +15,7 @@ use crate::config::revoked_path;
 #[derive(Debug, Args)]
 pub struct RevokeCmd {
     /// The `sheer:` link to revoke (revokes it and everything attenuated from it).
+    #[arg(value_name = "link")]
     pub link: String,
 }
 
