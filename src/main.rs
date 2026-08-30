@@ -7,10 +7,9 @@
 //! the far machine by its key, not an IP.
 //!
 //! Who may connect is a property of the node, not a per-expose choice: by default `expose` gates a
-//! service to the machine's signet ANCHOR (the key it trusts, set by `swoosh adopt`), admitting the
-//! owner's own devices and anyone they delegate to. `--allow <node-id>` is the signet-less raw allowlist,
-//! `--public` opens a service to anyone (never a shell), and `--trust-root <key>` trusts a signet other
-//! than the provisioned one. A capability is a signed, expiring link rooted at a signet: `tightbeam share
+//! service to the machine's signet (the key it trusts, set by `swoosh adopt`), admitting the owner's own
+//! devices and anyone they delegate to. `--public` is the one deliberate opt-out: it opens a service to
+//! anyone (never a shell). A capability is a signed, expiring link rooted at a signet: `tightbeam share
 //! <service>` mints one, `tightbeam attenuate <link>` narrows it offline, `tightbeam revoke <link>`
 //! recalls it, and a holder connects with the link directly. The identity is always persisted (it is both
 //! the address peers dial and the key a share-link roots at): `--key` or `TIGHTBEAM_KEY`.
@@ -21,7 +20,7 @@ use std::path::PathBuf;
 use bifrost::Node;
 use bifrost_iroh::Endpoint;
 use clap::{CommandFactory, Parser, Subcommand};
-use tightbeam::config::load_anchor;
+use tightbeam::config::load_signet;
 use tightbeam::identity::{self, Secret};
 use tightbeam::peer::{Discovery, Peer};
 use tightbeam::{AttenuateCmd, ConnectCmd, ExposeCmd, RevokeCmd, ShareCmd, TreeCmd};
@@ -81,16 +80,16 @@ async fn main() -> eyre::Result<()> {
             let secret = identity::load(cli.key.as_deref()).await?;
             cmd.run(&secret.cap_identity()?)
         }
-        // `expose`/`connect` bind a node. `expose` also reads the persisted signet anchor: the key its
-        // default gate trusts (a family gate admits the owner's devices and their delegates).
+        // `expose`/`connect` bind a node. `expose` also reads the persisted signet: the key its default
+        // gate trusts (a family gate admits the owner's devices and their delegates).
         Command::Expose(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
             // Derive the ssh host-key seed before the secret is consumed by the bind. Only a `sshd:`
             // service uses it, but it is cheap and keeps the secret's raw bytes from leaving for it.
             let host_seed = secret.ssh_host_seed();
-            let anchor = load_anchor().await?;
+            let signet = load_signet().await?;
             let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
-            cmd.run(&node, host_seed, anchor).await
+            cmd.run(&node, host_seed, signet).await
         }
         Command::Connect(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;

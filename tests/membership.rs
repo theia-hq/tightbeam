@@ -24,7 +24,7 @@ use tightbeam::{ConnectCmd, ExposeCmd};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
-/// The signet's fixed secret. Its ed25519 public half is the anchor the family gate trusts, and it roots
+/// The signet's fixed secret. Its ed25519 public half is the signet the family gate trusts, and it roots
 /// every badge minted here.
 const SIGNET_SECRET: [u8; 32] = [42u8; 32];
 
@@ -37,17 +37,17 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             let exposer = Node::new(MemTransport::bind(), NoDiscovery);
             let exposer_id = exposer.node_id();
 
-            // Expose `web=<echo>` behind the DEFAULT family gate, anchored to the signet. No `--allow`:
-            // admission is by membership alone. The service is `web`, NOT the badge's service, to prove a
-            // membership badge is whole-node (any service), not a per-service slip.
-            let anchor = Identity::from_secret(&SIGNET_SECRET).unwrap().node_id();
+            // Expose `web=<echo>` behind the DEFAULT family gate, rooted at the signet. Admission is by
+            // membership alone, no per-service grant. The service is `web`, NOT the badge's service, to
+            // prove a membership badge is whole-node (any service), not a per-service slip.
+            let signet = Identity::from_secret(&SIGNET_SECRET).unwrap().node_id();
             tokio::task::spawn_local(async move {
                 ExposeCmd {
                     services: vec![format!("web={echo_addr}")],
                     public: false,
                     quiet: false,
                 }
-                .run(&exposer, [0u8; 32], Some(anchor))
+                .run(&exposer, [0u8; 32], Some(signet))
                 .await
                 .unwrap();
             });

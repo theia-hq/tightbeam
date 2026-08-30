@@ -2,8 +2,8 @@
 //!
 //! `expose` forwards inbound overlay streams to a local TCP service; `connect` binds a peer's exposed
 //! service to a local port. Each proxied TCP connection rides one bifrost bidirectional stream. Who may
-//! connect is decided by the [`nauthy`] crate's authorization gate: by default the node's signet anchor
-//! (its own devices and their delegates), else a raw allowlist or open. `share` and `attenuate` mint and
+//! connect is decided by the [`nauthy`] crate's authorization gate: by default the node's signet
+//! (its own devices and their delegates), else `--public` for open. `share` and `attenuate` mint and
 //! narrow the capabilities that gate honors.
 //!
 //! Concurrency uses `FuturesUnordered` + `select!` (structured concurrency on one task) rather than

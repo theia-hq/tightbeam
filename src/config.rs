@@ -5,34 +5,34 @@ use std::path::PathBuf;
 use bifrost::NodeId;
 use eyre::eyre;
 
-/// The persisted signet-anchor location, `~/.config/tightbeam/anchor`, overridable with
-/// `TIGHTBEAM_ANCHOR`. Holds one thing: the public [`NodeId`] of the signet this node trusts, written
-/// once by provisioning (`swoosh adopt`). Public material (a key you already share), so it sits beside
-/// the secret identity, never inside it.
-pub fn anchor_path() -> eyre::Result<PathBuf> {
-    if let Some(path) = std::env::var_os("TIGHTBEAM_ANCHOR") {
+/// The persisted signet location, `~/.config/tightbeam/signet`, overridable with `TIGHTBEAM_SIGNET`.
+/// Holds one thing: the public [`NodeId`] of the signet this node trusts, written once by provisioning
+/// (`swoosh adopt`). Public material (a key you already share), so it sits beside the secret identity,
+/// never inside it.
+pub fn signet_path() -> eyre::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("TIGHTBEAM_SIGNET") {
         return Ok(PathBuf::from(path));
     }
-    Ok(config_dir()?.join("anchor"))
+    Ok(config_dir()?.join("signet"))
 }
 
-/// Load this node's signet anchor: the [`NodeId`] of the signet it was provisioned to trust, or `None`
-/// if it was never provisioned. The file is a single public node id; an absent file means unprovisioned,
-/// which `expose` treats as "no default gate" (a loud error), never a silent open.
+/// Load this node's signet: the [`NodeId`] it was provisioned to trust, or `None` if it was never
+/// provisioned. The file is a single public node id; an absent file means unprovisioned, which `expose`
+/// treats as "no default gate" (a loud error), never a silent open.
 // `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
 #[allow(clippy::std_instead_of_core)]
-pub async fn load_anchor() -> eyre::Result<Option<NodeId>> {
-    match tokio::fs::read_to_string(anchor_path()?).await {
+pub async fn load_signet() -> eyre::Result<Option<NodeId>> {
+    match tokio::fs::read_to_string(signet_path()?).await {
         Ok(text) => Ok(Some(text.trim().parse::<NodeId>()?)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
 
-/// Write this node's signet anchor: the public [`NodeId`] its default gate will trust, as `adopt` sets
-/// it from an authkey. Overwrites any prior anchor (re-provisioning re-anchors), creating the config dir.
-pub async fn write_anchor(signet: NodeId) -> eyre::Result<()> {
-    let path = anchor_path()?;
+/// Write this node's signet: the public [`NodeId`] its default gate will trust, as `adopt` sets it from
+/// an authkey. Overwrites any prior signet (re-provisioning re-trusts), creating the config dir.
+pub async fn write_signet(signet: NodeId) -> eyre::Result<()> {
+    let path = signet_path()?;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }

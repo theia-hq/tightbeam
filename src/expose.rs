@@ -29,10 +29,9 @@ const MAX_STREAMS_PER_SESSION: usize = 256;
 /// Expose a local service to peers.
 ///
 /// Authorization is a property of the node, not a per-expose choice: by default a service is gated to this
-/// node's signet ANCHOR (set once by `swoosh adopt`), admitting the owner's own devices (membership
-/// badges) and anyone they delegate a slip to. The flags are deliberate exceptions to that default, not a
-/// menu of policies: `--allow` for a signet-less raw allowlist, `--public` to open a service to anyone,
-/// `--trust-root` to trust a signet other than the provisioned one.
+/// node's signet (set once by `swoosh adopt`), admitting the owner's own devices (membership badges) and
+/// anyone they delegate a slip to. `--public` is the one deliberate exception: it opens a service to
+/// anyone, unauthenticated.
 #[derive(Debug, Args)]
 pub struct ExposeCmd {
     /// expose local services as `name=addr` (bare `addr` = `default`)
@@ -51,13 +50,13 @@ pub struct ExposeCmd {
 impl ExposeCmd {
     /// Accept overlay sessions from permitted peers and forward each inbound stream to the service.
     ///
-    /// `anchor` is this node's provisioned signet: the [`NodeId`] it trusts, or `None` if it was never
-    /// provisioned. The default gate verifies presented tokens against it; the flags override it.
+    /// `signet` is this node's provisioned signet: the [`NodeId`] it trusts, or `None` if it was never
+    /// provisioned. The default gate verifies presented tokens against it; `--public` overrides it.
     pub async fn run<T: Transport, D: Discovery>(
         self,
         node: &Node<T, D>,
         host_seed: [u8; 32],
-        anchor: Option<NodeId>,
+        signet: Option<NodeId>,
     ) -> eyre::Result<()>
     where
         <T::Session as Session>::Write: Send + 'static,
@@ -74,7 +73,7 @@ impl ExposeCmd {
         }
         // Build the gate before announcing readiness: an unprovisioned node with no explicit override
         // fails HERE, loudly, rather than ever serving on a permissive default.
-        let gate = Arc::new(self.gate(anchor).await?);
+        let gate = Arc::new(self.gate(signet).await?);
         // The readiness banner names the node id AND the effective gate, so "who can reach this right now?"
         // is answerable at a glance. `--quiet` withholds it so a key never lands in an unattended log.
         if !self.quiet {
@@ -88,7 +87,7 @@ impl ExposeCmd {
             println!(
                 "exposing {} \u{2014} gate: {}. press ctrl-c to stop.",
                 names.join(", "),
-                self.gate_description(anchor)
+                self.gate_description(signet)
             );
         }
         let mut sessions = FuturesUnordered::new();
@@ -123,13 +122,13 @@ impl ExposeCmd {
     }
 
     /// Build the authorization gate. Two modes, no policy menu: the default gates on the node's signet
-    /// anchor (admitting its members and delegates), and `--public` is the one deliberate opt-out to
-    /// anyone. Unprovisioned + not public fails LOUDLY rather than falling back to anything permissive.
-    async fn gate(&self, anchor: Option<NodeId>) -> eyre::Result<Gate> {
+    /// (admitting its members and delegates), and `--public` is the one deliberate opt-out to anyone.
+    /// Unprovisioned + not public fails LOUDLY rather than falling back to anything permissive.
+    async fn gate(&self, signet: Option<NodeId>) -> eyre::Result<Gate> {
         if self.public {
             return Ok(Gate::Open);
         }
-        let root = anchor.ok_or_else(|| {
+        let root = signet.ok_or_else(|| {
             eyre::eyre!(
                 "this node has no signet to gate on: provision it with `swoosh adopt <authkey>`, \
                  or pass --public to expose to anyone"
@@ -142,11 +141,11 @@ impl ExposeCmd {
     }
 
     /// A one-line description of the effective gate, for the readiness banner: trust made visible.
-    fn gate_description(&self, anchor: Option<NodeId>) -> String {
+    fn gate_description(&self, signet: Option<NodeId>) -> String {
         if self.public {
             "public (anyone, unauthenticated)".to_owned()
         } else {
-            match anchor {
+            match signet {
                 Some(root) => format!("signet {}", root.short()),
                 None => "unprovisioned".to_owned(),
             }

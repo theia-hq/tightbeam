@@ -40,7 +40,7 @@ async fn tunnels_tcp_over_bifrost() {
             let exposer_id = exposer.node_id();
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
 
-            // A public gate needs no identity or anchor: any peer reaching the key is served (this test
+            // A public gate needs no identity or signet: any peer reaching the key is served (this test
             // exercises the tunnel path, not authorization).
             tokio::task::spawn_local(async move {
                 ExposeCmd {
