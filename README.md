@@ -50,6 +50,9 @@ own devices and anyone they delegate a capability to (below), and refuses everyo
 `expose --quiet` suppresses the readiness banner, so the node's key never lands in a log, for unattended
 or CI use. The tunnel runs the same either way.
 
+For worked examples of what to run over a tunnel (stream a movie, pipe a raw stream, reach a database
+port), see [examples.md](examples.md).
+
 ## Share a service as a capability
 
 The default gate already accepts capabilities: a signed, expiring, attenuable link rooted at this
