@@ -299,7 +299,7 @@ where
                 // guarantee holds only because the admit (above) and this serve share one stream frame:
                 // never hoist the admit to session scope, or one witness would cover streams the gate
                 // never ruled on.
-                sshh::serve(&admitted, host_seed, writer, reader).await?;
+                sshh::serve(admitted, host_seed, writer, reader).await?;
             }
             #[cfg(not(feature = "ssh"))]
             Response::Error(
