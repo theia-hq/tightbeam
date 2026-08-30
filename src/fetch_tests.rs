@@ -44,6 +44,9 @@ fn ssrf_guard_refuses_loopback_private_link_local_and_metadata() {
         "fe80::1",                // v6 link-local
         "fc00::1",                // v6 unique-local
         "::ffff:169.254.169.254", // v4-mapped metadata must not slip past
+        "64:ff9b::a9fe:a9fe",     // NAT64 well-known -> 169.254.169.254 on a DNS64 host
+        "64:ff9b::a00:5",         // NAT64 well-known -> 10.0.0.5 (RFC1918)
+        "::7f00:1",               // deprecated IPv4-compatible -> 127.0.0.1
     ] {
         let ip: IpAddr = addr.parse().expect("valid ip");
         assert!(!is_public(ip), "{addr} must be judged non-public");

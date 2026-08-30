@@ -3,7 +3,7 @@
 //! and stream the response back (status + headers, then the body to stream close). This is the smallest
 //! honest instance of "run this at a keyed node": a fetch, not a general proxy.
 
-use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use core::time::Duration;
 
 use futures::StreamExt as _;
@@ -166,12 +166,13 @@ async fn resolve_public(host: &str, port: u16) -> Result<SocketAddr, String> {
 
 /// Whether an IP is a public (globally routable) unicast address — the only kind `fetch:` will reach.
 /// Conservative: loopback, private, link-local, shared (CGNAT), unspecified, and multicast are all NOT
-/// public. An IPv4-mapped IPv6 address is unwrapped and judged as IPv4, so `::ffff:169.254.169.254` (the
-/// cloud metadata IP in v6 clothing) cannot slip past.
+/// public. Any IPv6 that EMBEDS an IPv4 address (mapped, NAT64, or the deprecated compatible form) is
+/// unwrapped and judged as IPv4, so `::ffff:169.254.169.254` AND the NAT64 `64:ff9b::169.254.169.254`
+/// (which a DNS64/NAT64 host routes straight to the cloud metadata IP) cannot slip past.
 pub(crate) fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_public_v4(v4),
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+        IpAddr::V6(v6) => match embedded_ipv4(v6) {
             Some(v4) => is_public_v4(v4),
             None => {
                 let seg = v6.segments();
@@ -185,6 +186,28 @@ pub(crate) fn is_public(ip: IpAddr) -> bool {
             }
         },
     }
+}
+
+/// Extract an IPv4 address embedded in an IPv6 one, so an internal target wearing IPv6 clothing is judged
+/// by its real IPv4. Covers the three embeddings a translating host will actually route to that v4:
+/// IPv4-mapped `::ffff:0:0/96` (via `to_ipv4_mapped`), NAT64 well-known `64:ff9b::/96` (RFC 6052, the
+/// standard DNS64 prefix), and deprecated IPv4-compatible `::/96` (`::a.b.c.d`). `::` and `::1` are left
+/// for the caller to refuse as unspecified/loopback. Returns `None` for a native IPv6 address.
+fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let seg = v6.segments();
+    let low = |a: u16, b: u16| Ipv4Addr::new((a >> 8) as u8, a as u8, (b >> 8) as u8, b as u8);
+    // NAT64 well-known prefix 64:ff9b::/96.
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6] == [0, 0, 0, 0] {
+        return Some(low(seg[6], seg[7]));
+    }
+    // Deprecated IPv4-compatible ::/96, excluding :: and ::1 (handled as unspecified/loopback).
+    if seg[0..6] == [0, 0, 0, 0, 0, 0] && !(seg[6] == 0 && (seg[7] == 0 || seg[7] == 1)) {
+        return Some(low(seg[6], seg[7]));
+    }
+    None
 }
 
 /// The IPv4 half of [`is_public`]. `is_shared` (100.64.0.0/10, CGNAT) is not yet stable in std, so it is
