@@ -3,7 +3,7 @@ use core::time::Duration;
 use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
 use tightbeam::connect::Target;
-use tightbeam::{ConnectCmd, ExposeCmd};
+use tightbeam::{Brand, ConnectCmd, ExposeCmd};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -48,7 +48,7 @@ async fn tunnels_tcp_over_bifrost() {
                     public: true,
                     quiet: false,
                 }
-                .run(&exposer, [0u8; 32], None)
+                .run(&exposer, [0u8; 32], None, Brand::TIGHTBEAM)
                 .await
                 .unwrap();
             });

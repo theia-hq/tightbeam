@@ -23,7 +23,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use tightbeam::config::load_signet;
 use tightbeam::identity::{self, Secret};
 use tightbeam::peer::{Discovery, Peer};
-use tightbeam::{AttenuateCmd, ConnectCmd, ExposeCmd, RevokeCmd, ShareCmd, TreeCmd};
+use tightbeam::{AttenuateCmd, Brand, ConnectCmd, ExposeCmd, RevokeCmd, ShareCmd, TreeCmd};
 
 /// Reach a service on another machine by its public key, no public IP needed.
 #[derive(Debug, Parser)]
@@ -89,7 +89,7 @@ async fn main() -> eyre::Result<()> {
             let host_seed = secret.ssh_host_seed();
             let signet = load_signet().await?;
             let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
-            cmd.run(&node, host_seed, signet).await
+            cmd.run(&node, host_seed, signet, Brand::TIGHTBEAM).await
         }
         Command::Connect(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;

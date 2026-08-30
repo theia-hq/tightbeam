@@ -20,7 +20,7 @@ use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
 use nauthy::Identity;
 use tightbeam::connect::Target;
-use tightbeam::{ConnectCmd, ExposeCmd};
+use tightbeam::{Brand, ConnectCmd, ExposeCmd};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -47,7 +47,7 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
                     public: false,
                     quiet: false,
                 }
-                .run(&exposer, [0u8; 32], Some(signet))
+                .run(&exposer, [0u8; 32], Some(signet), Brand::TIGHTBEAM)
                 .await
                 .unwrap();
             });

@@ -16,7 +16,7 @@ use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
 use nauthy::{Identity, Service};
 use tightbeam::connect::Target;
-use tightbeam::{ConnectCmd, ExposeCmd};
+use tightbeam::{Brand, ConnectCmd, ExposeCmd};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -42,7 +42,7 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
                     public: false,
                     quiet: false,
                 }
-                .run(&exposer, [0u8; 32], Some(signet))
+                .run(&exposer, [0u8; 32], Some(signet), Brand::TIGHTBEAM)
                 .await
                 .unwrap();
             });

@@ -38,7 +38,7 @@ use tokio::io::{self, AsyncWriteExt as _};
 
 pub use crate::attenuate::AttenuateCmd;
 pub use crate::connect::ConnectCmd;
-pub use crate::expose::ExposeCmd;
+pub use crate::expose::{Brand, ExposeCmd};
 pub use crate::revoke::RevokeCmd;
 pub use crate::share::ShareCmd;
 pub use crate::tree::TreeCmd;

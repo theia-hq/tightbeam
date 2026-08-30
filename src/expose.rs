@@ -26,6 +26,25 @@ const MAX_SESSIONS: usize = 256;
 /// The maximum number of in-flight streams per session, bounding what a single connected peer can pin.
 const MAX_STREAMS_PER_SESSION: usize = 256;
 
+/// How the readiness banner names the tool exposing the services, so the same code serves both callers
+/// without hardcoding one binary. `tightbeam expose` says "tightbeam ... `tightbeam share`"; `swoosh
+/// tunnel expose` says "swoosh tunnel ... `swoosh share`". Two `&str`s, not one, because the ready-name
+/// and the share-verb differ (`swoosh tunnel` vs `swoosh share`).
+pub struct Brand {
+    /// The name that leads the readiness banner, e.g. `tightbeam` or `swoosh tunnel`.
+    pub ready: &'static str,
+    /// The exact command that mints a link for this node, e.g. `tightbeam share` or `swoosh share`.
+    pub share: &'static str,
+}
+
+impl Brand {
+    /// The banner for `tightbeam` invoked directly.
+    pub const TIGHTBEAM: Self = Self {
+        ready: "tightbeam",
+        share: "tightbeam share",
+    };
+}
+
 /// Expose a local service to peers.
 ///
 /// Authorization is a property of the node, not a per-expose choice: by default a service is gated to this
@@ -52,11 +71,13 @@ impl ExposeCmd {
     ///
     /// `signet` is this node's provisioned signet: the [`NodeId`] it trusts, or `None` if it was never
     /// provisioned. The default gate verifies presented tokens against it; `--public` overrides it.
+    /// `brand` names the calling tool in the readiness banner, so it points at the right binary's `share`.
     pub async fn run<T: Transport, D: Discovery>(
         self,
         node: &Node<T, D>,
         host_seed: [u8; 32],
         signet: Option<NodeId>,
+        brand: Brand,
     ) -> eyre::Result<()>
     where
         <T::Session as Session>::Write: Send + 'static,
@@ -77,15 +98,19 @@ impl ExposeCmd {
         // The readiness banner names the node id AND the effective gate, so "who can reach this right now?"
         // is answerable at a glance. `--quiet` withholds it so a key never lands in an unattended log.
         if !self.quiet {
-            println!("tightbeam ready. peers can reach these services at:\n");
             println!(
-                "    {}                     (share this key, or mint a link with `tightbeam share`)\n",
-                node.node_id()
+                "{} ready. peers can reach these services at:\n",
+                brand.ready
+            );
+            println!(
+                "    {}                     (share this key, or mint a link with `{}`)\n",
+                node.node_id(),
+                brand.share
             );
             let mut names: Vec<&str> = services.keys().map(String::as_str).collect();
             names.sort_unstable();
             println!(
-                "exposing {} \u{2014} gate: {}. press ctrl-c to stop.",
+                "exposing {}. gate: {}. ctrl-c to stop.",
                 names.join(", "),
                 self.gate_description(signet)
             );
