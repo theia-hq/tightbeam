@@ -14,9 +14,8 @@ use core::time::Duration;
 
 use bifrost::{NoDiscovery, Node, NodeId};
 use bifrost_mem::MemTransport;
-use nauthy::{Identity, Service};
-use tightbeam::connect::Target;
-use tightbeam::{Brand, ConnectCmd, ExposeCmd};
+use nauthy::{Denylist, Identity, Service};
+use tightbeam::tunnel::{self, Connector, Exposer, Services};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -37,14 +36,13 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
             // rooted at that key (badges or slips), which is what these cap tests present.
             let signet = NodeId::from_ed25519_secret(&EXPOSER_SECRET);
             tokio::task::spawn_local(async move {
-                ExposeCmd {
-                    services: vec![format!("ssh={echo_addr}")],
-                    public: false,
-                    quiet: false,
-                }
-                .run(&exposer, [0u8; 32], Some(signet), Brand::TIGHTBEAM)
-                .await
-                .unwrap();
+                let services = Services::parse(&[format!("ssh={echo_addr}")]).unwrap();
+                let gate = tunnel::family_gate(signet, empty_denylist().await);
+                Exposer::new(services, gate, [0u8; 32])
+                    .unwrap()
+                    .run(&exposer)
+                    .await
+                    .unwrap();
             });
 
             // A cap for ssh, valid for an hour, minted by the exposer's identity.
@@ -111,15 +109,9 @@ async fn connect_and_echo(
     let service = service.to_owned();
     let present = capability.map(str::to_owned);
     tokio::task::spawn_local(async move {
-        let _ = ConnectCmd {
-            target: Target::Node(exposer),
-            to: Some(port),
-            stdio: false,
-            service,
-            present,
-        }
-        .run(&consumer)
-        .await;
+        let _ = Connector::to_node(exposer, service, present)
+            .forward_port(&consumer, port)
+            .await;
     });
 
     let mut client = None;
@@ -149,4 +141,12 @@ async fn free_port() -> u16 {
     let port = probe.local_addr().unwrap().port();
     drop(probe);
     port
+}
+
+/// An empty revocation denylist: these tests exercise the grant path, not revocation, so the gate loads
+/// from a path that does not exist (an absent file is an empty set).
+async fn empty_denylist() -> Denylist {
+    let path = std::env::temp_dir().join(format!("tightbeam-cap-denylist-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    Denylist::load(path).await.unwrap()
 }

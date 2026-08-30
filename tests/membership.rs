@@ -18,10 +18,9 @@ use core::time::Duration;
 
 use bifrost::{NoDiscovery, Node, NodeId};
 use bifrost_mem::MemTransport;
-use nauthy::Identity;
-use tightbeam::connect::Target;
+use nauthy::{Denylist, Identity};
 use tightbeam::identity::AsVerifyKey as _;
-use tightbeam::{Brand, ConnectCmd, ExposeCmd};
+use tightbeam::tunnel::{self, Connector, Exposer, Services};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -43,14 +42,13 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             // prove a membership badge is whole-node (any service), not a per-service slip.
             let signet = NodeId::from_ed25519_secret(&SIGNET_SECRET);
             tokio::task::spawn_local(async move {
-                ExposeCmd {
-                    services: vec![format!("web={echo_addr}")],
-                    public: false,
-                    quiet: false,
-                }
-                .run(&exposer, [0u8; 32], Some(signet), Brand::TIGHTBEAM)
-                .await
-                .unwrap();
+                let services = Services::parse(&[format!("web={echo_addr}")]).unwrap();
+                let gate = tunnel::family_gate(signet, empty_denylist().await);
+                Exposer::new(services, gate, [0u8; 32])
+                    .unwrap()
+                    .run(&exposer)
+                    .await
+                    .unwrap();
             });
 
             let signet = Identity::from_secret(&SIGNET_SECRET).unwrap();
@@ -130,15 +128,9 @@ async fn connect_and_echo(
     let service = service.to_owned();
     let present = badge.map(str::to_owned);
     tokio::task::spawn_local(async move {
-        let _ = ConnectCmd {
-            target: Target::Node(exposer),
-            to: Some(port),
-            stdio: false,
-            service,
-            present,
-        }
-        .run(&consumer)
-        .await;
+        let _ = Connector::to_node(exposer, service, present)
+            .forward_port(&consumer, port)
+            .await;
     });
 
     let mut client = None;
@@ -168,4 +160,12 @@ async fn free_port() -> u16 {
     let port = probe.local_addr().unwrap().port();
     drop(probe);
     port
+}
+
+/// An empty revocation denylist: this test exercises membership admission, not revocation, so the gate
+/// loads from a path that does not exist (an absent file is an empty set).
+async fn empty_denylist() -> Denylist {
+    let path = std::env::temp_dir().join(format!("tightbeam-mbr-denylist-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    Denylist::load(path).await.unwrap()
 }

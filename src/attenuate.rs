@@ -1,7 +1,7 @@
 //! `tightbeam attenuate`: narrow an existing `sheer:` link, offline, before handing it on.
 
 use clap::Args;
-use nauthy::{Cap, Service};
+use nauthy::Service;
 
 use crate::duration::Lifetime;
 
@@ -27,13 +27,9 @@ pub struct AttenuateCmd {
 impl AttenuateCmd {
     /// Narrow the link and print the result.
     pub fn run(self) -> eyre::Result<()> {
-        if self.service.is_none() && self.expires.is_none() {
-            eyre::bail!("give --service and/or --expires to narrow the link");
-        }
-        let cap = Cap::parse(&self.link)?;
-        let shorten = self.expires.map(|life| nauthy::expires_in(life.duration()));
-        let narrowed = cap.attenuate(self.service.as_ref(), shorten)?;
-        println!("{}", narrowed.link()?);
+        let shorten = self.expires.map(Lifetime::duration);
+        let narrowed = crate::tunnel::narrow_link(&self.link, self.service.as_ref(), shorten)?;
+        println!("{narrowed}");
         Ok(())
     }
 }

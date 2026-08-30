@@ -2,17 +2,11 @@
 
 use core::str::FromStr;
 
-use bifrost::{Discovery, Node, NodeId, Session, Transport};
+use bifrost::{Discovery, Node, NodeId, Transport};
 use clap::{ArgGroup, Args};
-use futures::StreamExt as _;
-use futures::stream::FuturesUnordered;
 use nauthy::{Cap, SCHEME};
-use tokio::io;
-use tokio::net::{TcpListener, TcpStream};
 
-use crate::identity::AsNodeId as _;
-use crate::protocol::{Request, Response};
-use crate::{splice, splice_halves};
+use crate::tunnel::Connector;
 
 /// Reach a peer's exposed service and bind it to a local port, or pipe it over stdin/stdout.
 #[derive(Debug, Args)]
@@ -67,135 +61,28 @@ impl ConnectCmd {
     /// Reach the peer, then either bind a local port and forward each accepted connection, or (`--stdio`)
     /// pipe the single service stream against this process's stdin/stdout, the ssh `ProxyCommand` shape.
     pub async fn run<T: Transport, D: Discovery>(self, node: &Node<T, D>) -> eyre::Result<()> {
-        let plan = self.plan()?;
-        let session = node.connect(plan.dial).await?;
+        let connector = self.connector()?;
         // The arg group makes exactly one of `--to`/`--stdio` present, so a missing port means stdio.
         match self.to {
-            Some(port) => serve_port(&session, &plan, port).await,
-            None => stdio_pipe(&session, &plan).await,
+            Some(port) => {
+                println!(
+                    "forwarding 127.0.0.1:{port} to {} ({})",
+                    connector.dial(),
+                    connector.service()
+                );
+                connector.forward_port(node, port).await
+            }
+            None => connector.pipe_stdio(node).await,
         }
     }
 
-    /// Resolve the target into a node to dial, a service to request, and an optional token to present.
-    ///
-    /// A capability link supplies the node to dial (the cap's root) and carries the token; the service
-    /// requested is still `--service`, and the host refuses unless the token actually grants that service.
-    /// A bare node id uses `--service` and presents nothing.
-    fn plan(&self) -> eyre::Result<Plan> {
+    /// Resolve the target into a [`Connector`]: a raw node id (optionally presenting a link) or a link that
+    /// supplies both the node to dial and the token.
+    fn connector(&self) -> eyre::Result<Connector> {
         let service = String::clone(&self.service);
         match &self.target {
-            Target::Node(node) => Ok(Plan {
-                dial: *node,
-                service,
-                // A raw-node dial may still present a token via `--present`, for the case where the node
-                // id was shared separately from the capability.
-                capability: self.present.clone(),
-            }),
-            Target::Capability(link) => Ok(Plan {
-                dial: Cap::parse(link)?.root().node_id(),
-                service,
-                capability: Some(String::clone(link)),
-            }),
+            Target::Node(node) => Ok(Connector::to_node(*node, service, self.present.clone())),
+            Target::Capability(link) => Connector::from_link(link, service),
         }
     }
-}
-
-/// A resolved connect: the node to dial, the service to ask for, and any token to present.
-struct Plan {
-    dial: NodeId,
-    service: String,
-    capability: Option<String>,
-}
-
-impl Plan {
-    /// The opening request this plan sends on each stream: the service to reach and any token.
-    fn request(&self) -> Request {
-        Request {
-            service: String::clone(&self.service),
-            capability: self.capability.clone(),
-        }
-    }
-}
-
-/// Bind a local port and forward each accepted TCP connection to the peer over its own stream.
-async fn serve_port<S: Session>(session: &S, plan: &Plan, port: u16) -> eyre::Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
-    println!(
-        "forwarding 127.0.0.1:{port} to {} ({})",
-        plan.dial, plan.service
-    );
-    let mut pipes = FuturesUnordered::new();
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                // One local accept or stream-open failing must not drop the pipes already in flight:
-                // log the transient error and keep the local listener up.
-                let (tcp, _) = match accepted {
-                    Ok(accepted) => accepted,
-                    Err(error) => {
-                        tracing::warn!(%error, "local accept failed; still listening");
-                        continue;
-                    }
-                };
-                let (writer, reader) = match session.open_bi().await {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        tracing::warn!(%error, "opening a stream to the peer failed; still listening");
-                        continue;
-                    }
-                };
-                pipes.push(request_service(plan.request(), tcp, writer, reader));
-            }
-            Some(result) = pipes.next(), if !pipes.is_empty() => {
-                if let Err(error) = result {
-                    // A refused stream (wrong `--service`, a revoked or non-granting cap) is
-                    // user-actionable, not a transient to bury in a log: surface it, so a silent
-                    // "connection reset" on the local port always carries the reason the peer gave.
-                    eprintln!("connection failed: {error:#}");
-                }
-            }
-        }
-    }
-}
-
-/// Reach the service over one stream and pipe it against this process's stdin/stdout: the ssh
-/// `ProxyCommand` shape, where ssh speaks its protocol over our stdio and we carry it to the peer. No
-/// stdout prints here, since stdout IS the data channel.
-async fn stdio_pipe<S: Session>(session: &S, plan: &Plan) -> eyre::Result<()> {
-    let (writer, reader) = session.open_bi().await?;
-    request_stdio(plan.request(), writer, reader).await
-}
-
-/// Open a stream to a service: send the request, and if the host accepts, pipe the connection.
-async fn request_service<W, R>(
-    request: Request,
-    tcp: TcpStream,
-    mut writer: W,
-    mut reader: R,
-) -> eyre::Result<()>
-where
-    W: io::AsyncWrite + Unpin,
-    R: io::AsyncRead + Unpin,
-{
-    request.write(&mut writer).await?;
-    match Response::read(&mut reader).await? {
-        Response::Ok => splice(tcp, writer, reader).await?,
-        Response::Error(message) => eyre::bail!("service refused: {message}"),
-    }
-    Ok(())
-}
-
-/// Open a service and, if the host accepts, pipe it against this process's stdin/stdout (the `--stdio`
-/// path). Same handshake as [`request_service`], but the local ends are the process's own std streams.
-async fn request_stdio<W, R>(request: Request, mut writer: W, mut reader: R) -> eyre::Result<()>
-where
-    W: io::AsyncWrite + Unpin,
-    R: io::AsyncRead + Unpin,
-{
-    request.write(&mut writer).await?;
-    match Response::read(&mut reader).await? {
-        Response::Ok => splice_halves(io::stdin(), io::stdout(), writer, reader).await?,
-        Response::Error(message) => eyre::bail!("service refused: {message}"),
-    }
-    Ok(())
 }

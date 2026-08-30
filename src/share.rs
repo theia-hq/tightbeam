@@ -26,12 +26,13 @@ pub struct ShareCmd {
 impl ShareCmd {
     /// Mint the link and print it.
     pub fn run(self, identity: &Identity) -> eyre::Result<()> {
-        let expiry = nauthy::expires_in(self.expires.duration());
-        let cap = identity.mint(&self.service, expiry)?;
-        // A non-delegable link is sealed so no holder can append a narrower block; a delegable one is
-        // left open. Verification is unaffected either way.
-        let cap = if self.delegable { cap } else { cap.seal()? };
-        println!("{}", cap.link()?);
+        let link = crate::tunnel::mint_link(
+            identity,
+            &self.service,
+            self.expires.duration(),
+            self.delegable,
+        )?;
+        println!("{link}");
         Ok(())
     }
 }

@@ -4,8 +4,8 @@ use core::time::Duration;
 
 use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
-use tightbeam::connect::Target;
-use tightbeam::{Brand, ConnectCmd, ExposeCmd};
+use nauthy::Gate;
+use tightbeam::tunnel::{Connector, Exposer, Services};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
 
@@ -43,26 +43,18 @@ async fn tunnels_to_a_unix_socket() {
 
             let service = format!("unix:{}", sock.display());
             tokio::task::spawn_local(async move {
-                ExposeCmd {
-                    services: vec![service],
-                    public: true,
-                    quiet: false,
-                }
-                .run(&exposer, [0u8; 32], None, Brand::TIGHTBEAM)
-                .await
-                .unwrap();
+                let services = Services::parse(&[service]).unwrap();
+                Exposer::new(services, Gate::Open, [0u8; 32])
+                    .unwrap()
+                    .run(&exposer)
+                    .await
+                    .unwrap();
             });
             tokio::task::spawn_local(async move {
-                ConnectCmd {
-                    target: Target::Node(exposer_id),
-                    to: Some(local_port),
-                    stdio: false,
-                    service: "default".to_string(),
-                    present: None,
-                }
-                .run(&consumer)
-                .await
-                .unwrap();
+                Connector::to_node(exposer_id, "default".to_owned(), None)
+                    .forward_port(&consumer, local_port)
+                    .await
+                    .unwrap();
             });
 
             let mut client = None;

@@ -20,10 +20,17 @@ use std::path::PathBuf;
 use bifrost::Node;
 use bifrost_iroh::Endpoint;
 use clap::{CommandFactory, Parser, Subcommand};
+// `Brand` is deprecated (banners moved into each CLI); tightbeam still names itself through it until it is
+// removed in step 4, so import it under the allow rather than tripping `-D warnings`.
+#[expect(
+    deprecated,
+    reason = "Brand removed in step 4; tightbeam names itself here for now"
+)]
+use tightbeam::Brand;
 use tightbeam::config::load_signet;
 use tightbeam::identity::{self, Secret};
 use tightbeam::peer::{Discovery, Peer};
-use tightbeam::{AttenuateCmd, Brand, ConnectCmd, ExposeCmd, RevokeCmd, ShareCmd, TreeCmd};
+use tightbeam::{AttenuateCmd, ConnectCmd, ExposeCmd, RevokeCmd, ShareCmd, TreeCmd};
 
 /// Reach a service on another machine by its public key, no public IP needed.
 #[derive(Debug, Parser)]
@@ -94,7 +101,15 @@ async fn main() -> eyre::Result<()> {
             let host_seed = secret.ssh_host_seed();
             let signet = load_signet().await?;
             let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
-            cmd.run(&node, host_seed, signet, Brand::TIGHTBEAM).await
+            // `Brand` is deprecated: banners are a CLI concern and the logic now lives in the tunnel core.
+            // tightbeam still names itself through it until `Brand` is removed in step 4. The const access
+            // is itself deprecated, so suppress it here too.
+            #[expect(
+                deprecated,
+                reason = "Brand removed in step 4; tightbeam names itself here for now"
+            )]
+            let brand = Brand::TIGHTBEAM;
+            cmd.run(&node, host_seed, signet, brand).await
         }
         Command::Connect(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
