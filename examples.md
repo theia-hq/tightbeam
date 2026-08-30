@@ -38,6 +38,51 @@ the host's key, gated, and never touch a public IP or a port-forward.
 Music is the same shape: point the exposed port at a music server (for example `mopidy` or a plain
 folder of files) and open it with any client.
 
+## Your whole media server over your key
+
+The host runs Plex or Jellyfin. You want the whole library on another machine you own, without opening
+the server to the public internet.
+
+Expose the server's port on the host, bind it to a local port on your machine, then open the web UI
+there.
+
+```sh
+# on the host: expose the running media server (Plex 32400, Jellyfin 8096)
+tightbeam expose plex=127.0.0.1:32400        # Jellyfin: jellyfin=127.0.0.1:8096
+```
+
+```sh
+# on your machine: bind it to a local port, then open the web UI or a client
+tightbeam connect <peer> --service plex --to 32400
+open http://127.0.0.1:32400                  # or point a Plex/Jellyfin app at it
+```
+
+Your whole library streams to any machine you own, addressed by key and gated to your signet. There is
+no port-forward and the server never faces the public internet.
+
+## A live webcam to VLC on the other side
+
+The host has a camera. You want the live feed on another machine, with no cloud camera vendor in the
+middle.
+
+Have `ffmpeg` serve the camera on a TCP port, expose it, then open the local port in a player.
+
+```sh
+# on the host: capture the camera and serve it on a TCP port (device name varies by OS:
+# /dev/video0 on Linux, "0" with -f avfoundation on macOS)
+ffmpeg -i /dev/video0 -f mpegts "tcp://127.0.0.1:9002?listen" &
+tightbeam expose cam=127.0.0.1:9002
+```
+
+```sh
+# on your machine: bind it to a local port, then open that port in a player
+tightbeam connect <peer> --service cam --to 9002
+vlc tcp://127.0.0.1:9002                      # or: mpv tcp://127.0.0.1:9002
+```
+
+The live feed reaches you addressed by the host's key and gated to your signet, with no port-forward
+and no camera service in the path.
+
 ## Pipe a raw stream: stdin to stdout across the overlay
 
 `--stdio` pipes one service stream against this process's own stdin and stdout instead of binding a
