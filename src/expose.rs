@@ -96,7 +96,7 @@ impl ExposeCmd {
         let _ = host_seed;
         // Merge the caller's injected handlers (swoosh's `diag:`) over tightbeam's own; the embedder that
         // depends on the service crates owns what plugs in, the tunnel names only its raw-forward primitives.
-        let registry = registry.extend(extra);
+        let registry = registry.extend(extra)?;
         // The domain assembles the exposer, enforcing the sshd-cannot-be-public invariant before any
         // banner is printed, so a refused pairing never advertises a shell it will not serve.
         let exposer = Exposer::new(services.clone(), registry, gate)?;
@@ -126,19 +126,12 @@ impl ExposeCmd {
     /// (admitting its members and delegates), and `--public` is the one deliberate opt-out to anyone.
     /// Unprovisioned + not public fails LOUDLY rather than falling back to anything permissive.
     async fn gate(&self, signet: Option<NodeId>) -> eyre::Result<Gate> {
-        if self.public {
-            return Ok(Gate::Open);
-        }
-        let root = signet.ok_or_else(|| {
-            eyre::eyre!(
-                "this node has no signet to gate on: provision it with `swoosh adopt <authkey>`, \
-                 or pass --public to expose to anyone"
-            )
-        })?;
         // The revocation denylist is loaded once here; a `tightbeam revoke` adds to the file, which the
         // next exposer run reads. Offline, no server. The core takes the loaded denylist, never a path.
         let denylist = Denylist::load(crate::config::revoked_path()?).await?;
-        Ok(tunnel::family_gate(root, denylist))
+        // One shared policy point for every embedder (tightbeam's CLI and swoosh): --public opens, else a
+        // family gate on the signet, else fail loud. See `tunnel::resolve_gate`.
+        tunnel::resolve_gate(self.public, signet, denylist)
     }
 
     /// A one-line description of the effective gate, for the readiness banner: trust made visible.
