@@ -10,7 +10,7 @@ Two facts hold for every example:
 - A service is reachable only by a peer that holds the host's key and passes its gate (its signet by
   default, or a `sheer:` link). `--public` opens it to anyone; that is the only opt-out.
 
-`<peer>` is the host's node id, printed in the `serve` readiness banner, or a `sheer:` link from
+`<peer>` is the host's node id, printed in the `expose` readiness banner, or a `sheer:` link from
 `tightbeam share`.
 
 ## Stream a file by key
@@ -55,7 +55,7 @@ tightbeam connect <peer> --service cam --stdio | mpv -    # or: vlc -
 The live feed reaches you addressed by the host's key and gated to your signet, with no port-forward and
 no camera vendor in the path.
 
-> Streaming a *command's* own stdout directly (`serve cam=exec:'ffmpeg -i /dev/video0 -f mpegts -'`, with
+> Streaming a *command's* own stdout directly (`expose cam=exec:'ffmpeg -i /dev/video0 -f mpegts -'`, with
 > no pipe to make and no background producer) needs an `exec:` scheme. Spawning a process on the host is a
 > materially bigger blast radius than opening a file, so it is a separate, held item pending its own
 > design. When it lands, the live case collapses to one line too.
@@ -99,7 +99,7 @@ ssh uses for its `ProxyCommand` (see the README).
 
 ## Anything with a local address is reachable by key
 
-A database port or a Unix socket. One `serve` and one `connect` each.
+A database port or a Unix socket. One `expose` and one `connect` each.
 
 A Postgres server on the host, reached with `psql` from your machine:
 
