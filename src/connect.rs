@@ -1,8 +1,13 @@
-//! `tightbeam connect`: bind a peer's exposed service to a local port, by node id or by capability link.
+//! `tightbeam connect`: the clap surface for binding a peer's exposed service to a local port or piping it
+//! over stdin/stdout, by node id or by capability link.
+//!
+//! The `Args` struct + its `Target` parse type + the `connector` resolver live here; the driving body
+//! (forward a port or pipe stdio) is `main.rs` glue over the library [`Connector`], so tightbeam's CLI is a
+//! thin adapter symmetric with swoosh's.
 
 use core::str::FromStr;
 
-use bifrost::{Discovery, Node, NodeId, Transport};
+use bifrost::NodeId;
 use clap::{ArgGroup, Args};
 use nauthy::{Cap, SCHEME};
 
@@ -58,27 +63,10 @@ impl FromStr for Target {
 }
 
 impl ConnectCmd {
-    /// Reach the peer, then either bind a local port and forward each accepted connection, or (`--stdio`)
-    /// pipe the single service stream against this process's stdin/stdout, the ssh `ProxyCommand` shape.
-    pub async fn run<T: Transport, D: Discovery>(self, node: &Node<T, D>) -> eyre::Result<()> {
-        let connector = self.connector()?;
-        // The arg group makes exactly one of `--to`/`--stdio` present, so a missing port means stdio.
-        match self.to {
-            Some(port) => {
-                println!(
-                    "forwarding 127.0.0.1:{port} to {} ({})",
-                    connector.dial(),
-                    connector.service()
-                );
-                connector.forward_port(node, port).await
-            }
-            None => connector.pipe_stdio(node).await,
-        }
-    }
-
     /// Resolve the target into a [`Connector`]: a raw node id (optionally presenting a link) or a link that
-    /// supplies both the node to dial and the token.
-    fn connector(&self) -> eyre::Result<Connector> {
+    /// supplies both the node to dial and the token. The driving (`forward_port`/`pipe_stdio`, chosen by
+    /// `--to`/`--stdio`) is `main.rs` glue over the returned connector.
+    pub fn connector(&self) -> eyre::Result<Connector> {
         let service = String::clone(&self.service);
         match &self.target {
             Target::Node(node) => Ok(Connector::to_node(*node, service, self.present.clone())),

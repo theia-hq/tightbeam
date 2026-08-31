@@ -17,19 +17,14 @@
 use core::net::SocketAddr;
 use std::path::PathBuf;
 
-use bifrost::Node;
+use bifrost::{Node, NodeId, Transport};
 use bifrost_iroh::Endpoint;
 use clap::{CommandFactory, Parser, Subcommand};
-// `Brand` is deprecated (banners moved into each CLI); tightbeam still names itself through it until it is
-// removed in step 4, so import it under the allow rather than tripping `-D warnings`.
-#[expect(
-    deprecated,
-    reason = "Brand removed in step 4; tightbeam names itself here for now"
-)]
-use tightbeam::Brand;
-use tightbeam::config::load_signet;
+use nauthy::Denylist;
+use tightbeam::config::{load_signet, revoked_path};
 use tightbeam::identity::{self, Secret};
 use tightbeam::peer::{Discovery, Peer};
+use tightbeam::tunnel::{self, Exposer, Registry, Services};
 use tightbeam::{AttenuateCmd, ConnectCmd, ExposeCmd, RevokeCmd, ShareCmd, TreeCmd};
 
 /// Reach a service on another machine by its public key, no public IP needed.
@@ -100,25 +95,100 @@ async fn main() -> eyre::Result<()> {
             // service uses it, but it is cheap and keeps the secret's raw bytes from leaving for it.
             let host_seed = secret.ssh_host_seed();
             let signet = load_signet().await?;
+            // Load tightbeam's own denylist here in the adapter and pass it as a value; the core takes the
+            // loaded list, never a path (the same seam swoosh drives on its own store).
+            let denylist = Denylist::load(revoked_path()?).await?;
             let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
-            // `Brand` is deprecated: banners are a CLI concern and the logic now lives in the tunnel core.
-            // tightbeam still names itself through it until `Brand` is removed in step 4. The const access
-            // is itself deprecated, so suppress it here too.
-            #[expect(
-                deprecated,
-                reason = "Brand removed in step 4; tightbeam names itself here for now"
-            )]
-            let brand = Brand::TIGHTBEAM;
-            // tightbeam's own CLI injects no service crate: only its raw forwards + the sshd/fetch handlers
-            // ExposeCmd builds itself. swoosh is the embedder that adds `diag:`.
-            cmd.run(&node, host_seed, signet, brand, tightbeam::tunnel::Registry::new())
-                .await
+            expose(&node, cmd, host_seed, signet, denylist).await
         }
         Command::Connect(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
             let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
-            cmd.run(&node).await
+            connect(&node, cmd).await
         }
+    }
+}
+
+/// tightbeam's `expose` adapter: a thin glue over [`tightbeam::tunnel`], symmetric with swoosh's. Parse
+/// the services, resolve the gate through the shared `resolve_gate` policy (`--public` opens, else a family
+/// gate on the signet, else a loud error), assemble the shipped handler registry (`fetch`, plus `sshd`
+/// behind the `ssh` feature; tightbeam injects no service crate, so `extra` is empty), print tightbeam's
+/// OWN banner, and run the exposer. The core prints nothing; the banner is this CLI's to own.
+async fn expose<T: Transport, D: bifrost::Discovery>(
+    node: &Node<T, D>,
+    cmd: ExposeCmd,
+    host_seed: [u8; 32],
+    signet: Option<NodeId>,
+    denylist: Denylist,
+) -> eyre::Result<()>
+where
+    <T::Session as bifrost::Session>::Write: Send + 'static,
+    <T::Session as bifrost::Session>::Read: Send + 'static,
+{
+    let services = Services::parse(&cmd.services)?;
+    // Build the gate before announcing readiness: an unprovisioned node with no `--public` fails HERE,
+    // loudly, through the ONE shared policy point, never on a permissive default.
+    let gate = tunnel::resolve_gate(cmd.public, signet, denylist)?;
+    // The registry tightbeam ships: the HTTP egress fetch, and the keyless shell behind the `ssh` feature.
+    // tightbeam injects no service crate of its own, so it extends with an empty registry (the same
+    // add-only merge swoosh uses to plug in its `diag:`).
+    let registry = Registry::new().with("fetch", tightbeam::handlers::fetch());
+    #[cfg(feature = "ssh")]
+    let registry = registry.with("sshd", tightbeam::handlers::sshd(host_seed));
+    #[cfg(not(feature = "ssh"))]
+    let _ = host_seed;
+    let registry = registry.extend(Registry::new())?;
+    // The core assembles the exposer, enforcing the sshd-cannot-be-public invariant before any banner is
+    // printed, so a refused pairing never advertises a shell it will not serve.
+    let exposer = Exposer::new(services.clone(), registry, gate)?;
+    if !cmd.quiet {
+        expose_banner(node.node_id(), services.names(), &gate_description(&cmd, signet));
+    }
+    exposer.run(node).await
+}
+
+/// Print tightbeam's readiness banner: the copyable node id set off by blank lines, a header, and a trailer
+/// naming the exposed services, the effective gate, and how to stop. Points at `tightbeam share` (this
+/// CLI's own mint verb). Only public material (the node id) is printed; the host seed and signet secret
+/// never appear. Withheld under `--quiet`.
+fn expose_banner<'a>(node_id: NodeId, names: impl Iterator<Item = &'a str>, gate: &str) {
+    println!("tightbeam ready. peers can reach these services at:\n");
+    println!("    {node_id}                     (share this key, or mint a link with `tightbeam share`)\n");
+    let names: Vec<&str> = names.collect();
+    println!("exposing {}. gate: {}. ctrl-c to stop.", names.join(", "), gate);
+}
+
+/// A one-line description of the effective gate, for the readiness banner: trust made visible.
+fn gate_description(cmd: &ExposeCmd, signet: Option<NodeId>) -> String {
+    if cmd.public {
+        "public (anyone, unauthenticated)".to_owned()
+    } else {
+        match signet {
+            Some(root) => format!("signet {}", root.short()),
+            None => "unprovisioned".to_owned(),
+        }
+    }
+}
+
+/// tightbeam's `connect` adapter: resolve the target into a library [`Connector`], then either bind a local
+/// port and forward each accepted connection, or (`--stdio`) pipe the single service stream against this
+/// process's stdin/stdout (the ssh `ProxyCommand` shape). The arg group makes exactly one of `--to`/
+/// `--stdio` present, so a missing port means stdio.
+async fn connect<T: Transport, D: bifrost::Discovery>(
+    node: &Node<T, D>,
+    cmd: ConnectCmd,
+) -> eyre::Result<()> {
+    let connector = cmd.connector()?;
+    match cmd.to {
+        Some(port) => {
+            println!(
+                "forwarding 127.0.0.1:{port} to {} ({})",
+                connector.dial(),
+                connector.service()
+            );
+            connector.forward_port(node, port).await
+        }
+        None => connector.pipe_stdio(node).await,
     }
 }
 

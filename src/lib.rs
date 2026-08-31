@@ -40,13 +40,6 @@ use tokio::io::{self, AsyncWriteExt as _};
 
 pub use crate::attenuate::AttenuateCmd;
 pub use crate::connect::ConnectCmd;
-// `Brand` is deprecated (banners are a CLI concern now); re-exported so swoosh keeps building until its
-// cutover, and removed in step 4. The allow keeps the re-export from tripping `-D warnings`.
-#[expect(
-    deprecated,
-    reason = "re-exported for swoosh until its cutover; removed in step 4"
-)]
-pub use crate::expose::Brand;
 pub use crate::expose::ExposeCmd;
 pub use crate::revoke::RevokeCmd;
 pub use crate::share::ShareCmd;
