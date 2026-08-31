@@ -22,7 +22,7 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::identity::{AsNodeId as _, AsVerifyKey as _};
 use crate::protocol::{Request, Response};
 use crate::raw_stream::RawStream;
-use crate::{splice, splice_halves};
+use crate::{pipe_stdio_bridge, splice, splice_halves};
 
 /// How long to wait for a raw-stream open to complete before dropping the stream. A `fifo:` `open()`
 /// blocks until a peer opens the other end (POSIX), so an admitted peer that requests a FIFO whose writer
@@ -52,7 +52,7 @@ enum Target {
     /// tightbeam's own primitive, the raw-stream half: source an already-open byte stream and splice it
     /// toward the peer, either an OS object the operator named (`file:<path>` / `fifo:<path>`) or this
     /// process's own standard input (`stdin:`, a single-consumer source taken once). The reverse of
-    /// `connect --stdio`. Carries a [`RawStream`] whose direction is fixed at parse time (a read-only
+    /// `connect --to -`. Carries a [`RawStream`] whose direction is fixed at parse time (a read-only
     /// source), so "write peer bytes back into the source" is unrepresentable rather than a runtime error.
     RawStream(RawStream),
     /// A named service handler (`sshd`, `fetch`, `diag`, ...) dispatched through the injected registry.
@@ -689,8 +689,9 @@ impl Connector {
         })
     }
 
-    /// Reach the service over one stream and pipe it against this process's stdin/stdout: the ssh
-    /// `ProxyCommand` shape, where ssh speaks its protocol over our stdio and we carry it to the peer.
+    /// Reach the service over one stream and pipe it against this process's stdin/stdout (the `--to -`
+    /// stdout / ssh `ProxyCommand` shape): ssh speaks its protocol over our stdio and we carry it to the
+    /// peer. The pump finishes when the peer closes, so a `-- <cmd>` invocation exits when its command does.
     pub async fn pipe_stdio<T: Transport, D: Discovery>(
         self,
         node: &Node<T, D>,
@@ -843,8 +844,10 @@ where
     Ok(())
 }
 
-/// Open a service and, if the host accepts, pipe it against this process's stdin/stdout (the stdio path).
-/// Same handshake as [`request_service`], but the local ends are the process's own std streams.
+/// Open a service and, if the host accepts, pipe it against this process's stdin/stdout (the `--to -`
+/// stdout/ssh-`ProxyCommand` path). Same handshake as [`request_service`], but the local ends are the
+/// process's own std streams, and the pump ([`pipe_stdio_bridge`]) returns when the PEER closes rather than
+/// waiting on a stdin that (at a terminal) never EOFs, so `ssh <peer> -- <cmd>` exits when the command does.
 async fn request_stdio<W, R>(request: Request, mut writer: W, mut reader: R) -> eyre::Result<()>
 where
     W: io::AsyncWrite + Unpin,
@@ -852,7 +855,7 @@ where
 {
     request.write(&mut writer).await?;
     match Response::read(&mut reader).await? {
-        Response::Ok => splice_halves(io::stdin(), io::stdout(), writer, reader).await?,
+        Response::Ok => pipe_stdio_bridge(writer, reader).await?,
         Response::Error(message) => eyre::bail!("service refused: {message}"),
     }
     Ok(())

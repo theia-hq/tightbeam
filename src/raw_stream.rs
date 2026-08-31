@@ -8,9 +8,10 @@
 //! - `stdin:` — this process's own standard input (fd 0). No path, so none of the path guards apply; it is
 //!   a SINGLE-CONSUMER source (fd 0 is one non-re-openable stream) taken once and never re-armed.
 //!
-//! The path forms mirror `connect --stdio` (which splices the connector's stdio): where `--stdio` pumps a
-//! running process's stdin/stdout, `file:`/`fifo:` pump the bytes of a path the operator already made, and
-//! `stdin:` pumps whatever a producer pipes into the exposer (`producer | tightbeam expose x=stdin:`).
+//! The path forms mirror `connect --to -` (which streams the service to the connector's stdout): where
+//! `--to -` pumps the far service to a running process's stdout, `file:`/`fifo:` pump the bytes of a path
+//! the operator already made, and `stdin:` pumps whatever a producer pipes in (`producer | tightbeam
+//! expose x=stdin:`).
 //!
 //! The four path guards (`file:`/`fifo:` only; `stdin:` has no path and inherits NONE of them):
 //!

@@ -23,7 +23,7 @@ tightbeam expose movie=file:/srv/films/big.mkv     # on the host
 ```
 
 ```sh
-tightbeam connect <peer> --service movie --stdio | mpv -    # on your machine
+tightbeam connect <peer> --service movie --to - | mpv -    # on your machine
 ```
 
 `file:<path>` streams the file's raw bytes toward the peer, so there is no port to bind, no `cat`, and
@@ -43,7 +43,7 @@ ffmpeg -i /dev/video0 -f mpegts - | tightbeam expose cam=stdin:
 
 ```sh
 # on your machine: read the stream straight into a player
-tightbeam connect <peer> --service cam --stdio | mpv -    # or: vlc -
+tightbeam connect <peer> --service cam --to - | mpv -    # or: vlc -
 ```
 
 `stdin:` serves whatever a producer pipes into `expose`, so the whole live case is one pipe: no `mkfifo`,
@@ -89,12 +89,12 @@ tar -cf - ~/project | tightbeam expose bundle=stdin:
 
 ```sh
 # on your machine: pull the stream and unpack it in place
-tightbeam connect <peer> --service bundle --stdio | tar -xf -
+tightbeam connect <peer> --service bundle --to - | tar -xf -
 ```
 
-`--stdio` pipes one service stream against this process's own stdin and stdout instead of binding a port,
-so tightbeam becomes a transport for anything that reads stdin and writes stdout. It is the same shape
-ssh uses for its `ProxyCommand` (see the README).
+`--to -` streams one service against this process's own stdout (and reads its stdin) instead of binding a
+port, so tightbeam becomes a transport for anything that reads stdin and writes stdout. It is the same
+shape ssh uses for its `ProxyCommand` (see the README).
 
 ## Anything with a local address is reachable by key
 

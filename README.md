@@ -96,7 +96,7 @@ None of these is a tightbeam feature with a verb of its own. They are what a raw
 you do.
 
 **ssh to a machine with no public IP.** Expose the host's own sshd as a service, then point ssh's
-`ProxyCommand` at a forwarded stream. `--stdio` pipes the service over stdin/stdout instead of binding a
+`ProxyCommand` at a forwarded stream. `--to -` streams the service over stdin/stdout instead of binding a
 port, which is exactly the shape a `ProxyCommand` wants: ssh talks to the far sshd through the stream as
 if it were local.
 
@@ -109,7 +109,7 @@ directly. Give ssh a legal alias in `~/.ssh/config` instead:
 
 ```
 Host alice-desk
-    ProxyCommand tightbeam connect <peer> --service ssh --stdio
+    ProxyCommand tightbeam connect <peer> --service ssh --to -
 ```
 
 Then `ssh alice-desk` reaches the far machine by key. `<peer>` is the host's node id or a `sheer:`

@@ -2,9 +2,9 @@
 //!
 //! `tightbeam expose <target>...` publishes local services (a `host:port` or a `unix:<path>`, named
 //! `name=target` or bare for the `default` service) under this machine's key. `tightbeam connect
-//! <node-id|sheer-link> --to <port> [--service <name>]` reaches an exposed service from another machine
-//! and binds it to a local port. Peer to peer, with nothing in between; `ssh -L` shaped, but you address
-//! the far machine by its key, not an IP.
+//! <node-id|sheer-link> --to <port | - | unix:PATH> [--service <name>]` reaches an exposed service from
+//! another machine and puts it on a local port, stdout (`-`), or a unix listener. Peer to peer, with
+//! nothing in between; `ssh -L` shaped, but you address the far machine by its key, not an IP.
 //!
 //! Who may connect is a property of the node, not a per-expose choice: by default `expose` gates a
 //! service to the machine's signet (the key it trusts, set by `swoosh adopt`), admitting the owner's own
@@ -25,7 +25,7 @@ use tightbeam::config::{load_signet, revoked_path};
 use tightbeam::identity::{self, Secret};
 use tightbeam::peer::{Discovery, Peer};
 use tightbeam::tunnel::{self, Exposer, Registry, Services};
-use tightbeam::{AttenuateCmd, ConnectCmd, ExposeCmd, RevokeCmd, ShareCmd, TreeCmd};
+use tightbeam::{AttenuateCmd, ConnectCmd, ExposeCmd, RevokeCmd, ShareCmd, To, TreeCmd};
 
 /// Reach a service on another machine by its public key, no public IP needed.
 #[derive(Debug, Parser)]
@@ -148,7 +148,7 @@ where
 /// never appear. Withheld under `--quiet`.
 ///
 /// Printed to STDERR, never stdout: a `stdin:` producer pipes its bytes into this process's stdin, and stdout
-/// is a data path (`connect --stdio` mirrors it), so a human banner on stdout could interleave into the
+/// is a data path (`connect --to -` mirrors it), so a human banner on stdout could interleave into the
 /// stream. stderr is for the human; stdout/stdin carry data.
 fn expose_banner<'a>(node_id: NodeId, names: impl Iterator<Item = &'a str>, gate: &str) {
     eprintln!("tightbeam ready. peers can reach these services at:\n");
@@ -175,17 +175,17 @@ fn gate_description(cmd: &ExposeCmd, signet: Option<NodeId>) -> String {
     }
 }
 
-/// tightbeam's `connect` adapter: resolve the target into a library [`Connector`], then either bind a local
-/// port and forward each accepted connection, or (`--stdio`) pipe the single service stream against this
-/// process's stdin/stdout (the ssh `ProxyCommand` shape). The arg group makes exactly one of `--to`/
-/// `--stdio` present, so a missing port means stdio.
+/// tightbeam's `connect` adapter: resolve the target into a library [`Connector`], then drive the sink the
+/// single `--to` selector names -- bind a local port and forward each accepted connection, stream the
+/// service to stdout (`--to -`, the ssh `ProxyCommand` shape), or a reserved unix listener. `To` is one
+/// closed enum, so the sink is unambiguous with no arg group and no missing-means-stdio inference.
 async fn connect<T: Transport, D: bifrost::Discovery>(
     node: &Node<T, D>,
     cmd: ConnectCmd,
 ) -> eyre::Result<()> {
     let connector = cmd.connector()?;
     match cmd.to {
-        Some(port) => {
+        To::Port(port) => {
             // Prove the gate admits us BEFORE announcing readiness: `preflight` reaches, probes admission,
             // and binds the port, returning an error (with the host's reason) on refusal. Only past it is
             // "forwarding …" true, so an unauthorized forward fails loudly here, never a fake success then
@@ -195,7 +195,11 @@ async fn connect<T: Transport, D: bifrost::Discovery>(
             println!("forwarding 127.0.0.1:{port} to {dial} ({service})");
             forward.run().await
         }
-        None => connector.pipe_stdio(node).await,
+        To::Stdout => connector.pipe_stdio(node).await,
+        To::UnixListener(path) => eyre::bail!(
+            "--to unix:{} is reserved, not yet built (bind a port and connect to it, or use `--to -`)",
+            path.display()
+        ),
     }
 }
 

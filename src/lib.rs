@@ -34,7 +34,7 @@ mod protocol_tests;
 use tokio::io::{self, AsyncWriteExt as _};
 
 pub use crate::attenuate::AttenuateCmd;
-pub use crate::connect::ConnectCmd;
+pub use crate::connect::{ConnectCmd, To};
 pub use crate::expose::ExposeCmd;
 pub use crate::revoke::RevokeCmd;
 pub use crate::share::ShareCmd;
@@ -55,8 +55,8 @@ where
 }
 
 /// Copy bytes both ways between a separate local reader/writer pair and a bifrost stream until both
-/// sides close. The split form of [`splice`], for locals that are not one duplex object: `connect
-/// --stdio` pumps this process's stdin and stdout (two handles) against the peer stream.
+/// sides close. The split form of [`splice`], for locals that are not one duplex object: a `file:`/`stdin:`
+/// raw-stream source pumps its reader toward the peer with a discarding sink the other way.
 pub(crate) async fn splice_halves<LR, LW, W, R>(
     mut local_reader: LR,
     mut local_writer: LW,
@@ -79,4 +79,43 @@ where
     };
     tokio::try_join!(upstream, downstream)?;
     Ok(())
+}
+
+/// Pump this process's stdio against a peer service stream for an ssh-`ProxyCommand`-shaped bridge (`connect
+/// --to -`), finishing as soon as the PEER closes its write half.
+///
+/// The asymmetry is the whole point, and the fix for the `ssh <peer> -- <cmd>` hang. The bridge's stdin is
+/// the local ssh's terminal, which never reaches EOF for the life of the session, so a symmetric
+/// wait-for-both pump ([`splice_halves`]) would park forever after the remote command exits (the remote
+/// closes its write half, but local stdin stays open). A stdio bridge is done when the SERVICE is done:
+/// when the peer half-closes (its command exited, or an interactive session ended), copy any final bytes to
+/// stdout, then return, rather than waiting on a stdin that will never close. The local-to-peer copy runs
+/// concurrently and is dropped on return (its writer is shut down first, so the peer sees a clean close).
+pub(crate) async fn pipe_stdio_bridge<W, R>(mut writer: W, mut reader: R) -> io::Result<()>
+where
+    W: io::AsyncWrite + Unpin,
+    R: io::AsyncRead + Unpin,
+{
+    let mut local_in = io::stdin();
+    let mut local_out = io::stdout();
+    let upstream = async {
+        io::copy(&mut local_in, &mut writer).await?;
+        writer.shutdown().await
+    };
+    let downstream = async {
+        io::copy(&mut reader, &mut local_out).await?;
+        local_out.flush().await
+    };
+    tokio::select! {
+        // The peer closed (remote command exited / session ended): the service is done, so return without
+        // waiting on local stdin (which, at a terminal, never EOFs). This is what unhangs `ssh -- <cmd>`.
+        result = downstream => result,
+        // Local stdin closed first (a piped, finite input): half-close toward the peer, then keep draining
+        // the peer's remaining output to stdout so nothing it still had to say is lost.
+        result = upstream => {
+            result?;
+            io::copy(&mut reader, &mut local_out).await?;
+            local_out.flush().await
+        }
+    }
 }
