@@ -128,14 +128,9 @@ impl Handler {
     }
 }
 
-/// The service schemes tightbeam's OWN handlers ship (`sshd:`, `fetch:`). An injected registry may ADD new
-/// schemes but never REPLACE one of these, so a caller cannot shadow a gated built-in (a keyless shell) with
-/// an open handler and slip it past [`Exposer::new`]'s gate check. Enforced in [`Registry::extend`].
-const RESERVED_SCHEMES: &[&str] = &["sshd", "fetch"];
-
 /// The scheme -> handler map the [`Exposer`] takes at construction. The caller builds it; the tunnel core
-/// depends on no service crate. Keyed by the `<scheme>:` an exposed service resolves to (`sshd`, `fetch`,
-/// `diag`).
+/// depends on no service crate and ships no handler of its own. Keyed by the `<scheme>:` an exposed service
+/// resolves to (`sshd`, `fetch`, `diag`).
 #[derive(Default)]
 pub struct Registry(HashMap<String, Handler>);
 
@@ -153,18 +148,19 @@ impl Registry {
         self
     }
 
-    /// Merge another registry's handlers into this one. An injected registry may only ADD schemes: a
-    /// collision with a scheme already present, or with one of tightbeam's own [`RESERVED_SCHEMES`], is
-    /// refused HERE at merge intent. This makes it impossible for an injected handler to shadow (and
-    /// silently downgrade the gate of) a built-in one, rather than repairing it after the fact.
+    /// Merge another registry's handlers into this one. The merge is ADD-ONLY: a collision with a scheme
+    /// already present is refused HERE at merge intent, never silently overwritten. tightbeam ships no
+    /// handler of its own, so the caller (swoosh) assembles the whole registry; this guard keeps that
+    /// assembly honest, so a second `extend` cannot shadow (and silently downgrade the gate of) a handler
+    /// the caller already registered, rather than repairing the collision after the fact.
     pub fn extend(mut self, other: Registry) -> eyre::Result<Self> {
         let Self(handlers) = &mut self;
         let Registry(others) = other;
         for (scheme, handler) in others {
-            if handlers.contains_key(&scheme) || RESERVED_SCHEMES.contains(&scheme.as_str()) {
+            if handlers.contains_key(&scheme) {
                 eyre::bail!(
-                    "cannot inject a handler for `{scheme}:`: it is a reserved built-in scheme and may \
-                     not be replaced"
+                    "cannot inject a handler for `{scheme}:`: a handler for that scheme is already \
+                     registered and may not be replaced"
                 );
             }
             handlers.insert(scheme, handler);
@@ -890,21 +886,21 @@ mod tests {
     }
 
     #[test]
-    fn extend_refuses_to_inject_a_reserved_scheme() {
+    fn extend_is_add_only_and_refuses_a_collision() {
         use futures::FutureExt as _;
         let noop: super::ServeFn =
             std::sync::Arc::new(|_admitted, _writer, _reader| async { Ok(()) }.boxed());
-        // Adding a NEW scheme (an embedder injecting its own `diag:`) is allowed.
+        // Adding a NEW scheme (an embedder injecting its own `diag:` beside `fetch:`) is allowed.
         let base = super::Registry::new().with("fetch", super::Handler::open(noop.clone()));
         let added = base.extend(super::Registry::new().with("diag", super::Handler::open(noop.clone())));
         assert!(added.is_ok(), "injecting a new scheme must be allowed");
-        // Injecting a RESERVED built-in (`sshd`/`fetch`) is refused at merge intent, so an injected OPEN
-        // handler can never shadow (and silently downgrade the gate of) a gated built-in.
-        let base = super::Registry::new().with("fetch", super::Handler::open(noop.clone()));
+        // Re-injecting a scheme already registered is refused at merge intent, so a second `extend` can
+        // never shadow (and silently downgrade the gate of) a handler the caller already registered.
+        let base = super::Registry::new().with("sshd", super::Handler::gated(noop.clone()));
         let shadowed = base.extend(super::Registry::new().with("sshd", super::Handler::open(noop)));
         assert!(
             shadowed.is_err(),
-            "injecting a reserved built-in scheme must be refused so it cannot shadow a gated handler"
+            "re-injecting an already-registered scheme must be refused so it cannot shadow a handler"
         );
     }
 }

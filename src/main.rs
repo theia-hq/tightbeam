@@ -91,15 +91,12 @@ async fn main() -> eyre::Result<()> {
         // gate trusts (a family gate admits the owner's devices and their delegates).
         Command::Expose(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
-            // Derive the ssh host-key seed before the secret is consumed by the bind. Only a `sshd:`
-            // service uses it, but it is cheap and keeps the secret's raw bytes from leaving for it.
-            let host_seed = secret.ssh_host_seed();
             let signet = load_signet().await?;
             // Load tightbeam's own denylist here in the adapter and pass it as a value; the core takes the
             // loaded list, never a path (the same seam swoosh drives on its own store).
             let denylist = Denylist::load(revoked_path()?).await?;
             let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
-            expose(&node, cmd, host_seed, signet, denylist).await
+            expose(&node, cmd, signet, denylist).await
         }
         Command::Connect(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
@@ -111,13 +108,16 @@ async fn main() -> eyre::Result<()> {
 
 /// tightbeam's `expose` adapter: a thin glue over [`tightbeam::tunnel`], symmetric with swoosh's. Parse
 /// the services, resolve the gate through the shared `resolve_gate` policy (`--public` opens, else a family
-/// gate on the signet, else a loud error), assemble the shipped handler registry (`fetch`, plus `sshd`
-/// behind the `ssh` feature; tightbeam injects no service crate, so `extra` is empty), print tightbeam's
-/// OWN banner, and run the exposer. The core prints nothing; the banner is this CLI's to own.
+/// gate on the signet, else a loud error), print tightbeam's OWN banner, and run the exposer. The core
+/// prints nothing; the banner is this CLI's to own.
+///
+/// tightbeam's binary is a thin demo of the tunnel: it exposes only the raw-forward primitive
+/// (`host:port` / `unix:<path>`), so it hands the exposer an EMPTY registry and names no service crate. A
+/// handler service (`sshd:`, `fetch:`, `diag:`) lives in its own crate that swoosh injects; a bare scheme
+/// here resolves to a handler no registry holds and is refused loudly at [`Exposer::new`].
 async fn expose<T: Transport, D: bifrost::Discovery>(
     node: &Node<T, D>,
     cmd: ExposeCmd,
-    host_seed: [u8; 32],
     signet: Option<NodeId>,
     denylist: Denylist,
 ) -> eyre::Result<()>
@@ -129,18 +129,9 @@ where
     // Build the gate before announcing readiness: an unprovisioned node with no `--public` fails HERE,
     // loudly, through the ONE shared policy point, never on a permissive default.
     let gate = tunnel::resolve_gate(cmd.public, signet, denylist)?;
-    // The registry tightbeam ships: the HTTP egress fetch, and the keyless shell behind the `ssh` feature.
-    // tightbeam injects no service crate of its own, so it extends with an empty registry (the same
-    // add-only merge swoosh uses to plug in its `diag:`).
-    let registry = Registry::new().with("fetch", tightbeam::handlers::fetch());
-    #[cfg(feature = "ssh")]
-    let registry = registry.with("sshd", tightbeam::handlers::sshd(host_seed));
-    #[cfg(not(feature = "ssh"))]
-    let _ = host_seed;
-    let registry = registry.extend(Registry::new())?;
-    // The core assembles the exposer, enforcing the sshd-cannot-be-public invariant before any banner is
-    // printed, so a refused pairing never advertises a shell it will not serve.
-    let exposer = Exposer::new(services.clone(), registry, gate)?;
+    // The core assembles the exposer over an empty registry (tightbeam ships no handler of its own), so a
+    // named-service scheme is refused at construction, and only raw forwards are served.
+    let exposer = Exposer::new(services.clone(), Registry::new(), gate)?;
     if !cmd.quiet {
         expose_banner(node.node_id(), services.names(), &gate_description(&cmd, signet));
     }

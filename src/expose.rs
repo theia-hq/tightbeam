@@ -8,6 +8,10 @@ use clap::Args;
 
 /// Expose a local service to peers.
 ///
+/// tightbeam's binary is a thin demo of the tunnel: it forwards the raw primitives (`host:port` /
+/// `unix:<path>`) only. A named handler service (`sshd:`, `fetch:`, `diag:`) lives in its own crate that a
+/// product (swoosh) injects, so it is not served here.
+///
 /// Authorization is a property of the node, not a per-expose choice: by default a service is gated to this
 /// node's signet (set once by `swoosh adopt`), admitting the owner's own devices (membership badges) and
 /// anyone they delegate a slip to. `--public` is the one deliberate exception: it opens a service to
@@ -17,8 +21,7 @@ pub struct ExposeCmd {
     /// expose local services as `name=addr` (bare `addr` = `default`)
     #[arg(required = true, value_name = "name=addr")]
     pub services: Vec<String>,
-    /// Expose to ANYONE, unauthenticated: the one deliberate opt-out from the signet. Refused for a shell
-    /// service (`sshd:`), which has no auth of its own.
+    /// Expose to ANYONE, unauthenticated: the one deliberate opt-out from the signet.
     #[arg(long)]
     pub public: bool,
     /// Suppress the readiness banner (the node id, services, and gate). For unattended/CI use where the

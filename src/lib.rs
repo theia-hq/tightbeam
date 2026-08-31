@@ -15,8 +15,6 @@ pub mod config;
 pub mod connect;
 pub mod duration;
 pub mod expose;
-pub mod handlers;
-pub mod http;
 pub mod identity;
 pub mod peer;
 pub mod revoke;
@@ -24,15 +22,10 @@ pub mod share;
 pub mod tree;
 pub mod tunnel;
 
-mod fetch;
 pub mod protocol;
 
 #[cfg(test)]
 mod duration_tests;
-#[cfg(test)]
-mod fetch_tests;
-#[cfg(test)]
-mod http_tests;
 #[cfg(test)]
 mod protocol_tests;
 
