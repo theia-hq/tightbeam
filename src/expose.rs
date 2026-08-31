@@ -10,7 +10,7 @@ use clap::Args;
 ///
 /// tightbeam's binary is a thin demo of the tunnel: it forwards the raw primitives (`host:port` /
 /// `unix:<path>`, and the raw-stream `file:<path>` / `fifo:<path>` that source a path's bytes to the peer)
-/// only. A named handler service (`sshd:`, `fetch:`, `diag:`) lives in its own crate that a product
+/// only. A named handler service (`sshd:`, `fetch:`, `ping:`) lives in its own crate that a product
 /// (swoosh) injects, so it is not served here.
 ///
 /// Authorization is a property of the node, not a per-expose choice: by default a service is gated to this

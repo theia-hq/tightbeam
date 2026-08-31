@@ -66,8 +66,8 @@ pub struct Services(HashMap<String, Target>);
 
 impl Services {
     /// Parse `name=addr` service entries; a bare `addr` becomes the `default` service. A bare scheme
-    /// (`sshd:`, `fetch:`, `diag.ping:`) resolves to a handler; a `host:port` / `unix:<path>` to a raw
-    /// forward. A scheme may be dotted (`diag.ping`, `diag.speed`) for a method-service split.
+    /// (`sshd:`, `fetch:`, `ping:`) resolves to a handler; a `host:port` / `unix:<path>` to a raw
+    /// forward. A scheme may be dotted (`control.status`, `control.restart`) for a method on an interface.
     pub fn parse(entries: &[String]) -> eyre::Result<Self> {
         let mut services = HashMap::new();
         for entry in entries {
@@ -523,7 +523,7 @@ fn resolve_single_service(requested: Service, services: &HashMap<String, Target>
 
 /// Resolve an exposed service's address to a [`Target`]: `file:<path>` / `fifo:<path>` are the raw-stream
 /// forward (open an existing OS object, splice its bytes to the peer); a bare scheme (`sshd:`, `fetch:`,
-/// `diag:` — a word then a colon with nothing after) names a handler; anything else must be a socket forward
+/// `ping:` -- a word then a colon with nothing after) names a handler; anything else must be a socket forward
 /// (`host:port` or `unix:<path>`). All validated here so a typo fails at parse with a teaching message, not
 /// at dial time.
 fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
@@ -548,8 +548,8 @@ fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
         // A bare `<scheme>:` (nothing after the colon) is a handler selector. `unix:<path>` and `host:port`
         // carry a tail and so fall through to the forward grammar; a bare `unix:` (no path) resolves to a
         // handler named `unix` that no registry holds, failing loudly at `Exposer::new`. A `.` is allowed
-        // so a dotted method-service (`diag.ping:`, `diag.speed:`) is typeable as one handler: `.` is in
-        // the `Service` alphabet, and these are the shipped instance of the methods-as-services split.
+        // so a dotted method on an interface (`control.status:`, `control.restart:`) is typeable as one
+        // handler: `.` is in the `Service` alphabet, so a real interface's methods are addressable by name.
         if !scheme.is_empty()
             && scheme
                 .bytes()
@@ -1016,11 +1016,11 @@ mod tests {
     }
 
     #[test]
-    fn a_dotted_scheme_resolves_to_a_handler_for_the_method_service_split() {
-        // A method-service split (`diag.ping`, `diag.speed`) is one dotted handler scheme: `.` is in the
-        // `Service` alphabet and the bare-scheme arm admits it, so `serve diag.ping=diag.ping:` names one
-        // handler the registry holds, not a `host.port`-shaped forward.
-        for entry in ["ping=diag.ping:", "speed=diag.speed:"] {
+    fn a_dotted_scheme_resolves_to_a_handler_for_a_method_on_an_interface() {
+        // A method on an interface (`control.status`, `control.restart`) is one dotted handler scheme: `.`
+        // is in the `Service` alphabet and the bare-scheme arm admits it, so `serve status=control.status:`
+        // names one handler the registry holds, not a `host.port`-shaped forward.
+        for entry in ["status=control.status:", "restart=control.restart:"] {
             let Services(parsed) = services(&[entry]);
             let target = parsed.values().next().expect("one service parsed");
             let super::Target::Handler(scheme) = target else {
@@ -1212,10 +1212,10 @@ mod tests {
         use futures::FutureExt as _;
         let noop: super::ServeFn =
             std::sync::Arc::new(|_admitted, _writer, _reader| async { Ok(()) }.boxed());
-        // Adding a NEW scheme (an embedder injecting its own `diag:` beside `fetch:`) is allowed.
+        // Adding a NEW scheme (an embedder injecting its own `ping:` beside `fetch:`) is allowed.
         let base = super::Registry::new().with("fetch", super::Handler::open(noop.clone()));
         let added =
-            base.extend(super::Registry::new().with("diag", super::Handler::open(noop.clone())));
+            base.extend(super::Registry::new().with("ping", super::Handler::open(noop.clone())));
         assert!(added.is_ok(), "injecting a new scheme must be allowed");
         // Re-injecting a scheme already registered is refused at merge intent, so a second `extend` can
         // never shadow (and silently downgrade the gate of) a handler the caller already registered.

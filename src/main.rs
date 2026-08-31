@@ -113,7 +113,7 @@ async fn main() -> eyre::Result<()> {
 ///
 /// tightbeam's binary is a thin demo of the tunnel: it exposes only the raw-forward primitive
 /// (`host:port` / `unix:<path>`), so it hands the exposer an EMPTY registry and names no service crate. A
-/// handler service (`sshd:`, `fetch:`, `diag:`) lives in its own crate that swoosh injects; a bare scheme
+/// handler service (`sshd:`, `fetch:`, `ping:`) lives in its own crate that swoosh injects; a bare scheme
 /// here resolves to a handler no registry holds and is refused loudly at [`Exposer::new`].
 async fn expose<T: Transport, D: bifrost::Discovery>(
     node: &Node<T, D>,
