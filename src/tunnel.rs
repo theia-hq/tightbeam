@@ -101,6 +101,19 @@ impl Services {
             Target::Forward(_) | Target::RawStream(_) => None,
         })
     }
+
+    /// The exposed names whose target is a [`Target::RawStream`] (a `file:`/`fifo:` source). Like a keyless
+    /// shell, a raw-stream source has no auth of its own: it serves a chosen path's bytes to whoever the gate
+    /// admits, so [`Exposer::new`] refuses it behind an [`Gate::Open`] gate (a `--public file:` would exfil a
+    /// secret to anyone). A raw forward (`host:port`/`unix:`) is a service the operator deliberately stood
+    /// up, so it stays `--public`-able; a bare file path is one keystroke from a secret, so it does not.
+    fn raw_stream_names(&self) -> impl Iterator<Item = &str> {
+        let Self(services) = self;
+        services.iter().filter_map(|(name, target)| match target {
+            Target::RawStream(_) => Some(name.as_str()),
+            Target::Handler(_) | Target::Forward(_) => None,
+        })
+    }
 }
 
 /// A boxed writer half handed to a handler (the accepted stream is already `Send + 'static`, so boxing it
@@ -239,6 +252,18 @@ impl Exposer {
                      drop --public, which would expose it to anyone who reaches this node"
                 );
             }
+        }
+        // A raw-stream source (`file:`/`fifo:`) also has no auth of its own: under an open gate it would
+        // serve a chosen path's bytes to anyone, so `--public file:<secret>` would exfil a secret. Refuse it
+        // at the same door that refuses a public shell. A raw forward (`host:port`/`unix:`) stays open-able:
+        // it is a service the operator deliberately stood up, not a bare file path one keystroke from a key.
+        if matches!(gate, Gate::Open)
+            && let Some(name) = services.raw_stream_names().next()
+        {
+            eyre::bail!(
+                "a raw-stream service (`{name}`, a file:/fifo: source) has no auth of its own and must be \
+                 gated; drop --public, which would serve its bytes to anyone who reaches this node"
+            );
         }
         Ok(Self {
             services,
@@ -942,6 +967,25 @@ mod tests {
         assert!(
             super::Exposer::new(web, super::Registry::new(), Gate::Open).is_ok(),
             "an open gate over a non-shell service is allowed"
+        );
+    }
+
+    #[test]
+    fn an_exposer_refuses_a_public_raw_stream() {
+        // A raw-stream source (`file:`/`fifo:`) has no auth of its own: under an open gate it would serve a
+        // chosen path's bytes to anyone, so `--public file:<secret>` would exfil it. Refused at the same door
+        // as a public shell.
+        let secret = services(&["leak=file:/etc/hosts"]);
+        assert!(
+            super::Exposer::new(secret, super::Registry::new(), Gate::Open).is_err(),
+            "an open gate over a file:/fifo: source must be refused"
+        );
+        // A raw forward the operator deliberately stood up (host:port) stays open-able; only the no-auth
+        // raw-stream source is refused under the open gate.
+        let web = services(&["web=127.0.0.1:80"]);
+        assert!(
+            super::Exposer::new(web, super::Registry::new(), Gate::Open).is_ok(),
+            "an open gate over a host:port forward is still allowed"
         );
     }
 
