@@ -19,7 +19,7 @@ The host has a file. You want it on another machine, with no public IP, no copy,
 stand up. Serve the file's bytes directly:
 
 ```sh
-tightbeam serve movie=file:/srv/films/big.mkv     # on the host
+tightbeam expose movie=file:/srv/films/big.mkv     # on the host
 ```
 
 ```sh
@@ -43,7 +43,7 @@ the producer at the pipe, serve the pipe, and read it on the far side:
 # on the host: make a pipe, serve it, then capture the camera into it
 # (device name varies by OS: /dev/video0 on Linux, "0" with -f avfoundation on macOS)
 mkfifo /tmp/cam
-tightbeam serve cam=fifo:/tmp/cam &
+tightbeam expose cam=fifo:/tmp/cam &
 ffmpeg -i /dev/video0 -f mpegts /tmp/cam
 ```
 
@@ -66,7 +66,7 @@ The host runs Plex or Jellyfin. You want the whole library on another machine yo
 the server to the public internet. Forward the server's port and open the web UI on the local port:
 
 ```sh
-tightbeam serve plex=127.0.0.1:32400        # on the host (Jellyfin: jellyfin=127.0.0.1:8096)
+tightbeam expose plex=127.0.0.1:32400        # on the host (Jellyfin: jellyfin=127.0.0.1:8096)
 ```
 
 ```sh
@@ -84,7 +84,7 @@ Pipe `tar` into a served pipe and unpack it on the far side as it arrives:
 ```sh
 # on the host: make a pipe, serve it, then pack the directory into it
 mkfifo /tmp/bundle
-tightbeam serve bundle=fifo:/tmp/bundle &
+tightbeam expose bundle=fifo:/tmp/bundle &
 tar -cf /tmp/bundle ~/project
 ```
 
@@ -104,7 +104,7 @@ A database port or a Unix socket. One `serve` and one `connect` each.
 A Postgres server on the host, reached with `psql` from your machine:
 
 ```sh
-tightbeam serve db=127.0.0.1:5432                  # on the host
+tightbeam expose db=127.0.0.1:5432                  # on the host
 tightbeam connect <peer> --service db --to 5432    # on your machine
 psql -h 127.0.0.1 -p 5432 -U postgres
 ```
@@ -112,7 +112,7 @@ psql -h 127.0.0.1 -p 5432 -U postgres
 A Unix socket (here the Docker daemon) reached as a TCP port you can point tooling at:
 
 ```sh
-tightbeam serve docker=unix:/var/run/docker.sock           # on the host
+tightbeam expose docker=unix:/var/run/docker.sock           # on the host
 tightbeam connect <peer> --service docker --to 2375        # on your machine
 DOCKER_HOST=tcp://127.0.0.1:2375 docker ps
 ```
