@@ -11,7 +11,7 @@ use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bifrost::{Discovery, Node, NodeId, Session, Transport};
+use bifrost::{ConnInfo, Discovery, Node, NodeId, Session, Transport};
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
@@ -633,6 +633,82 @@ impl Connector {
         let session = node.connect(self.dial).await?;
         let (writer, reader) = session.open_bi().await?;
         request_stdio(self.request(), writer, reader).await
+    }
+
+    /// Reach the peer and return a [`ServiceSession`]: a [`Session`] whose every `open_bi` first speaks
+    /// this connector's `Request{service, capability}` / `Response::Ok` handshake, so a protocol that is
+    /// generic over `Session` (diag's ping/speed) rides the gate transparently, one admitted stream at a
+    /// time. This is the client counterpart to a per-stream [`serve_request`]: the exposer gates each
+    /// stream, and the wrapper presents the request on each stream so every one of them is admitted on its
+    /// own merits. Plain `async fn`, no spawn, so it honors the non-`Send` structured-concurrency rule.
+    pub async fn open_service<T: Transport, D: Discovery>(
+        self,
+        node: &Node<T, D>,
+    ) -> eyre::Result<ServiceSession<T::Session>> {
+        let session = node.connect(self.dial).await?;
+        Ok(ServiceSession {
+            session,
+            request: self.request(),
+        })
+    }
+}
+
+/// A [`Session`] view that gates every stream it opens through a fixed service request. Wraps a live
+/// bifrost session; on `open_bi` it opens a real stream, sends the request, and yields the admitted halves
+/// ONLY on `Response::Ok`, mapping a refusal to [`bifrost::Error::Stream`]. Any `Session`-generic protocol
+/// (diag's `Speedtest`/`Ping`) runs over it unchanged, every one of its streams admitted by the gate.
+///
+/// The associated stream halves are the inner session's own (`type Write = S::Write; type Read =
+/// S::Read`), so the handshake writes/reads on those exact halves and hands them back untouched: zero
+/// boxing, and the wrapped protocol sees the same concrete stream types it would over a raw session.
+/// `peer`/`conn_info`/`wait_closed` delegate to the inner session (so a caller still reads the settled
+/// path); `accept_bi` is refused, because a service client never accepts peer-opened streams.
+pub struct ServiceSession<S> {
+    session: S,
+    request: Request,
+}
+
+impl<S: Session> Session for ServiceSession<S> {
+    type Write = S::Write;
+    type Read = S::Read;
+
+    fn peer(&self) -> NodeId {
+        self.session.peer()
+    }
+
+    async fn open_bi(&self) -> Result<(Self::Write, Self::Read), bifrost::Error> {
+        let (mut writer, mut reader) = self.session.open_bi().await?;
+        self.request
+            .write(&mut writer)
+            .await
+            .map_err(|error| bifrost::Error::Stream(Box::new(error)))?;
+        match Response::read(&mut reader)
+            .await
+            .map_err(|error| bifrost::Error::Stream(Box::new(error)))?
+        {
+            Response::Ok => Ok((writer, reader)),
+            // Surface the host's refusal reason through the stream error, using the same phrasing
+            // `request_service` gives the forward path, so a caller's error chain reads one way.
+            Response::Error(message) => Err(bifrost::Error::Stream(
+                format!("service refused: {message}").into(),
+            )),
+        }
+    }
+
+    async fn accept_bi(&self) -> Result<(Self::Write, Self::Read), bifrost::Error> {
+        // A service client never accepts peer-opened streams; the diag protocols only ever `open_bi`.
+        // Refusing (rather than `unreachable!`) keeps the wrapper total and panic-free.
+        Err(bifrost::Error::Stream(
+            "a service-scoped session does not accept inbound streams".into(),
+        ))
+    }
+
+    async fn wait_closed(&self) {
+        self.session.wait_closed().await
+    }
+
+    fn conn_info(&self) -> ConnInfo {
+        self.session.conn_info()
     }
 }
 
