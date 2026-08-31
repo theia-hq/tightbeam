@@ -17,6 +17,8 @@ pub mod duration;
 pub mod expose;
 pub mod identity;
 pub mod peer;
+#[cfg_attr(not(unix), path = "raw_stream_unsupported.rs")]
+pub mod raw_stream;
 pub mod revoke;
 pub mod share;
 pub mod tree;

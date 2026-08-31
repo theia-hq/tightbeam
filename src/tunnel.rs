@@ -21,7 +21,15 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::identity::{AsNodeId as _, AsVerifyKey as _};
 use crate::protocol::{Request, Response};
+use crate::raw_stream::RawStream;
 use crate::{splice, splice_halves};
+
+/// How long to wait for a raw-stream open to complete before dropping the stream. A `fifo:` `open()`
+/// blocks until a peer opens the other end (POSIX), so an admitted peer that requests a FIFO whose writer
+/// never appears would park the serving task indefinitely, one layer deeper than the pre-gate
+/// [`REQUEST_READ_TIMEOUT`] (which has already elapsed by the time a target is dialed). Mirror that
+/// timeout on the open so a never-opened FIFO cannot pin a stream slot forever.
+pub(crate) const RAW_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long to wait for a connector to send its opening request before dropping the stream. Bounds the
 /// pre-gate work an unauthenticated peer can pin (a slow-loris that opens a stream and never speaks).
@@ -41,6 +49,11 @@ const MAX_STREAMS_PER_SESSION: usize = 256;
 enum Target {
     /// tightbeam's own primitive: connect a local `host:port` / `unix:<path>` and splice bytes to it.
     Forward(String),
+    /// tightbeam's own primitive, the raw-stream half: open an already-existing OS object (`file:<path>`
+    /// or `fifo:<path>`) and splice its bytes toward the peer. The reverse of `connect --stdio`. Carries a
+    /// [`RawStream`] whose direction is fixed at parse time (a read-only source), so "write peer bytes into
+    /// a read-only file" is unrepresentable rather than a runtime write error.
+    RawStream(RawStream),
     /// A named service handler (`sshd`, `fetch`, `diag`, ...) dispatched through the injected registry.
     Handler(String),
 }
@@ -85,7 +98,7 @@ impl Services {
         let Self(services) = self;
         services.values().filter_map(|target| match target {
             Target::Handler(scheme) => Some(scheme.as_str()),
-            Target::Forward(_) => None,
+            Target::Forward(_) | Target::RawStream(_) => None,
         })
     }
 }
@@ -387,6 +400,26 @@ where
             Response::Ok.write(&mut writer).await?;
             dial_and_splice(addr, writer, reader).await?;
         }
+        // tightbeam's own primitive, the raw-stream half: open the named file/FIFO (guarded) and splice its
+        // bytes toward the peer. `Response::Ok` is written only AFTER the open succeeds, so a peer learns
+        // "refused" (not a silent hang or a mid-stream reset) when the target is a device, a directory, a
+        // symlink, or a FIFO whose writer never appears.
+        Some(Target::RawStream(stream)) => match stream.open().await {
+            Ok(source) => {
+                Response::Ok.write(&mut writer).await?;
+                // Direction is fixed at parse time: read the source, send its bytes to the peer, and
+                // discard any bytes the peer sends upstream (a read-only source has nowhere to put them).
+                // Using `splice_halves` (never the duplex `splice`) is what makes "write peer bytes into a
+                // read-only file" unrepresentable.
+                splice_halves(source, io::sink(), writer, reader).await?;
+            }
+            Err(error) => {
+                tracing::warn!(%peer, service = %service, %error, "raw-stream open refused");
+                Response::Error(error.to_string())
+                    .write(&mut writer)
+                    .await?;
+            }
+        },
         // A named service: hand the admitted stream to the caller-injected handler. The `Admitted` witness
         // proves the gate ruled on THIS stream and is moved into the handler by value (single-use), so a
         // handler can never run for an unauthorized peer; the guarantee holds only because the admit
@@ -458,10 +491,22 @@ fn resolve_single_service(requested: Service, services: &HashMap<String, Target>
     }
 }
 
-/// Resolve an exposed service's address to a [`Target`]: a bare scheme (`sshd:`, `fetch:`, `diag:` — a word
-/// then a colon with nothing after) names a handler; anything else must be a raw forward (`host:port` or
-/// `unix:<path>`), validated here so a typo fails at parse with a teaching message, not at dial time.
+/// Resolve an exposed service's address to a [`Target`]: `file:<path>` / `fifo:<path>` are the raw-stream
+/// forward (open an existing OS object, splice its bytes to the peer); a bare scheme (`sshd:`, `fetch:`,
+/// `diag:` — a word then a colon with nothing after) names a handler; anything else must be a socket forward
+/// (`host:port` or `unix:<path>`). All validated here so a typo fails at parse with a teaching message, not
+/// at dial time.
 fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
+    // A raw-stream forward carries a PATH tail (`file:/tmp/x`, `fifo:/tmp/beam`), so it is a Forward, not a
+    // bare-scheme Handler. Route it FIRST: the direction (a read-only source toward the peer) is fixed here
+    // at parse time, and a bare `file:`/`fifo:` with no path fails loudly rather than resolving to a
+    // handler no registry holds.
+    if let Some(path) = addr.strip_prefix("file:") {
+        return Ok(Target::RawStream(RawStream::file(path, entry)?));
+    }
+    if let Some(path) = addr.strip_prefix("fifo:") {
+        return Ok(Target::RawStream(RawStream::fifo(path, entry)?));
+    }
     if let Some(scheme) = addr.strip_suffix(':') {
         // A bare `<scheme>:` (nothing after the colon) is a handler selector. `unix:<path>` and `host:port`
         // carry a tail and so fall through to the forward grammar; a bare `unix:` (no path) resolves to a
@@ -492,11 +537,13 @@ fn validate_forward(addr: &str, entry: &str) -> eyre::Result<()> {
     if !entry.contains('=') {
         eyre::bail!(
             "`{entry}` is not an address to forward to. Did you mean a service pointing at one, e.g. \
-             `{entry}=127.0.0.1:8080`? (an address is host:port, unix:<path>, or a handler like sshd:/fetch:)"
+             `{entry}=127.0.0.1:8080`? (an address is host:port, unix:<path>, file:<path>, fifo:<path>, \
+             or a handler like sshd:/fetch:)"
         );
     }
     eyre::bail!(
-        "`{addr}` is not a valid forwarding address (host:port, unix:<path>, or a handler like sshd:/fetch:)"
+        "`{addr}` is not a valid forwarding address (host:port, unix:<path>, file:<path>, fifo:<path>, \
+         or a handler like sshd:/fetch:)"
     )
 }
 
@@ -834,6 +881,8 @@ mod tests {
             "ssh=sshd:",
             "proxy=fetch:",
             "db=unix:/run/db.sock",
+            "pipe=file:/tmp/beam",
+            "named=fifo:/tmp/beam",
             "127.0.0.1:5000",
         ] {
             assert!(
@@ -841,6 +890,30 @@ mod tests {
                 "{entry} should parse"
             );
         }
+    }
+
+    #[test]
+    fn raw_stream_schemes_resolve_to_a_raw_stream_target_never_a_bare_forward_or_handler() {
+        // `file:`/`fifo:` carry a PATH tail, so they must resolve to the guarded raw-stream forward, NEVER
+        // a plain `Target::Forward` (which would splice unguarded) nor a `Target::Handler` (a bare scheme).
+        // Pin it so a future refactor cannot regress the routing into an unguarded shape.
+        for entry in ["pipe=file:/tmp/beam", "named=fifo:/tmp/beam"] {
+            let Services(parsed) = services(&[entry]);
+            let target = parsed.values().next().expect("one service parsed");
+            assert!(
+                matches!(target, super::Target::RawStream(_)),
+                "{entry} must resolve to Target::RawStream, got {target:?}"
+            );
+        }
+        // A bare `file:`/`fifo:` with no path is NOT a handler: it fails loudly at parse.
+        assert!(
+            Services::parse(&["pipe=file:".to_owned()]).is_err(),
+            "`file:` with no path must be rejected, never treated as a handler scheme"
+        );
+        assert!(
+            Services::parse(&["pipe=fifo:".to_owned()]).is_err(),
+            "`fifo:` with no path must be rejected, never treated as a handler scheme"
+        );
     }
 
     #[test]

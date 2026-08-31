@@ -20,6 +20,12 @@ rand = "0.8"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "time"] }
 tracing = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+# The raw-stream forward (`file:`/`fifo:`) opens an existing OS object with O_NOFOLLOW and stats it to
+# refuse anything that is not a regular file or a FIFO. Those two guards need the libc open flags and the
+# `st_mode` type macros, which std does not surface; unix-only, matching where `fifo:`/`unix:` live.
+libc = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = { version = "1", features = ["derive"] }
 

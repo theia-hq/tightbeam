@@ -86,15 +86,14 @@ and no camera service in the path.
 ## Pipe a raw stream: stdin to stdout across the overlay
 
 `--stdio` pipes one service stream against this process's own stdin and stdout instead of binding a
-port. Whatever you write on one end comes out the other. Expose a named pipe (FIFO) on the host and read
-it from your machine:
+port. Whatever you write on one end comes out the other. On the serve side, `file:<path>` and
+`fifo:<path>` are its mirror: instead of a port, `expose` names a path whose bytes it sources to the peer
+(the reverse of `connect --stdio`). Expose a named pipe (FIFO) on the host and read it from your machine:
 
 ```sh
-# on the host: create a FIFO, expose a reader of it, then feed it
+# on the host: create a FIFO and expose it directly -- no bound port, no listener in the loop
 mkfifo /tmp/beam
-tightbeam expose pipe=127.0.0.1:9000 &
-# feed the FIFO into the exposed port (any process that writes to the port works)
-nc -l 127.0.0.1 9000 < /tmp/beam &
+tightbeam expose pipe=fifo:/tmp/beam &
 echo "hello from the host" > /tmp/beam
 ```
 
@@ -103,13 +102,19 @@ echo "hello from the host" > /tmp/beam
 tightbeam connect <peer> --service pipe --stdio
 ```
 
-For a file transfer, pair `tar` on both ends. The host streams a directory; you unpack it as it
-arrives:
+`fifo:` opens the pipe (blocking until a writer appears, bounded by a timeout) and streams its bytes;
+`file:<path>` does the same for a regular file, so `expose iso=file:/srv/big.iso` serves a file's bytes
+with no `cat` and no port. Both are read-only sources toward the peer: they refuse block/char devices
+(`/dev/zero`, `/dev/urandom`), directories, and a symlink at the named path.
+
+For a file transfer, feed a FIFO with `tar` and expose the FIFO. The host streams a directory; you unpack
+it as it arrives:
 
 ```sh
-# on the host: expose a listener that streams a tarball of a directory
-tightbeam expose bundle=127.0.0.1:9001 &
-nc -l 127.0.0.1 9001 < <(tar -cf - ~/project) &
+# on the host: point tar at a FIFO, expose the FIFO -- the peer reads the tarball as tar writes it
+mkfifo /tmp/bundle
+tightbeam expose bundle=fifo:/tmp/bundle &
+tar -cf /tmp/bundle ~/project &
 ```
 
 ```sh
@@ -117,8 +122,12 @@ nc -l 127.0.0.1 9001 < <(tar -cf - ~/project) &
 tightbeam connect <peer> --service bundle --stdio | tar -xf -
 ```
 
-`--stdio` is the same shape ssh uses for its `ProxyCommand` (see the README). It makes tightbeam a
-transport for anything that reads stdin and writes stdout.
+Streaming a *command's* own stdout directly (`expose feed=exec:'tar -cf - ~/project'`, with no FIFO in
+between) needs an `exec:` scheme -- spawning a process on the host is a materially bigger blast radius
+than opening a file, so it is a separate, held item pending its own design, not part of `file:`/`fifo:`.
+
+`--stdio` is the same shape ssh uses for its `ProxyCommand` (see the README). With `file:`/`fifo:` on the
+serve side, tightbeam is a transport for anything that reads stdin and writes stdout, on either end.
 
 ## Anything with a local address is reachable by key
 
