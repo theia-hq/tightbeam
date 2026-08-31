@@ -2,7 +2,7 @@
 //!
 //! This is the domain a tunnel is made of, with no CLI around it: an [`Exposer`] that accepts overlay
 //! sessions and forwards inbound streams to local services, a [`Connector`] that reaches a peer's exposed
-//! service, the [`family_gate`] builder, and the offline capability operations ([`mint_link`],
+//! service, the [`resolve_gate`] policy, and the offline capability operations ([`mint_link`],
 //! [`narrow_link`], [`revoke_into`]). It prints NOTHING and reads no config path: a caller (tightbeam's
 //! own CLI, or a future swoosh) loads the signet, denylist, and identity, prints its own banner, and drives
 //! this core. Everything here already speaks `bifrost` and `nauthy`, never clap or a store.
@@ -175,23 +175,17 @@ impl Registry {
     }
 }
 
-/// Build a family authorization gate: admit a peer that presents a signed token rooted at `signet`
-/// (a membership badge or a delegated slip), unless the token is on `denylist`.
-///
-/// A pure builder. The CALLER loads the denylist (from wherever it keeps revocations) and passes it in;
-/// the core never reads a config path. `--public` is the caller's own choice, so the open gate
-/// ([`Gate::Open`]) is built at the call site, not here.
-pub fn family_gate(signet: NodeId, denylist: Denylist) -> Gate {
-    Gate::Family(signet.verify_key(), Box::new(denylist))
-}
-
 /// Resolve the exposer's gate from the operator's choices, in ONE place so every embedder (tightbeam's own
 /// CLI and swoosh) applies the SAME policy: an explicit `--public` (and ONLY that) opens the gate; otherwise
 /// a family gate on the node's provisioned `signet`; an UNPROVISIONED node fails LOUD rather than ever
 /// defaulting to open. The caller loads the denylist and passes it as a value. This exists so the three
 /// security-relevant conventions (open-only-on-`--public`, fail-loud-on-unprovisioned, real-loaded-denylist)
 /// are enforced once, not hand-copied into each caller.
-pub fn resolve_gate(public: bool, signet: Option<NodeId>, denylist: Denylist) -> eyre::Result<Gate> {
+pub fn resolve_gate(
+    public: bool,
+    signet: Option<NodeId>,
+    denylist: Denylist,
+) -> eyre::Result<Gate> {
     if public {
         return Ok(Gate::Open);
     }
@@ -201,7 +195,7 @@ pub fn resolve_gate(public: bool, signet: Option<NodeId>, denylist: Denylist) ->
              to anyone"
         )
     })?;
-    Ok(family_gate(root, denylist))
+    Ok(Gate::family(root.verify_key(), denylist))
 }
 
 /// An exposer: the services to publish, the caller-injected handler registry that serves the named ones,
@@ -472,7 +466,11 @@ fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
         // A bare `<scheme>:` (nothing after the colon) is a handler selector. `unix:<path>` and `host:port`
         // carry a tail and so fall through to the forward grammar; a bare `unix:` (no path) resolves to a
         // handler named `unix` that no registry holds, failing loudly at `Exposer::new`.
-        if !scheme.is_empty() && scheme.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        if !scheme.is_empty()
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
             return Ok(Target::Handler(scheme.to_owned()));
         }
     }
@@ -892,7 +890,8 @@ mod tests {
             std::sync::Arc::new(|_admitted, _writer, _reader| async { Ok(()) }.boxed());
         // Adding a NEW scheme (an embedder injecting its own `diag:` beside `fetch:`) is allowed.
         let base = super::Registry::new().with("fetch", super::Handler::open(noop.clone()));
-        let added = base.extend(super::Registry::new().with("diag", super::Handler::open(noop.clone())));
+        let added =
+            base.extend(super::Registry::new().with("diag", super::Handler::open(noop.clone())));
         assert!(added.is_ok(), "injecting a new scheme must be allowed");
         // Re-injecting a scheme already registered is refused at merge intent, so a second `extend` can
         // never shadow (and silently downgrade the gate of) a handler the caller already registered.

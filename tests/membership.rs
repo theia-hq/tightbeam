@@ -43,7 +43,7 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             let signet = NodeId::from_ed25519_secret(&SIGNET_SECRET);
             tokio::task::spawn_local(async move {
                 let services = Services::parse(&[format!("web={echo_addr}")]).unwrap();
-                let gate = tunnel::family_gate(signet, empty_denylist().await);
+                let gate = tunnel::resolve_gate(false, Some(signet), empty_denylist().await).unwrap();
                 Exposer::new(services, tightbeam::tunnel::Registry::new(), gate)
                     .unwrap()
                     .run(&exposer)

@@ -37,7 +37,8 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
             let signet = NodeId::from_ed25519_secret(&EXPOSER_SECRET);
             tokio::task::spawn_local(async move {
                 let services = Services::parse(&[format!("ssh={echo_addr}")]).unwrap();
-                let gate = tunnel::family_gate(signet, empty_denylist().await);
+                let gate =
+                    tunnel::resolve_gate(false, Some(signet), empty_denylist().await).unwrap();
                 Exposer::new(services, tightbeam::tunnel::Registry::new(), gate)
                     .unwrap()
                     .run(&exposer)
