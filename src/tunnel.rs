@@ -66,7 +66,8 @@ pub struct Services(HashMap<String, Target>);
 
 impl Services {
     /// Parse `name=addr` service entries; a bare `addr` becomes the `default` service. A bare scheme
-    /// (`sshd:`, `fetch:`, `diag:`) resolves to a handler; a `host:port` / `unix:<path>` to a raw forward.
+    /// (`sshd:`, `fetch:`, `diag.ping:`) resolves to a handler; a `host:port` / `unix:<path>` to a raw
+    /// forward. A scheme may be dotted (`diag.ping`, `diag.speed`) for a method-service split.
     pub fn parse(entries: &[String]) -> eyre::Result<Self> {
         let mut services = HashMap::new();
         for entry in entries {
@@ -546,11 +547,13 @@ fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
     if let Some(scheme) = addr.strip_suffix(':') {
         // A bare `<scheme>:` (nothing after the colon) is a handler selector. `unix:<path>` and `host:port`
         // carry a tail and so fall through to the forward grammar; a bare `unix:` (no path) resolves to a
-        // handler named `unix` that no registry holds, failing loudly at `Exposer::new`.
+        // handler named `unix` that no registry holds, failing loudly at `Exposer::new`. A `.` is allowed
+        // so a dotted method-service (`diag.ping:`, `diag.speed:`) is typeable as one handler: `.` is in
+        // the `Service` alphabet, and these are the shipped instance of the methods-as-services split.
         if !scheme.is_empty()
             && scheme
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
         {
             return Ok(Target::Handler(scheme.to_owned()));
         }
@@ -1010,6 +1013,24 @@ mod tests {
     #[test]
     fn a_named_service_pointed_at_a_bogus_addr_is_rejected() {
         assert!(Services::parse(&["web=nonsense".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn a_dotted_scheme_resolves_to_a_handler_for_the_method_service_split() {
+        // A method-service split (`diag.ping`, `diag.speed`) is one dotted handler scheme: `.` is in the
+        // `Service` alphabet and the bare-scheme arm admits it, so `serve diag.ping=diag.ping:` names one
+        // handler the registry holds, not a `host.port`-shaped forward.
+        for entry in ["ping=diag.ping:", "speed=diag.speed:"] {
+            let Services(parsed) = services(&[entry]);
+            let target = parsed.values().next().expect("one service parsed");
+            let super::Target::Handler(scheme) = target else {
+                panic!("{entry} must resolve to Target::Handler, got {target:?}");
+            };
+            assert!(
+                scheme.contains('.'),
+                "the dotted scheme is preserved verbatim as the registry key, got {scheme:?}"
+            );
+        }
     }
 
     #[test]
