@@ -146,13 +146,17 @@ where
 /// naming the exposed services, the effective gate, and how to stop. Points at `tightbeam share` (this
 /// CLI's own mint verb). Only public material (the node id) is printed; the host seed and signet secret
 /// never appear. Withheld under `--quiet`.
+///
+/// Printed to STDERR, never stdout: a `stdin:` producer pipes its bytes into this process's stdin, and stdout
+/// is a data path (`connect --stdio` mirrors it), so a human banner on stdout could interleave into the
+/// stream. stderr is for the human; stdout/stdin carry data.
 fn expose_banner<'a>(node_id: NodeId, names: impl Iterator<Item = &'a str>, gate: &str) {
-    println!("tightbeam ready. peers can reach these services at:\n");
-    println!(
+    eprintln!("tightbeam ready. peers can reach these services at:\n");
+    eprintln!(
         "    {node_id}                     (share this key, or mint a link with `tightbeam share`)\n"
     );
     let names: Vec<&str> = names.collect();
-    println!(
+    eprintln!(
         "exposing {}. gate: {}. ctrl-c to stop.",
         names.join(", "),
         gate
@@ -182,12 +186,14 @@ async fn connect<T: Transport, D: bifrost::Discovery>(
     let connector = cmd.connector()?;
     match cmd.to {
         Some(port) => {
-            println!(
-                "forwarding 127.0.0.1:{port} to {} ({})",
-                connector.dial(),
-                connector.service()
-            );
-            connector.forward_port(node, port).await
+            // Prove the gate admits us BEFORE announcing readiness: `preflight` reaches, probes admission,
+            // and binds the port, returning an error (with the host's reason) on refusal. Only past it is
+            // "forwarding …" true, so an unauthorized forward fails loudly here, never a fake success then
+            // a silent reset.
+            let (dial, service) = (connector.dial(), connector.service().to_owned());
+            let forward = connector.preflight(node, port).await?;
+            println!("forwarding 127.0.0.1:{port} to {dial} ({service})");
+            forward.run().await
         }
         None => connector.pipe_stdio(node).await,
     }

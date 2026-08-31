@@ -110,9 +110,14 @@ async fn connect_and_echo(
     let service = service.to_owned();
     let present = capability.map(str::to_owned);
     tokio::task::spawn_local(async move {
-        let _ = Connector::to_node(exposer, service, present)
-            .forward_port(&consumer, port)
-            .await;
+        // A refused connector fails at `preflight` (before the port binds), so the client below never
+        // connects and the helper returns `None`; an admitted one binds and forwards.
+        if let Ok(forward) = Connector::to_node(exposer, service, present)
+            .preflight(&consumer, port)
+            .await
+        {
+            let _ = forward.run().await;
+        }
     });
 
     let mut client = None;
@@ -123,13 +128,13 @@ async fn connect_and_echo(
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let mut client = client.expect("consumer never started listening");
+    let mut client = client?;
 
     let probe = b"through a capability";
     client.write_all(probe).await.ok()?;
     let mut echoed = vec![0u8; probe.len()];
-    // A refused stream is closed by the host after the error reply, so the read returns early with fewer
-    // bytes; only a granted stream echoes the whole probe back.
+    // A refused connector fails at `preflight` (the port never binds), so the client loop above never
+    // connects and this returns `None` before the probe; only a granted stream binds and echoes it back.
     match tokio::time::timeout(Duration::from_millis(500), client.read_exact(&mut echoed)).await {
         Ok(Ok(_)) => Some(echoed),
         _ => None,

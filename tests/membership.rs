@@ -95,6 +95,51 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
         .await;
 }
 
+/// A forward the gate refuses fails LOUDLY at `preflight`, carrying the host's reason, rather than binding
+/// a port and printing a hopeful "forwarding …" that then resets mutely. This is the client-side proof of
+/// the false-success fix: an unauthorized forward returns an `Err` before any success is announced.
+#[tokio::test]
+async fn a_refused_forward_fails_at_preflight_with_the_reason() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let echo_addr = spawn_echo().await;
+            let exposer = Node::new(MemTransport::bind(), NoDiscovery);
+            let exposer_id = exposer.node_id();
+
+            // A family-gated node rooted at the signet: only a member is admitted.
+            let signet = NodeId::from_ed25519_secret(&SIGNET_SECRET);
+            tokio::task::spawn_local(async move {
+                let services = Services::parse(&[format!("web={echo_addr}")]).unwrap();
+                let gate =
+                    tunnel::resolve_gate(false, Some(signet), empty_denylist().await).unwrap();
+                Exposer::new(services, tightbeam::tunnel::Registry::new(), gate)
+                    .unwrap()
+                    .run(&exposer)
+                    .await
+                    .unwrap();
+            });
+
+            // A stranger presenting NO badge: the gate refuses it. `preflight` proves admission before
+            // announcing anything, so this returns an `Err` naming the peer and the reason -- never an
+            // `Ok(PortForward)` a caller would have already printed "forwarding …" over.
+            let stranger = Node::new(MemTransport::bind(), NoDiscovery);
+            let port = free_port().await;
+            let refused = Connector::to_node(exposer_id, "web".to_owned(), None)
+                .preflight(&stranger, port)
+                .await;
+            let error = refused
+                .err()
+                .expect("an unauthorized forward must be refused at preflight, not admitted");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("refused by") && message.contains(&exposer_id.to_string()),
+                "the refusal must name the peer it came from: {message}"
+            );
+        })
+        .await;
+}
+
 /// Spawn a local TCP echo service and return its address.
 async fn spawn_echo() -> core::net::SocketAddr {
     let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -128,9 +173,14 @@ async fn connect_and_echo(
     let service = service.to_owned();
     let present = badge.map(str::to_owned);
     tokio::task::spawn_local(async move {
-        let _ = Connector::to_node(exposer, service, present)
-            .forward_port(&consumer, port)
-            .await;
+        // A refused connector fails at `preflight` (before the port binds), so the client below never
+        // connects and the helper returns `None`; an admitted one binds and forwards.
+        if let Ok(forward) = Connector::to_node(exposer, service, present)
+            .preflight(&consumer, port)
+            .await
+        {
+            let _ = forward.run().await;
+        }
     });
 
     let mut client = None;
@@ -141,13 +191,13 @@ async fn connect_and_echo(
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let mut client = client.expect("consumer never started listening");
+    let mut client = client?;
 
     let probe = b"i am a member";
     client.write_all(probe).await.ok()?;
     let mut echoed = vec![0u8; probe.len()];
-    // A refused stream is closed by the host after the error reply, so the read returns early with fewer
-    // bytes; only a granted stream echoes the whole probe back.
+    // A refused connector fails at `preflight` (the port never binds), so the client loop above never
+    // connects and this returns `None` before the probe; only a granted stream binds and echoes it back.
     match tokio::time::timeout(Duration::from_millis(500), client.read_exact(&mut echoed)).await {
         Ok(Ok(_)) => Some(echoed),
         _ => None,

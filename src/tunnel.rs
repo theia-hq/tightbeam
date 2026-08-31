@@ -49,10 +49,11 @@ const MAX_STREAMS_PER_SESSION: usize = 256;
 enum Target {
     /// tightbeam's own primitive: connect a local `host:port` / `unix:<path>` and splice bytes to it.
     Forward(String),
-    /// tightbeam's own primitive, the raw-stream half: open an already-existing OS object (`file:<path>`
-    /// or `fifo:<path>`) and splice its bytes toward the peer. The reverse of `connect --stdio`. Carries a
-    /// [`RawStream`] whose direction is fixed at parse time (a read-only source), so "write peer bytes into
-    /// a read-only file" is unrepresentable rather than a runtime write error.
+    /// tightbeam's own primitive, the raw-stream half: source an already-open byte stream and splice it
+    /// toward the peer, either an OS object the operator named (`file:<path>` / `fifo:<path>`) or this
+    /// process's own standard input (`stdin:`, a single-consumer source taken once). The reverse of
+    /// `connect --stdio`. Carries a [`RawStream`] whose direction is fixed at parse time (a read-only
+    /// source), so "write peer bytes back into the source" is unrepresentable rather than a runtime error.
     RawStream(RawStream),
     /// A named service handler (`sshd`, `fetch`, `diag`, ...) dispatched through the injected registry.
     Handler(String),
@@ -102,11 +103,12 @@ impl Services {
         })
     }
 
-    /// The exposed names whose target is a [`Target::RawStream`] (a `file:`/`fifo:` source). Like a keyless
-    /// shell, a raw-stream source has no auth of its own: it serves a chosen path's bytes to whoever the gate
-    /// admits, so [`Exposer::new`] refuses it behind an [`Gate::Open`] gate (a `--public file:` would exfil a
-    /// secret to anyone). A raw forward (`host:port`/`unix:`) is a service the operator deliberately stood
-    /// up, so it stays `--public`-able; a bare file path is one keystroke from a secret, so it does not.
+    /// The exposed names whose target is a [`Target::RawStream`] (a `file:`/`fifo:` path source, or `stdin:`).
+    /// Like a keyless shell, a raw-stream source has no auth of its own: it serves a chosen path's bytes (or
+    /// the piped stdin) to whoever the gate admits, so [`Exposer::new`] refuses it behind an [`Gate::Open`]
+    /// gate (a `--public file:` would exfil a secret, a `--public stdin:` the piped bytes, to anyone). A raw
+    /// forward (`host:port`/`unix:`) is a service the operator deliberately stood up, so it stays
+    /// `--public`-able; a bare file path or a piped stdin is one keystroke from a secret, so it does not.
     fn raw_stream_names(&self) -> impl Iterator<Item = &str> {
         let Self(services) = self;
         services.iter().filter_map(|(name, target)| match target {
@@ -253,16 +255,17 @@ impl Exposer {
                 );
             }
         }
-        // A raw-stream source (`file:`/`fifo:`) also has no auth of its own: under an open gate it would
-        // serve a chosen path's bytes to anyone, so `--public file:<secret>` would exfil a secret. Refuse it
-        // at the same door that refuses a public shell. A raw forward (`host:port`/`unix:`) stays open-able:
-        // it is a service the operator deliberately stood up, not a bare file path one keystroke from a key.
+        // A raw-stream source (`file:`/`fifo:`/`stdin:`) also has no auth of its own: under an open gate it
+        // would serve a chosen path's bytes (or the piped stdin) to anyone, so `--public file:<secret>` or
+        // `--public stdin:` would exfil it. Refuse it at the same door that refuses a public shell. A raw
+        // forward (`host:port`/`unix:`) stays open-able: it is a service the operator deliberately stood up,
+        // not a bare file path or a piped stream one keystroke from a key.
         if matches!(gate, Gate::Open)
             && let Some(name) = services.raw_stream_names().next()
         {
             eyre::bail!(
-                "a raw-stream service (`{name}`, a file:/fifo: source) has no auth of its own and must be \
-                 gated; drop --public, which would serve its bytes to anyone who reaches this node"
+                "a raw-stream service (`{name}`, a file:/fifo:/stdin: source) has no auth of its own and \
+                 must be gated; drop --public, which would serve its bytes to anyone who reaches this node"
             );
         }
         Ok(Self {
@@ -425,17 +428,18 @@ where
             Response::Ok.write(&mut writer).await?;
             dial_and_splice(addr, writer, reader).await?;
         }
-        // tightbeam's own primitive, the raw-stream half: open the named file/FIFO (guarded) and splice its
-        // bytes toward the peer. `Response::Ok` is written only AFTER the open succeeds, so a peer learns
-        // "refused" (not a silent hang or a mid-stream reset) when the target is a device, a directory, a
-        // symlink, or a FIFO whose writer never appears.
+        // tightbeam's own primitive, the raw-stream half: open the source (a guarded file/FIFO, or take fd 0
+        // for `stdin:`) and splice its bytes toward the peer. `Response::Ok` is written only AFTER the open
+        // succeeds, so a peer learns "refused" (not a silent hang or a mid-stream reset) when the target is a
+        // device, a directory, a symlink, a FIFO whose writer never appears, or a `stdin:` already taken by a
+        // concurrent connection (the single-consumer refusal).
         Some(Target::RawStream(stream)) => match stream.open().await {
             Ok(source) => {
                 Response::Ok.write(&mut writer).await?;
                 // Direction is fixed at parse time: read the source, send its bytes to the peer, and
                 // discard any bytes the peer sends upstream (a read-only source has nowhere to put them).
-                // Using `splice_halves` (never the duplex `splice`) is what makes "write peer bytes into a
-                // read-only file" unrepresentable.
+                // Using `splice_halves` (never the duplex `splice`) is what makes "write peer bytes back
+                // into the source" unrepresentable.
                 splice_halves(source, io::sink(), writer, reader).await?;
             }
             Err(error) => {
@@ -522,6 +526,13 @@ fn resolve_single_service(requested: Service, services: &HashMap<String, Target>
 /// (`host:port` or `unix:<path>`). All validated here so a typo fails at parse with a teaching message, not
 /// at dial time.
 fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
+    // `stdin:` is a raw-stream source with NO tail (this process's fd 0), so it is a zero-arg target routed
+    // FIRST, before the bare-scheme handler arm would read `stdin` as a handler no registry holds. It shares
+    // the raw-stream direction and the `--public` refusal, but inherits none of the path guards (there is no
+    // path). Anything after the colon is a typo: `stdin:` takes no argument.
+    if addr == "stdin:" {
+        return Ok(Target::RawStream(RawStream::stdin()?));
+    }
     // A raw-stream forward carries a PATH tail (`file:/tmp/x`, `fifo:/tmp/beam`), so it is a Forward, not a
     // bare-scheme Handler. Route it FIRST: the direction (a read-only source toward the peer) is fixed here
     // at parse time, and a bare `file:`/`fifo:` with no path fails loudly rather than resolving to a
@@ -601,7 +612,7 @@ where
 /// The domain half of a `connect`, with the CLI's target-parsing (`Target`/`FromStr`) left in the CLI
 /// layer. A caller builds one with [`Connector::to_node`] (a raw node id, optionally presenting a link) or
 /// [`Connector::from_link`] (a `sheer:` link that supplies both the node and the token), then drives it
-/// with [`Connector::forward_port`] or [`Connector::pipe_stdio`].
+/// with [`Connector::preflight`] (then [`PortForward::run`]) or [`Connector::pipe_stdio`].
 pub struct Connector {
     dial: NodeId,
     service: String,
@@ -647,47 +658,35 @@ impl Connector {
         }
     }
 
-    /// Reach the peer, bind a local port, and forward each accepted TCP connection over its own stream.
-    /// Runs until cancelled; prints nothing.
-    pub async fn forward_port<T: Transport, D: Discovery>(
+    /// Reach the peer, confirm the gate ADMITS this connector, and bind the local port, returning a live
+    /// [`PortForward`] ready to run. Admission is proven here, before any success is announced: a probe
+    /// stream sends the request and awaits the host's [`Response`], so a refusal (wrong `--service`, a
+    /// revoked or non-granting cap, an unauthorized identity) surfaces as an `Err` from THIS call, carrying
+    /// the host's reason, rather than a silently-reset connection once the caller has already printed
+    /// "forwarding …". The caller announces readiness only after this returns `Ok`. Prints nothing.
+    pub async fn preflight<T: Transport, D: Discovery>(
         self,
         node: &Node<T, D>,
         port: u16,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<PortForward<T::Session>> {
         let session = node.connect(self.dial).await?;
-        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
-        let mut pipes = FuturesUnordered::new();
-        loop {
-            tokio::select! {
-                accepted = listener.accept() => {
-                    // One local accept or stream-open failing must not drop the pipes already in flight:
-                    // log the transient error and keep the local listener up.
-                    let (tcp, _) = match accepted {
-                        Ok(accepted) => accepted,
-                        Err(error) => {
-                            tracing::warn!(%error, "local accept failed; still listening");
-                            continue;
-                        }
-                    };
-                    let (writer, reader) = match session.open_bi().await {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            tracing::warn!(%error, "opening a stream to the peer failed; still listening");
-                            continue;
-                        }
-                    };
-                    pipes.push(request_service(self.request(), tcp, writer, reader));
-                }
-                Some(result) = pipes.next(), if !pipes.is_empty() => {
-                    if let Err(error) = result {
-                        // A refused stream (wrong `--service`, a revoked or non-granting cap) carries a
-                        // user-actionable reason. The core is print-free (a library embedder owns its own
-                        // output), so route it through `tracing`; the CLI adapter surfaces it to the user.
-                        tracing::warn!("connection failed: {error:#}");
-                    }
-                }
-            }
+        let request = self.request();
+        // Probe admission on one throwaway stream before announcing anything: if the gate refuses, fail
+        // LOUDLY here with the reason, not mutely mid-forward. On admission the probe stream is dropped
+        // (the host tears its serving half down); every later per-connection stream presents the same
+        // request to the same gate, so this one admission faithfully predicts theirs.
+        let (mut writer, mut reader) = session.open_bi().await?;
+        request.write(&mut writer).await?;
+        if let Response::Error(message) = Response::read(&mut reader).await? {
+            eyre::bail!("refused by {}: {message}", self.dial);
         }
+        drop((writer, reader));
+        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+        Ok(PortForward {
+            session,
+            listener,
+            request,
+        })
     }
 
     /// Reach the service over one stream and pipe it against this process's stdin/stdout: the ssh
@@ -716,6 +715,53 @@ impl Connector {
             session,
             request: self.request(),
         })
+    }
+}
+
+/// A reached, admitted, bound port forward, ready to [`run`](PortForward::run). Returned by
+/// [`Connector::preflight`] only AFTER the gate has admitted this connector, so a caller can safely
+/// announce readiness before running the loop: readiness is no longer a hopeful guess.
+pub struct PortForward<S> {
+    session: S,
+    listener: TcpListener,
+    request: Request,
+}
+
+impl<S: Session> PortForward<S> {
+    /// Forward each accepted TCP connection over its own stream. Runs until cancelled; prints nothing.
+    pub async fn run(self) -> eyre::Result<()> {
+        let mut pipes = FuturesUnordered::new();
+        loop {
+            tokio::select! {
+                accepted = self.listener.accept() => {
+                    // One local accept or stream-open failing must not drop the pipes already in flight:
+                    // log the transient error and keep the local listener up.
+                    let (tcp, _) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            tracing::warn!(%error, "local accept failed; still listening");
+                            continue;
+                        }
+                    };
+                    let (writer, reader) = match self.session.open_bi().await {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            tracing::warn!(%error, "opening a stream to the peer failed; still listening");
+                            continue;
+                        }
+                    };
+                    pipes.push(request_service(self.request.clone(), tcp, writer, reader));
+                }
+                Some(result) = pipes.next(), if !pipes.is_empty() => {
+                    if let Err(error) = result {
+                        // A refused stream (wrong `--service`, a revoked or non-granting cap) carries a
+                        // user-actionable reason. The core is print-free (a library embedder owns its own
+                        // output), so route it through `tracing`; the CLI adapter surfaces it to the user.
+                        tracing::warn!("connection failed: {error:#}");
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -857,9 +903,15 @@ pub async fn revoke_into(denylist: &mut Denylist, link: &str) -> eyre::Result<()
 
 #[cfg(test)]
 mod tests {
-    use nauthy::{Gate, Service};
+    use std::collections::HashMap;
 
-    use super::{Services, resolve_single_service};
+    use bifrost::{NoDiscovery, Node, Session as _};
+    use bifrost_mem::MemTransport;
+    use nauthy::{Gate, Service};
+    use tokio::io::AsyncReadExt as _;
+
+    use super::{BoxRead, Exposer, Registry, Services, Target, resolve_single_service};
+    use crate::raw_stream::RawStream;
 
     fn svc(name: &str) -> Service {
         name.parse()
@@ -869,6 +921,17 @@ mod tests {
     fn services(entries: &[&str]) -> Services {
         Services::parse(&entries.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
             .expect("entries parse")
+    }
+
+    /// A single-service `Services` whose one target is a `stdin:`-shaped source over `reader`, so the full
+    /// served path can be exercised with known bytes instead of the process's real fd 0.
+    fn stdin_service(name: &str, reader: BoxRead) -> Services {
+        let mut map = HashMap::new();
+        map.insert(
+            name.to_owned(),
+            Target::RawStream(RawStream::from_reader(reader)),
+        );
+        Services(map)
     }
 
     #[test]
@@ -987,6 +1050,120 @@ mod tests {
             super::Exposer::new(web, super::Registry::new(), Gate::Open).is_ok(),
             "an open gate over a host:port forward is still allowed"
         );
+    }
+
+    #[test]
+    fn stdin_resolves_to_a_raw_stream_target_routed_before_the_bare_scheme_arm() {
+        // `stdin:` is a zero-arg raw-stream source: it must resolve to `Target::RawStream`, NOT a
+        // `Target::Handler("stdin")` (which the bare-scheme arm would produce and no registry would hold).
+        // (Under `cargo test` fd 0 is not a tty, so the parse-time TTY refusal does not fire.)
+        let Services(parsed) = services(&["cam=stdin:"]);
+        let target = parsed.values().next().expect("one service parsed");
+        assert!(
+            matches!(target, Target::RawStream(_)),
+            "`stdin:` must resolve to Target::RawStream, got {target:?}"
+        );
+    }
+
+    #[test]
+    fn an_exposer_refuses_a_public_stdin() {
+        // `stdin:` has no auth of its own: under an open gate it would pipe the producer's bytes to anyone, so
+        // `--public stdin:` would exfil them. Refused at the same door as a public shell or a public file:.
+        let piped = services(&["cam=stdin:"]);
+        assert!(
+            super::Exposer::new(piped, super::Registry::new(), Gate::Open).is_err(),
+            "an open gate over a stdin: source must be refused"
+        );
+    }
+
+    /// The full served path: an exposer over a `stdin:`-shaped source, a connector reaching it over the
+    /// in-process transport, and the peer receiving the source's EXACT bytes. Drives the same take-once +
+    /// `Target::RawStream` splice the binary uses, with an injected reader in place of the real fd 0. A second
+    /// concurrent connection finds the source taken and is refused cleanly (not a corrupted second read).
+    #[tokio::test]
+    async fn a_stdin_source_is_served_to_the_peer_and_a_second_reader_is_refused() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let body: &'static [u8] = b"live bytes piped into the exposer";
+                let services = stdin_service("cam", Box::new(body));
+
+                let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
+                let exposer_id = exposer_node.node_id();
+                let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+
+                // An open gate needs no signet; `stdin_service` bypasses the parse-time `--public` refusal
+                // (which lives at `Exposer::new`, covered above) precisely so the SERVING path is what runs.
+                tokio::task::spawn_local(async move {
+                    Exposer::new(services, Registry::new(), Gate::Open)
+                        .expect("exposer over a gated stdin source")
+                        .run(&exposer_node)
+                        .await
+                        .expect("exposer runs");
+                });
+
+                // First consumer: opens a service stream, gets Ok, and reads the source's exact bytes.
+                let session = consumer.connect(exposer_id).await.expect("connect");
+                let service = ServiceStream::open(&session, "cam").await.expect("first stream admitted");
+                let got = service.read_all().await.expect("read the piped bytes");
+                assert_eq!(got, body, "the reaching peer gets the source's exact bytes");
+
+                // Second CONCURRENT connection: the source is taken, so the host refuses cleanly with the
+                // single-consumer reason, never a racing (corrupting) second read.
+                let session2 = consumer.connect(exposer_id).await.expect("second connect");
+                let refused = ServiceStream::open(&session2, "cam").await;
+                let err = refused.expect_err("the second reader must be refused");
+                assert!(
+                    err.contains("single-consumer source, already in use"),
+                    "the refusal must name the single-consumer contract: {err}"
+                );
+            })
+            .await;
+    }
+
+    /// A tiny test client that speaks tightbeam's `Request`/`Response` handshake on one stream, so the unit
+    /// tests can reach a service without the `Connector`'s port/stdio machinery.
+    struct ServiceStream<W, R> {
+        writer: W,
+        reader: R,
+    }
+
+    impl<W, R> ServiceStream<W, R>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        /// Open a stream, request `service`, and return it on `Ok` or the host's reason on refusal.
+        async fn open<S>(session: &S, service: &str) -> Result<Self, String>
+        where
+            S: bifrost::Session<Write = W, Read = R>,
+        {
+            let (mut writer, mut reader) = session.open_bi().await.map_err(|e| e.to_string())?;
+            crate::protocol::Request {
+                service: service.to_owned(),
+                capability: None,
+            }
+            .write(&mut writer)
+            .await
+            .map_err(|e| e.to_string())?;
+            match crate::protocol::Response::read(&mut reader)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                crate::protocol::Response::Ok => Ok(Self { writer, reader }),
+                crate::protocol::Response::Error(message) => Err(message),
+            }
+        }
+
+        /// Read the piped payload to EOF. The exposer half-closes its write when the source hits EOF.
+        async fn read_all(mut self) -> std::io::Result<Vec<u8>> {
+            // Hold the writer open for the stream's lifetime (dropping it early would half-close our side
+            // before the peer finishes sending); read the piped payload to EOF.
+            let mut got = Vec::new();
+            self.reader.read_to_end(&mut got).await?;
+            drop(self.writer);
+            Ok(got)
+        }
     }
 
     #[test]

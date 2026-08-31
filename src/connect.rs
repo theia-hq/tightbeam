@@ -64,8 +64,8 @@ impl FromStr for Target {
 
 impl ConnectCmd {
     /// Resolve the target into a [`Connector`]: a raw node id (optionally presenting a link) or a link that
-    /// supplies both the node to dial and the token. The driving (`forward_port`/`pipe_stdio`, chosen by
-    /// `--to`/`--stdio`) is `main.rs` glue over the returned connector.
+    /// supplies both the node to dial and the token. The driving (`preflight`+`run`/`pipe_stdio`, chosen
+    /// by `--to`/`--stdio`) is `main.rs` glue over the returned connector.
     pub fn connector(&self) -> eyre::Result<Connector> {
         let service = String::clone(&self.service);
         match &self.target {

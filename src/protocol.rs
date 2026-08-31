@@ -10,7 +10,7 @@ use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
 const MAGIC: [u8; 4] = *b"TB02";
 
 /// A connector's opening frame: reach the named service, optionally presenting a capability.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     /// The service to reach, as named in `expose`.
     pub service: String,

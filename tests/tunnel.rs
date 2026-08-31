@@ -52,7 +52,10 @@ async fn tunnels_tcp_over_bifrost() {
             });
             tokio::task::spawn_local(async move {
                 Connector::to_node(exposer_id, "default".to_owned(), None)
-                    .forward_port(&consumer, local_port)
+                    .preflight(&consumer, local_port)
+                    .await
+                    .unwrap()
+                    .run()
                     .await
                     .unwrap();
             });
