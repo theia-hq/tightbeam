@@ -133,7 +133,11 @@ where
     // named-service scheme is refused at construction, and only raw forwards are served.
     let exposer = Exposer::new(services.clone(), Registry::new(), gate)?;
     if !cmd.quiet {
-        expose_banner(node.node_id(), services.names(), &gate_description(&cmd, signet));
+        expose_banner(
+            node.node_id(),
+            services.names(),
+            &gate_description(&cmd, signet),
+        );
     }
     exposer.run(node).await
 }
@@ -144,9 +148,15 @@ where
 /// never appear. Withheld under `--quiet`.
 fn expose_banner<'a>(node_id: NodeId, names: impl Iterator<Item = &'a str>, gate: &str) {
     println!("tightbeam ready. peers can reach these services at:\n");
-    println!("    {node_id}                     (share this key, or mint a link with `tightbeam share`)\n");
+    println!(
+        "    {node_id}                     (share this key, or mint a link with `tightbeam share`)\n"
+    );
     let names: Vec<&str> = names.collect();
-    println!("exposing {}. gate: {}. ctrl-c to stop.", names.join(", "), gate);
+    println!(
+        "exposing {}. gate: {}. ctrl-c to stop.",
+        names.join(", "),
+        gate
+    );
 }
 
 /// A one-line description of the effective gate, for the readiness banner: trust made visible.
