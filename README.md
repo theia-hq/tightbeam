@@ -14,7 +14,9 @@ Powered by [bifrost](https://github.com/theia-hq/bifrost) for the keyed connecti
 
 **The name.** A tightbeam is a tight, aimed beam: a private point-to-point link that goes only where you
 point it, not out to everyone. That is what this does, one machine's service reaching exactly one other,
-addressed by key.
+addressed by key. The word is borrowed from The Expanse, where a tightbeam is a directed transmission
+aimed at a single ship, not a broadcast. The privacy is in the aim; the security, here, is in the key at
+each end.
 
 > Experimental. Works for TCP over the iroh transport; not ready for production use.
 
