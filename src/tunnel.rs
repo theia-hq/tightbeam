@@ -905,7 +905,7 @@ pub async fn revoke_into(denylist: &mut Denylist, link: &str) -> eyre::Result<()
 mod tests {
     use std::collections::HashMap;
 
-    use bifrost::{NoDiscovery, Node, Session as _};
+    use bifrost::{NoDiscovery, Node};
     use bifrost_mem::MemTransport;
     use nauthy::{Gate, Service};
     use tokio::io::AsyncReadExt as _;
@@ -1092,27 +1092,33 @@ mod tests {
                 let exposer_id = exposer_node.node_id();
                 let consumer = Node::new(MemTransport::bind(), NoDiscovery);
 
-                // An open gate needs no signet; `stdin_service` bypasses the parse-time `--public` refusal
-                // (which lives at `Exposer::new`, covered above) precisely so the SERVING path is what runs.
+                // Drive the SERVE path directly. `Exposer::new`'s `--public` refusal for a raw-stream source
+                // is covered separately (`an_exposer_refuses_a_public_stdin`); here we construct the exposer
+                // past that door so the open gate keeps the peer admitted with no token, and the test isolates
+                // the take-once + splice path a `stdin:` source runs.
+                let exposer = Exposer {
+                    services,
+                    registry: std::sync::Arc::new(Registry::new()),
+                    gate: Gate::Open,
+                };
                 tokio::task::spawn_local(async move {
-                    Exposer::new(services, Registry::new(), Gate::Open)
-                        .expect("exposer over a gated stdin source")
-                        .run(&exposer_node)
-                        .await
-                        .expect("exposer runs");
+                    exposer.run(&exposer_node).await.expect("exposer runs");
                 });
 
                 // First consumer: opens a service stream, gets Ok, and reads the source's exact bytes.
                 let session = consumer.connect(exposer_id).await.expect("connect");
-                let service = ServiceStream::open(&session, "cam").await.expect("first stream admitted");
+                let service = ServiceStream::open(&session, "cam")
+                    .await
+                    .expect("first stream admitted");
                 let got = service.read_all().await.expect("read the piped bytes");
                 assert_eq!(got, body, "the reaching peer gets the source's exact bytes");
 
                 // Second CONCURRENT connection: the source is taken, so the host refuses cleanly with the
                 // single-consumer reason, never a racing (corrupting) second read.
                 let session2 = consumer.connect(exposer_id).await.expect("second connect");
-                let refused = ServiceStream::open(&session2, "cam").await;
-                let err = refused.expect_err("the second reader must be refused");
+                let Err(err) = ServiceStream::open(&session2, "cam").await else {
+                    panic!("the second reader must be refused, not a racing second read");
+                };
                 assert!(
                     err.contains("single-consumer source, already in use"),
                     "the refusal must name the single-consumer contract: {err}"

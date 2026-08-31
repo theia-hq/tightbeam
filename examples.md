@@ -32,19 +32,13 @@ no background process. It is a read-only source: it refuses block/char devices (
 
 ## A live feed to a player on the other side
 
-The host has a camera or a screen you want to watch live elsewhere. A live feed has a producer that must
-keep running while the stream is served, so this one has a background step (the producer) that the
-static-file case does not.
-
-`fifo:<path>` serves a named pipe: whatever a producer writes into the pipe streams to the peer. Point
-the producer at the pipe, serve the pipe, and read it on the far side:
+The host has a camera or a screen you want to watch live elsewhere. Pipe the producer straight into
+`expose` and read it on the far side:
 
 ```sh
-# on the host: make a pipe, serve it, then capture the camera into it
+# on the host: capture the camera and pipe it into expose
 # (device name varies by OS: /dev/video0 on Linux, "0" with -f avfoundation on macOS)
-mkfifo /tmp/cam
-tightbeam expose cam=fifo:/tmp/cam &
-ffmpeg -i /dev/video0 -f mpegts /tmp/cam
+ffmpeg -i /dev/video0 -f mpegts - | tightbeam expose cam=stdin:
 ```
 
 ```sh
@@ -52,13 +46,20 @@ ffmpeg -i /dev/video0 -f mpegts /tmp/cam
 tightbeam connect <peer> --service cam --stdio | mpv -    # or: vlc -
 ```
 
+`stdin:` serves whatever a producer pipes into `expose`, so the whole live case is one pipe: no `mkfifo`,
+no background job, no temp path to clean up. It works the same on Linux, macOS, and Windows (it reads this
+process's own standard input). It is **single-consumer**: standard input is one stream, so the first peer
+to reach it takes it, and a second concurrent connection is refused cleanly rather than corrupting the
+feed with a racing second read.
+
 The live feed reaches you addressed by the host's key and gated to your signet, with no port-forward and
 no camera vendor in the path.
 
-> Streaming a *command's* own stdout directly (`expose cam=exec:'ffmpeg -i /dev/video0 -f mpegts -'`, with
-> no pipe to make and no background producer) needs an `exec:` scheme. Spawning a process on the host is a
-> materially bigger blast radius than opening a file, so it is a separate, held item pending its own
-> design. When it lands, the live case collapses to one line too.
+> `fifo:<path>` is the alternative when you want several producers or several serially-reconnecting readers
+> over one named pipe on disk; `stdin:` is the one-shot pipe. Streaming a *command's* own stdout with the
+> host doing the spawning (`expose cam=exec:'ffmpeg ...'`) would need an `exec:` scheme, but with `stdin:`
+> the caller already spawns the command and pipes it in, so `exec:` stays parked: spawning a process on the
+> host is a materially bigger blast radius, and the pipe covers the case.
 
 ## Watch a whole media server over your key
 
@@ -79,13 +80,11 @@ no port-forward and the server never faces the public internet.
 
 ## Send a directory as it packs
 
-Pipe `tar` into a served pipe and unpack it on the far side as it arrives:
+Pipe `tar` straight into `expose` and unpack it on the far side as it arrives:
 
 ```sh
-# on the host: make a pipe, serve it, then pack the directory into it
-mkfifo /tmp/bundle
-tightbeam expose bundle=fifo:/tmp/bundle &
-tar -cf /tmp/bundle ~/project
+# on the host: pack the directory and pipe it into expose
+tar -cf - ~/project | tightbeam expose bundle=stdin:
 ```
 
 ```sh

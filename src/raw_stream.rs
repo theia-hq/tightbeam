@@ -1,11 +1,18 @@
-//! The raw-stream forward: open an already-existing OS object (a file or a FIFO named by the operator) and
-//! splice its bytes toward the peer. This is the expose-side mirror of `connect --stdio` (which splices the
-//! connector's own stdio): where `--stdio` pumps a running process's stdin/stdout, `file:<path>` /
-//! `fifo:<path>` pump the bytes of a path the operator already made.
+//! The raw-stream forward: source an already-open byte stream and splice it toward the peer. Three
+//! sources share one shape, so `expose` treats them all as a read-only [`crate::tunnel::Target::RawStream`]
+//! (inheriting the source-only splice and the `--public` refusal):
 //!
-//! It owns no lifecycle beyond the file descriptor (no child, nothing to reap), which is exactly what makes
-//! it a [`crate::tunnel::Target`] forward and not a handler. But its input is an untrusted path resolved at
-//! DIAL time, so every open goes through four guards, each named at its site below:
+//! - `file:<path>` / `fifo:<path>` — open an OS object the operator named on disk. Its input is an
+//!   untrusted path resolved at DIAL time, so every open goes through four guards (each named at its site
+//!   in [`open_guarded`]).
+//! - `stdin:` — this process's own standard input (fd 0). No path, so none of the path guards apply; it is
+//!   a SINGLE-CONSUMER source (fd 0 is one non-re-openable stream) taken once and never re-armed.
+//!
+//! The path forms mirror `connect --stdio` (which splices the connector's stdio): where `--stdio` pumps a
+//! running process's stdin/stdout, `file:`/`fifo:` pump the bytes of a path the operator already made, and
+//! `stdin:` pumps whatever a producer pipes into the exposer (`producer | tightbeam expose x=stdin:`).
+//!
+//! The four path guards (`file:`/`fifo:` only; `stdin:` has no path and inherits NONE of them):
 //!
 //! 1. **Regular-file-or-FIFO only.** `fstat` the opened fd and allow ONLY `S_ISREG` or `S_ISFIFO`. A block
 //!    or character device (`/dev/zero`, `/dev/urandom`) is an infinite drain; a directory or socket is not a
@@ -24,11 +31,11 @@ use std::os::fd::FromRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
-use crate::tunnel::RAW_STREAM_OPEN_TIMEOUT;
+use crate::tunnel::{BoxRead, RAW_STREAM_OPEN_TIMEOUT};
 
-/// Which OS object types a raw-stream forward accepts. Both fix the direction (a read-only source toward the
-/// peer); they differ only in the type guard, so the scheme the operator wrote is honored: `fifo:` insists
-/// on a FIFO (a regular file behind it is a mistake to surface), `file:` accepts either.
+/// Which OS object types a path-based raw-stream forward accepts. Both fix the direction (a read-only source
+/// toward the peer); they differ only in the type guard, so the scheme the operator wrote is honored:
+/// `fifo:` insists on a FIFO (a regular file behind it is a mistake to surface), `file:` accepts either.
 #[derive(Debug, Clone, Copy)]
 enum Kind {
     /// `file:<path>` — a regular file or a FIFO. The general "the bytes at this path."
@@ -38,71 +45,150 @@ enum Kind {
     Fifo,
 }
 
-/// A resolved raw-stream forward: an owned path and the type it must resolve to. Its direction is not a
-/// field because there is only one (a read-only source toward the peer); a writable direction is
-/// unrepresentable by construction.
+/// A resolved raw-stream forward: a read-only source of bytes toward the peer. Its direction is not a field
+/// because there is only one (a writable direction is unrepresentable by construction). Either a path on disk
+/// opened under the four guards, or this process's standard input taken once.
 #[derive(Debug, Clone)]
-pub struct RawStream {
-    path: PathBuf,
-    kind: Kind,
+pub struct RawStream(Source);
+
+/// The two sources a raw stream can splice from, sharing the read-only direction and the `--public` refusal.
+#[derive(Debug, Clone)]
+enum Source {
+    /// A path (`file:`/`fifo:`) opened under the four guards. Cheap to clone (a path + a kind), re-opened per
+    /// connection: two peers each reading the same file is fine.
+    Path { path: PathBuf, kind: Kind },
+    /// This process's standard input (`stdin:`), a SINGLE-CONSUMER source: fd 0 is one non-re-openable
+    /// stream, so it is taken once. See [`Stdin`].
+    Stdin(Stdin),
+}
+
+/// The take-once owner of a single-consumer reader (fd 0 for `stdin:`). `stdin:` names ONE non-re-openable OS
+/// stream, so two concurrent readers would race and corrupt the byte order. The reader is modelled as an
+/// owned resource in a shared cell: the FIRST [`RawStream::open`] that resolves `stdin:` TAKES it, and every
+/// later concurrent open finds it gone and is refused. Making "two readers of one stdin" unrepresentable is
+/// the whole point of the cell: once taken it is never put back, so on EOF or first-consumer disconnect it
+/// does not re-arm. Holds a [`BoxRead`] so a test can arm the same take-once cell with an in-memory reader
+/// and exercise the full served path without the process's real fd 0.
+#[derive(Clone)]
+struct Stdin(std::sync::Arc<std::sync::Mutex<Option<BoxRead>>>);
+
+impl core::fmt::Debug for Stdin {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Stdin").finish_non_exhaustive()
+    }
+}
+
+impl Stdin {
+    /// Arm a single-consumer source over `reader`.
+    fn new(reader: BoxRead) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(reader))))
+    }
+
+    /// Take the reader, or refuse if a prior connection already holds it. `None` means "already in use": the
+    /// caller turns it into a clean `Response::Error`, never a racing second read.
+    fn take(&self) -> Option<BoxRead> {
+        let Self(cell) = self;
+        // A poisoned lock means a prior holder panicked mid-take; treat the source as taken (never hand out a
+        // second reader) rather than unwrap. `PoisonError::into_inner` reads the guard without unwrapping.
+        cell.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
 }
 
 impl RawStream {
     /// Parse a `file:<path>` tail into a raw-stream forward. Rejects an empty path at parse time (`file:`
     /// with no tail is a typo, not a target) so it fails loudly at expose, not at dial.
     pub fn file(path: &str, entry: &str) -> eyre::Result<Self> {
-        Self::parse(path, Kind::File, entry, "file")
+        Self::path(path, Kind::File, entry, "file")
     }
 
     /// Parse a `fifo:<path>` tail into a raw-stream forward. Same shape as [`RawStream::file`], but the type
     /// guard at open will insist the path is a FIFO.
     pub fn fifo(path: &str, entry: &str) -> eyre::Result<Self> {
-        Self::parse(path, Kind::Fifo, entry, "fifo")
+        Self::path(path, Kind::Fifo, entry, "fifo")
     }
 
-    fn parse(path: &str, kind: Kind, entry: &str, scheme: &str) -> eyre::Result<Self> {
+    /// The `stdin:` source: this process's standard input, taken once (single-consumer). Refuses a TTY here,
+    /// at parse time (loudly at expose), because a `stdin:` with no pipe would eat the operator's keystrokes,
+    /// the analog of `file:`'s device refusal.
+    pub fn stdin() -> eyre::Result<Self> {
+        if is_stdin_a_tty() {
+            eyre::bail!(
+                "stdin: has no pipe to read: fd 0 is a terminal, so it would consume your keystrokes. \
+                 Pipe a producer in, e.g. `ffmpeg ... | tightbeam expose cam=stdin:`"
+            );
+        }
+        Ok(Self(Source::Stdin(Stdin::new(
+            Box::new(tokio::io::stdin()),
+        ))))
+    }
+
+    /// A `stdin:`-shaped single-consumer source over an arbitrary reader, for tests: arm the SAME take-once
+    /// cell with an in-memory reader so the full served path (take-once + splice toward the peer) is exercised
+    /// without the process's real fd 0. Not compiled into the binary.
+    #[cfg(test)]
+    pub(crate) fn from_reader(reader: BoxRead) -> Self {
+        Self(Source::Stdin(Stdin::new(reader)))
+    }
+
+    fn path(path: &str, kind: Kind, entry: &str, scheme: &str) -> eyre::Result<Self> {
         if path.is_empty() {
             eyre::bail!(
                 "`{entry}` names a `{scheme}:` target with no path; write `{scheme}:<path>`, e.g. \
                  `pipe={scheme}:/tmp/beam`"
             );
         }
-        Ok(Self {
+        Ok(Self(Source::Path {
             path: PathBuf::from(path),
             kind,
-        })
+        }))
     }
 
-    /// Open the object under the four guards and return its bytes as an async reader (the source half of the
-    /// splice). Errors (a device, a directory, a symlink at the final component, a FIFO with no writer
-    /// within the timeout, a missing path) are returned as [`eyre::Error`] so the caller can refuse the
-    /// stream cleanly rather than hang or reset mid-splice.
-    pub async fn open(&self) -> eyre::Result<tokio::fs::File> {
-        let path = self.path.clone();
-        let kind = self.kind;
-        // Guard 2 (blocking-open timeout): the `open()` itself blocks for a FIFO with no writer, so it runs
-        // on a blocking thread bounded by the timeout. On elapse the open is abandoned (the blocking thread
-        // completes or dies with the runtime); the stream is refused rather than pinned.
-        let opened = tokio::time::timeout(
-            RAW_STREAM_OPEN_TIMEOUT,
-            tokio::task::spawn_blocking(move || open_guarded(&path, kind)),
-        )
-        .await;
-        match opened {
-            Ok(Ok(result)) => result,
-            Ok(Err(join)) => Err(eyre::eyre!("raw-stream open task failed: {join}")),
-            Err(_elapsed) => eyre::bail!(
-                "opening {} timed out after {}s (a FIFO with no writer?)",
-                self.path.display(),
-                RAW_STREAM_OPEN_TIMEOUT.as_secs()
-            ),
+    /// Open the source and return its bytes as an async reader (the source half of the splice). For a path,
+    /// this opens the object under the four guards; errors (a device, a directory, a symlink at the final
+    /// component, a FIFO with no writer within the timeout, a missing path) are returned so the caller can
+    /// refuse cleanly rather than hang or reset mid-splice. For `stdin:`, this TAKES fd 0 once: a second
+    /// concurrent open finds it already in use and is refused, never a racing second read.
+    pub async fn open(&self) -> eyre::Result<BoxRead> {
+        let Self(source) = self;
+        match source {
+            Source::Path { path, kind } => open_path(path.clone(), *kind).await,
+            Source::Stdin(stdin) => match stdin.take() {
+                Some(reader) => Ok(reader),
+                None => eyre::bail!("stdin is a single-consumer source, already in use"),
+            },
         }
     }
 }
 
-/// The blocking body of [`RawStream::open`]: open the final path component with `O_NOFOLLOW` (guard 3),
-/// `fstat` the opened fd and enforce the type (guard 1). Runs on a blocking thread because a FIFO open
-/// blocks until a writer appears; the caller bounds it with a timeout (guard 2).
+/// Open a path source under the four guards and box its reader. Split out from [`RawStream::open`] so the
+/// `stdin:` arm (no path, no guards) reads cleanly beside it.
+async fn open_path(path: PathBuf, kind: Kind) -> eyre::Result<BoxRead> {
+    // Guard 2 (blocking-open timeout): the `open()` itself blocks for a FIFO with no writer, so it runs on a
+    // blocking thread bounded by the timeout. On elapse the open is abandoned (the blocking thread completes
+    // or dies with the runtime); the stream is refused rather than pinned.
+    let for_error = path.clone();
+    let opened = tokio::time::timeout(
+        RAW_STREAM_OPEN_TIMEOUT,
+        tokio::task::spawn_blocking(move || open_guarded(&path, kind)),
+    )
+    .await;
+    match opened {
+        Ok(Ok(Ok(file))) => Ok(Box::new(file)),
+        Ok(Ok(Err(refusal))) => Err(refusal),
+        Ok(Err(join)) => Err(eyre::eyre!("raw-stream open task failed: {join}")),
+        Err(_elapsed) => eyre::bail!(
+            "opening {} timed out after {}s (a FIFO with no writer?)",
+            for_error.display(),
+            RAW_STREAM_OPEN_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+/// The blocking body of [`open_path`]: open the final path component with `O_NOFOLLOW` (guard 3), `fstat` the
+/// opened fd and enforce the type (guard 1). Runs on a blocking thread because a FIFO open blocks until a
+/// writer appears; the caller bounds it with a timeout (guard 2).
 fn open_guarded(path: &Path, kind: Kind) -> eyre::Result<tokio::fs::File> {
     // Guard 3 (no symlink / no traversal at the final component): `O_NOFOLLOW` refuses a symlink AT the path
     // the operator named, so a swapped final component (a TOCTOU race, or a planted symlink) cannot redirect
@@ -168,6 +254,14 @@ fn open_guarded(path: &Path, kind: Kind) -> eyre::Result<tokio::fs::File> {
     Ok(tokio::fs::File::from_std(file))
 }
 
+/// Whether fd 0 is a terminal. A `stdin:` expose with no pipe would consume the operator's keystrokes, so it
+/// is refused at parse (guard 7). Uses `libc::isatty`, portable across unix; the non-unix stand-in uses the
+/// platform's own check. Not a guard on the byte source (there is no path), just a misuse refusal.
+fn is_stdin_a_tty() -> bool {
+    // SAFETY: `isatty` reads only the fd's terminal-ness and has no preconditions; fd 0 is always valid.
+    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
+}
+
 /// A human name for an `S_IFMT`-masked `st_mode` file type, for the "not a regular file or a FIFO (...)"
 /// refusal so the operator sees WHAT they pointed at (a device, a directory) rather than only that it was
 /// rejected. `file_type` is already masked with `S_IFMT`; the libc constants are widened to `u32` to match.
@@ -196,7 +290,7 @@ mod tests {
     use core::sync::atomic::{AtomicU32, Ordering};
     use std::io::Write as _;
 
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::io::AsyncReadExt as _;
 
     use super::RawStream;
 
@@ -234,10 +328,9 @@ mod tests {
     #[tokio::test]
     async fn a_device_path_is_refused() {
         let stream = RawStream::file("/dev/zero", "drain=file:/dev/zero").expect("parse file:");
-        let err = stream
-            .open()
-            .await
-            .expect_err("/dev/zero must be refused, never opened as a byte source");
+        let Err(err) = stream.open().await else {
+            panic!("/dev/zero must be refused, never opened as a byte source");
+        };
         let msg = err.to_string();
         assert!(
             msg.contains("not a regular file or a FIFO") && msg.contains("character device"),
@@ -245,9 +338,10 @@ mod tests {
         );
     }
 
-    /// (c) direction is enforced: the opened source is read-only, so peer bytes can never be written into
-    /// the file. The handle the splice reads from cannot be written; the splice pairs it with `io::sink()`
-    /// upstream, so "write peer bytes into a read-only file" is unrepresentable rather than a runtime error.
+    /// (c) direction is enforced structurally: `open` yields a read-only [`super::BoxRead`], so there is no
+    /// writable handle to push peer bytes back through. The splice pairs it with `io::sink()` upstream, so
+    /// "write peer bytes into a read-only file" is unrepresentable rather than a runtime error. Assert the
+    /// file on disk is untouched after the source is fully read and dropped.
     #[tokio::test]
     async fn direction_is_enforced_the_source_is_read_only() {
         let path = scratch("ro");
@@ -258,21 +352,10 @@ mod tests {
 
         let stream = RawStream::file(&path.to_string_lossy(), "x=file:y").expect("parse file:");
         let mut source = stream.open().await.expect("open regular file");
-        // Writing to the read-only source fails: the fd is O_RDONLY, so peer bytes have nowhere to go.
-        // (`tokio::fs::File` buffers, so the EBADF surfaces on flush, not necessarily the write call.)
-        let wrote = async {
-            source
-                .write_all(b"peer bytes should never land here")
-                .await?;
-            source.flush().await
-        }
-        .await;
-        assert!(
-            wrote.is_err(),
-            "the source is read-only; writing peer bytes into it must fail, never corrupt the file"
-        );
+        let mut got = Vec::new();
+        source.read_to_end(&mut got).await.expect("read source");
         drop(source);
-        // The file on disk is byte-for-byte unchanged: nothing was written through the source handle.
+        // The file on disk is byte-for-byte unchanged: the source is read-only, nothing could be written.
         let after = std::fs::read(&path).expect("re-read file");
         assert_eq!(
             after, body,
@@ -291,10 +374,9 @@ mod tests {
             .expect("write scratch file");
 
         let stream = RawStream::fifo(&path.to_string_lossy(), "p=fifo:z").expect("parse fifo:");
-        let err = stream
-            .open()
-            .await
-            .expect_err("a regular file behind fifo: must be refused");
+        let Err(err) = stream.open().await else {
+            panic!("a regular file behind fifo: must be refused");
+        };
         assert!(
             err.to_string().contains("not a FIFO"),
             "the refusal must say it is not a FIFO: {err}"
@@ -315,10 +397,9 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).expect("make symlink");
 
         let stream = RawStream::file(&link.to_string_lossy(), "s=file:l").expect("parse file:");
-        let err = stream
-            .open()
-            .await
-            .expect_err("a symlink at the final component must be refused by O_NOFOLLOW");
+        let Err(err) = stream.open().await else {
+            panic!("a symlink at the final component must be refused by O_NOFOLLOW");
+        };
         assert!(
             err.to_string().contains("symlink"),
             "the refusal must name the symlink guard: {err}"
@@ -338,6 +419,36 @@ mod tests {
         assert!(
             RawStream::fifo("", "pipe=fifo:").is_err(),
             "`fifo:` with no path must be rejected at parse"
+        );
+    }
+
+    /// `stdin:` is a SINGLE-CONSUMER source: the first `open` takes the reader, and a second CONCURRENT open
+    /// finds it already in use and is refused cleanly, never a racing second read. Uses `from_reader` so the
+    /// take-once cell is exercised deterministically, independent of the runner's real fd 0. The first open
+    /// also yields the source's exact bytes.
+    #[tokio::test]
+    async fn stdin_is_taken_once_and_the_second_open_is_refused() {
+        let body = b"piped bytes into the exposer";
+        let stream = RawStream::from_reader(Box::new(&body[..]));
+        // Clone the resolved stream the way `Services` does: both clones share ONE take-once cell.
+        let second = stream.clone();
+        let mut first = stream
+            .open()
+            .await
+            .expect("the first open takes the source");
+        let mut got = Vec::new();
+        first.read_to_end(&mut got).await.expect("read the source");
+        assert_eq!(
+            got, body,
+            "the first consumer gets the source's exact bytes"
+        );
+        let Err(err) = second.open().await else {
+            panic!("a second concurrent open must be refused, not a racing second read");
+        };
+        assert!(
+            err.to_string()
+                .contains("single-consumer source, already in use"),
+            "the refusal must name the single-consumer contract: {err}"
         );
     }
 }

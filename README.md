@@ -29,7 +29,7 @@ cargo install --path .
 ## Usage
 
 Expose one or more local services (on the machine that has them). A target may be a `host:port`, a
-`unix:<path>` socket, or a `file:`/`fifo:` byte source:
+`unix:<path>` socket, a `file:`/`fifo:` byte source, or `stdin:` (whatever a producer pipes in):
 
 ```sh
 tightbeam expose ssh=127.0.0.1:22 web=127.0.0.1:80 docker=unix:/var/run/docker.sock
@@ -154,8 +154,9 @@ commands.
   [`nauthy`](https://github.com/theia-hq/nauthy) crate: the default gate admits a presented `sheer:`
   token rooted at this node's signet (a device's membership badge or a delegated service slip);
   `--public` is the only opt-out.
-- Targets tightbeam forwards on its own: a `host:port` or `unix:<path>` (spliced to a local address) and
-  a `file:<path>` or `fifo:<path>` (a path's raw bytes sourced to the peer).
+- Targets tightbeam forwards on its own: a `host:port` or `unix:<path>` (spliced to a local address), a
+  `file:<path>` or `fifo:<path>` (a path's raw bytes sourced to the peer), and `stdin:` (whatever a
+  producer pipes into `expose`, sourced to the peer; single-consumer, one reader takes it).
 - A named service beyond a raw forward (a keyless shell, an HTTP fetcher, link diagnostics) is a handler
   a node injects into the registry. tightbeam knows the contract, never what such a service does, and
   ships none of its own; see [swoosh](https://github.com/theia-hq/swoosh) for the services a real node
