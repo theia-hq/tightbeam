@@ -193,8 +193,8 @@ fn describe_type(file_type: u32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
     use core::sync::atomic::{AtomicU32, Ordering};
+    use std::io::Write as _;
 
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -205,7 +205,11 @@ mod tests {
     fn scratch(tag: &str) -> std::path::PathBuf {
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("tightbeam-rawstream-{}-{tag}-{}", std::process::id(), n))
+        std::env::temp_dir().join(format!(
+            "tightbeam-rawstream-{}-{tag}-{}",
+            std::process::id(),
+            n
+        ))
     }
 
     /// (a) `file:` to a regular file sources its exact bytes.
@@ -257,7 +261,9 @@ mod tests {
         // Writing to the read-only source fails: the fd is O_RDONLY, so peer bytes have nowhere to go.
         // (`tokio::fs::File` buffers, so the EBADF surfaces on flush, not necessarily the write call.)
         let wrote = async {
-            source.write_all(b"peer bytes should never land here").await?;
+            source
+                .write_all(b"peer bytes should never land here")
+                .await?;
             source.flush().await
         }
         .await;
@@ -268,7 +274,10 @@ mod tests {
         drop(source);
         // The file on disk is byte-for-byte unchanged: nothing was written through the source handle.
         let after = std::fs::read(&path).expect("re-read file");
-        assert_eq!(after, body, "the file must be untouched by the read-only source");
+        assert_eq!(
+            after, body,
+            "the file must be untouched by the read-only source"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
