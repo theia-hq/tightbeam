@@ -42,6 +42,11 @@ tightbeam = { path = "../tightbeam" }
 
 You also depend on `bifrost` (to bind an overlay node) and `nauthy` (to build the gate).
 
+For the whole expose-then-reach flow in one runnable file, see
+[`examples/reach_a_service_by_key.rs`](examples/reach_a_service_by_key.rs): `cargo run --example
+reach_a_service_by_key` exposes a local service on one node and reaches it by key from another, no network
+needed.
+
 ## Serve services behind a gate
 
 An `Exposer` accepts overlay sessions from permitted peers and forwards each inbound stream to the
