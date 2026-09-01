@@ -42,6 +42,14 @@ const MAX_SESSIONS: usize = 256;
 /// The maximum number of in-flight streams per session, bounding what a single connected peer can pin.
 const MAX_STREAMS_PER_SESSION: usize = 256;
 
+/// The single, indistinguishable refusal a not-admitted dialer receives on the wire. A dialer the gate does
+/// not admit gets THIS and nothing else: no reason that separates a stranger (missing token) from a
+/// not-granting token from a revoked one, and no hint that names or enumerates a service. Existence, shape,
+/// and verdict of a service are revealed ONLY AFTER the gate admits the caller for that service, so the
+/// refusal path is not a pre-authorization capability-enumeration or revocation oracle (deliberation 18).
+/// The real reason still reaches the SERVER'S OWN logs (`tracing`); it is only the WIRE that is uniform.
+const UNIFORM_REFUSAL: &str = "refused";
+
 /// A forwarding target for one exposed service, resolved once at parse time so `serve_request` matches an
 /// enum rather than a string prefix: either tightbeam's own raw forward (a local socket it splices to) or a
 /// named handler the caller injected into the [`Registry`].
@@ -415,8 +423,12 @@ where
     let admitted = match admit(&gate, peer, request.capability.as_deref(), &service) {
         Ok(admitted) => admitted,
         Err(refusal) => {
+            // The real reason (missing / not-granted / revoked / malformed) is a LOCAL log line for the
+            // node's own operator. The WIRE gets one indistinguishable refusal, so a not-admitted dialer
+            // cannot tell a stranger's `Missing` from a revoked holder's `Revoked`, nor confirm a service
+            // exists at all: no pre-authorization revocation or capability-enumeration oracle.
             tracing::warn!(%peer, service = %service, %refusal, "refused");
-            return Response::Error(refusal)
+            return Response::Error(UNIFORM_REFUSAL.to_owned())
                 .write(&mut writer)
                 .await
                 .map_err(Into::into);
@@ -467,24 +479,37 @@ where
             }
         },
         None => {
-            // Name what this node DOES expose, so a service-name mismatch (the connector defaulting to
-            // `default` while the exposer named `web`) reads as a fixable error, not an opaque reset.
+            // Unknown service. The node's OWN log names what it exposes, so a service-name mismatch (the
+            // connector defaulting to `default` while the exposer named `web`) is diagnosable by the
+            // operator. It must NOT cross the wire: enumerating the service menu to a dialer is exactly the
+            // pre-authorization capability-enumeration oracle deliberation 18 forbids, so the wire gets the
+            // same indistinguishable refusal as any not-admitted dial. A dialer learns a service exists only
+            // by being admitted to it; the teaching hint returns as the gated `control.services` verb, never
+            // as a free menu here. (This arm is reached only past the gate: an Open node, or a whole-node
+            // member badge that admits any name -- so uniformity here also stops a member from mapping the
+            // menu by probing wrong names, keeping the same rule at every dialer class.)
             let mut available: Vec<&str> = services.keys().map(String::as_str).collect();
             available.sort_unstable();
-            let message = format!(
-                "unknown service {:?}; this node exposes: {}",
-                service.as_str(),
-                available.join(", ")
+            tracing::warn!(
+                %peer,
+                service = %service,
+                exposes = %available.join(", "),
+                "unknown service requested"
             );
-            Response::Error(message).write(&mut writer).await?;
+            Response::Error(UNIFORM_REFUSAL.to_owned())
+                .write(&mut writer)
+                .await?;
         }
     }
     Ok(())
 }
 
-/// Apply the gate to a request, returning the [`Admitted`] witness on success or a peer-facing refusal
-/// string. The witness is required to reach a service handler, so "authorize before serve" is a
-/// compile-time precondition (see [`nauthy::Admitted`]).
+/// Apply the gate to a request, returning the [`Admitted`] witness on success or a DISTINGUISHING refusal
+/// string for the node's OWN logs. The witness is required to reach a service handler, so "authorize before
+/// serve" is a compile-time precondition (see [`nauthy::Admitted`]). The reason returned here NEVER crosses
+/// the wire (the caller sends [`UNIFORM_REFUSAL`] to a not-admitted dialer); it exists only so the operator
+/// can see WHY on their own `tracing` output. Distinguishing missing/not-granted/revoked to the wire would
+/// be a revocation + capability-enumeration oracle for an unauthorized peer (deliberation 18).
 fn admit(
     gate: &Gate,
     peer: NodeId,
@@ -492,7 +517,7 @@ fn admit(
     service: &Service,
 ) -> Result<Admitted, String> {
     // Parse a presented capability at the edge; a malformed token is a refusal, not a hard error, so the
-    // connector gets a clean "not permitted" rather than a dropped stream.
+    // stream ends cleanly rather than being dropped mid-read.
     let cap = match capability.map(Cap::parse).transpose() {
         Ok(cap) => cap,
         Err(_) => return Err("malformed capability".to_owned()),
@@ -1168,10 +1193,24 @@ mod tests {
         where
             S: bifrost::Session<Write = W, Read = R>,
         {
+            Self::open_with(session, service, None).await
+        }
+
+        /// Like [`open`](Self::open) but presents `capability`, so a test can dial as a stranger (`None`) or
+        /// as a token-holder (a revoked slip). Returns the host's refusal string verbatim on `Error`, which
+        /// is what lets a test assert two dialers got BYTE-IDENTICAL refusals.
+        async fn open_with<S>(
+            session: &S,
+            service: &str,
+            capability: Option<String>,
+        ) -> Result<Self, String>
+        where
+            S: bifrost::Session<Write = W, Read = R>,
+        {
             let (mut writer, mut reader) = session.open_bi().await.map_err(|e| e.to_string())?;
             crate::protocol::Request {
                 service: service.to_owned(),
-                capability: None,
+                capability,
             }
             .write(&mut writer)
             .await
@@ -1225,5 +1264,163 @@ mod tests {
             shadowed.is_err(),
             "re-injecting an already-registered scheme must be refused so it cannot shadow a handler"
         );
+    }
+
+    /// SECURITY (deliberation 18, the discovery oracle): a dialer the gate does NOT admit must get ONE
+    /// indistinguishable refusal on the wire. No reason separates a stranger (no token) from a revoked
+    /// holder from a not-granting token, and no response enumerates or confirms a service. This test dials a
+    /// Family-gated node four ways -- a stranger, a revoked-slip holder, an unknown-service probe, and a
+    /// slip-for-the-wrong-service holder -- and asserts every refusal is BYTE-IDENTICAL, so the wire is not a
+    /// revocation oracle and not a capability-enumeration oracle. The gate is the discovery boundary:
+    /// existence, shape, and verdict are revealed only AFTER admission.
+    #[tokio::test]
+    async fn an_unadmitted_dialer_gets_one_uniform_refusal_no_reason_no_menu() {
+        use nauthy::{Denylist, Identity};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // The signet that roots the family, and a real exposed service (`ssh`) plus a second name
+                // (`web`) so the node has a genuine menu that MUST NOT leak. The bodies are irrelevant: every
+                // dial here is refused at the gate or at the unknown-service arm, never served.
+                let signet = Identity::from_secret(&[7u8; 32]).expect("valid secret");
+                let hour = nauthy::expires_in(core::time::Duration::from_secs(3600));
+
+                let mut map = HashMap::new();
+                map.insert(
+                    "ssh".to_owned(),
+                    Target::RawStream(RawStream::from_reader(Box::new(&b"secret"[..]))),
+                );
+                map.insert(
+                    "web".to_owned(),
+                    Target::RawStream(RawStream::from_reader(Box::new(&b"secret"[..]))),
+                );
+                let services = Services(map);
+
+                // A slip the family once honored for `ssh`, now REVOKED: the revoked-but-persistent holder.
+                let revoked_slip = signet.mint(&svc("ssh"), hour).expect("mint ssh slip");
+                let path = std::env::temp_dir()
+                    .join(format!("tb-uniform-refusal-{}", std::process::id()));
+                let _ = std::fs::remove_file(&path);
+                let mut denylist = Denylist::load(path.clone()).await.expect("load denylist");
+                denylist.revoke(&revoked_slip).await.expect("revoke the slip");
+
+                let exposer = Exposer {
+                    services,
+                    registry: std::sync::Arc::new(Registry::new()),
+                    gate: Gate::family(signet.node_id(), denylist),
+                };
+
+                let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
+                let exposer_id = exposer_node.node_id();
+                let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+                tokio::task::spawn_local(async move {
+                    exposer.run(&exposer_node).await.expect("exposer runs");
+                });
+
+                // Every dial opens a fresh session/stream (each stream is gated on its own merits).
+                let dial = |service: &'static str, cap: Option<String>| {
+                    let consumer = &consumer;
+                    async move {
+                        let session = consumer.connect(exposer_id).await.expect("connect");
+                        match ServiceStream::open_with(&session, service, cap).await {
+                            Ok(_) => panic!("dial for {service:?} must be refused, not served"),
+                            Err(message) => message,
+                        }
+                    }
+                };
+
+                // (a) a STRANGER: no token at all -> gate refuses (Missing) -> uniform "refused".
+                let stranger = dial("ssh", None).await;
+                // (b) a REVOKED holder: presents the now-denylisted `ssh` slip -> gate refuses (Revoked).
+                let revoked = dial("ssh", Some(revoked_slip.link().expect("link"))).await;
+                // (c) an UNKNOWN-SERVICE probe by a stranger: gate refuses the unknown name -> uniform.
+                let unknown = dial("admin", None).await;
+                // (d) a WRONG-SERVICE slip: a valid, UNREVOKED slip for `web` presented for `ssh` -> gate
+                //     refuses (NotGranted). Distinct internal reason, must still be the same wire string.
+                let wrong_slip = signet.mint(&svc("web"), hour).expect("mint web slip");
+                let not_granted = dial("ssh", Some(wrong_slip.link().expect("link"))).await;
+
+                // The whole point: all four are BYTE-IDENTICAL. A walker cannot tell revoked from stranger
+                // from not-granted, and cannot confirm `ssh` exists or that `admin` does not.
+                assert_eq!(
+                    stranger, revoked,
+                    "a revoked holder and a stranger must get byte-identical refusals (no revocation oracle)"
+                );
+                assert_eq!(
+                    stranger, unknown,
+                    "an unknown-service probe must be indistinguishable from a refused known service"
+                );
+                assert_eq!(
+                    stranger, not_granted,
+                    "a not-granting slip must get the same refusal as a stranger (no capability oracle)"
+                );
+
+                // And the refusal reveals NOTHING: no reason word, no service name, no menu.
+                for leaked in [
+                    "capability",
+                    "revoked",
+                    "requires",
+                    "grant",
+                    "exposes",
+                    "unknown",
+                    "ssh",
+                    "web",
+                    "admin",
+                ] {
+                    assert!(
+                        !stranger.contains(leaked),
+                        "the uniform refusal must not leak {leaked:?}: {stranger:?}"
+                    );
+                }
+
+                let _ = std::fs::remove_file(&path);
+            })
+            .await;
+    }
+
+    /// The unknown-service menu must not cross the wire even to an ADMITTED caller: under an open gate every
+    /// dialer is admitted, yet a probe for a name the node does not expose still gets the uniform refusal,
+    /// never the sorted "this node exposes: ..." menu that used to enumerate the surface. (The teaching hint
+    /// returns as the gated `control.services` verb, not as a free menu on the wrong-name path.)
+    #[tokio::test]
+    async fn an_unknown_service_probe_never_gets_the_menu_even_when_admitted() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut map = HashMap::new();
+                map.insert(
+                    "cam".to_owned(),
+                    Target::RawStream(RawStream::from_reader(Box::new(&b"x"[..]))),
+                );
+                map.insert(
+                    "mic".to_owned(),
+                    Target::RawStream(RawStream::from_reader(Box::new(&b"x"[..]))),
+                );
+                let exposer = Exposer {
+                    services: Services(map),
+                    registry: std::sync::Arc::new(Registry::new()),
+                    gate: Gate::Open,
+                };
+
+                let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
+                let exposer_id = exposer_node.node_id();
+                let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+                tokio::task::spawn_local(async move {
+                    exposer.run(&exposer_node).await.expect("exposer runs");
+                });
+
+                let session = consumer.connect(exposer_id).await.expect("connect");
+                let Err(message) = ServiceStream::open(&session, "nope").await else {
+                    panic!("an unknown service must be refused, not served");
+                };
+                for leaked in ["cam", "mic", "exposes", "unknown"] {
+                    assert!(
+                        !message.contains(leaked),
+                        "an admitted unknown-service probe must not learn the menu; leaked {leaked:?}: {message:?}"
+                    );
+                }
+            })
+            .await;
     }
 }
