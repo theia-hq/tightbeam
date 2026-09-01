@@ -25,11 +25,13 @@ use crate::protocol::{Request, Response};
 use crate::raw_stream::RawStream;
 use crate::{pipe_stdio_bridge, splice, splice_halves};
 
-/// How long to wait for a raw-stream open to complete before dropping the stream. A `fifo:` `open()`
-/// blocks until a peer opens the other end (POSIX), so an admitted peer that requests a FIFO whose writer
-/// never appears would park the serving task indefinitely, one layer deeper than the pre-gate
-/// [`REQUEST_READ_TIMEOUT`] (which has already elapsed by the time a target is dialed). Mirror that
-/// timeout on the open so a never-opened FIFO cannot pin a stream slot forever.
+/// How long to wait for a `fifo:` WRITER before dropping the stream. The FIFO open itself is NONBLOCKING
+/// (`O_NONBLOCK`, so it returns a valid fd at once with no writer and never parks a thread), but a writer-less
+/// FIFO reads as instant EOF, which is not a real byte stream. So the raw-stream open awaits readable readiness
+/// (a writer connecting/writing) bounded by this timeout; on elapse the fd is dropped (cheap, no parked thread)
+/// and the stream is refused, one layer deeper than the pre-gate [`REQUEST_READ_TIMEOUT`] (which has already
+/// elapsed by the time a target is dialed). A regular-file open has no writer to wait for and is not bounded by
+/// this.
 pub(crate) const RAW_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long to wait for a connector to send its opening request before dropping the stream. Bounds the
@@ -43,16 +45,15 @@ const MAX_SESSIONS: usize = 256;
 /// The maximum number of in-flight streams per session, bounding what a single connected peer can pin.
 const MAX_STREAMS_PER_SESSION: usize = 256;
 
-/// The maximum number of raw-stream opens (`file:`/`fifo:`/`stdin:`) in flight across the whole node. A
-/// `fifo:` open blocks a tokio blocking-pool thread until a writer appears (up to [`RAW_STREAM_OPEN_TIMEOUT`],
-/// and the thread can leak past it since `timeout` cancels the await, not the blocking syscall). The
-/// per-open timeout bounds ONE open, but not a flood: without a concurrency cap an admitted peer (or anyone
-/// under `--public`) could request hundreds of never-written `fifo:` streams and park hundreds of blocking
-/// threads at once, saturating the pool (tokio's default is 512) and starving all other `spawn_blocking`
-/// work. This semaphore caps concurrent opens well below the pool so parked opens can never approach it; a
-/// request over the cap is refused cleanly rather than parking one more thread. Small because a legitimate
-/// node serves a handful of raw streams, never hundreds; `file:`/`stdin:` opens return fast and hold a
-/// permit only briefly, so the cap does not penalize the common single-stream case.
+/// The maximum number of raw-stream opens (`file:`/`fifo:`/`stdin:`) in flight across the whole node. The
+/// real invariant that keeps a flood safe is that the open NEVER PARKS: a `fifo:`/`file:` open is nonblocking
+/// (`O_NONBLOCK`, guard 2 in [`crate::raw_stream`]), so it returns at once with no writer and a writer-less
+/// FIFO is awaited via the reactor (an fd registration, not a blocking-pool thread), not parked in a syscall.
+/// So no flood can exhaust the blocking pool the way a blocking open once could (issue #25). This semaphore is
+/// kept purely as cheap defense-in-depth: a bound on concurrent in-flight opens is healthy regardless (it
+/// caps the fds a peer can hold mid-open), and it costs the common single-stream case nothing (one permit,
+/// briefly held). Small because a legitimate node serves a handful of raw streams, never hundreds; a request
+/// over the cap is refused cleanly.
 const RAW_STREAM_OPEN_PERMITS: usize = 16;
 
 /// The single, indistinguishable refusal a not-admitted dialer receives on the wire. A dialer the gate does
@@ -311,9 +312,9 @@ impl Exposer {
         } = self;
         let services = Arc::new(services);
         let gate = Arc::new(gate);
-        // Cap concurrent raw-stream opens across the whole node (all sessions share this one semaphore), so a
-        // flood of never-written `fifo:` opens cannot park unbounded blocking threads. See
-        // `RAW_STREAM_OPEN_PERMITS`.
+        // Cap concurrent raw-stream opens across the whole node (all sessions share this one semaphore) as
+        // cheap defense-in-depth: the nonblocking open cannot park a thread, so this bounds the fds held
+        // mid-open, not a leak. See `RAW_STREAM_OPEN_PERMITS`.
         let raw_stream_opens = Arc::new(Semaphore::new(RAW_STREAM_OPEN_PERMITS));
         let mut sessions = FuturesUnordered::new();
         loop {
@@ -468,11 +469,11 @@ where
         // device, a directory, a symlink, a FIFO whose writer never appears, or a `stdin:` already taken by a
         // concurrent connection (the single-consumer refusal).
         Some(Target::RawStream(stream)) => {
-            // Take a raw-stream open permit BEFORE opening (a `fifo:` open blocks a thread until a writer
-            // appears): `try_acquire` refuses immediately when the cap is reached rather than parking another
-            // blocking thread, so a flood of never-written `fifo:` opens cannot saturate the pool. The permit
-            // is held only across the open (the splice below holds no blocking thread) and dropped when
-            // `_permit` leaves scope. See `RAW_STREAM_OPEN_PERMITS`.
+            // Take a raw-stream open permit BEFORE opening, as defense-in-depth (the open is nonblocking and
+            // cannot park a thread, so this bounds the fds a peer holds mid-open, not a leak): `try_acquire`
+            // refuses immediately over the cap rather than admitting one more concurrent open. The permit is
+            // held only across the open (the splice below holds none) and dropped when `_permit` leaves scope.
+            // See `RAW_STREAM_OPEN_PERMITS`.
             let opened = match raw_stream_opens.try_acquire() {
                 Ok(_permit) => stream.open().await,
                 Err(_at_cap) => {
@@ -1281,14 +1282,19 @@ mod tests {
         (client_read, serve)
     }
 
-    /// AVAILABILITY (Adversary A-1, delib 05): a flood of never-written `fifo:` opens cannot park more than
-    /// `RAW_STREAM_OPEN_PERMITS` blocking threads at once. With a cap of N, launch N+K concurrent opens of a
-    /// FIFO that has no writer: exactly N acquire a permit and park in the blocking open (no `Response` yet),
-    /// while every over-cap open is refused CLEANLY and FAST with the cap message, never parking one more
-    /// thread. Proven with a small explicit permit count so the test does not wait the full open timeout.
+    /// AVAILABILITY (Adversary A-1, delib 05, issue #25): a flood of never-written `fifo:` opens is bounded
+    /// by `RAW_STREAM_OPEN_PERMITS` and, crucially, parks NO threads (the open is nonblocking; a writer-less
+    /// FIFO is awaited via the reactor, not a blocking-pool thread). With a cap of N, launch N+K concurrent
+    /// opens of a writer-less FIFO: exactly N acquire a permit and wait for a writer (no `Response` yet, no
+    /// parked thread), while every over-cap open is refused CLEANLY and FAST with the cap message. Proven with
+    /// a small explicit permit count so the test does not wait the full writer-wait timeout.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_flood_of_fifo_opens_cannot_exceed_the_cap() {
         use tokio::io::AsyncReadExt as _;
+
+        // Hold the writer-wait lock so the no-leak test (which SHRINKS the writer-wait) cannot run concurrently
+        // and make these parked opens time out early; here the wait must stay long so they genuinely park.
+        let _lock = crate::raw_stream::WRITER_WAIT_TEST_LOCK.lock().await;
 
         let fifo = never_written_fifo("flood");
         let services = std::sync::Arc::new(services(&[&format!("pipe=fifo:{}", fifo.display())]));
@@ -1349,16 +1355,10 @@ mod tests {
         }
 
         // Release the parked opens so the test's runtime can shut down: open the FIFO's write end, which is the
-        // writer they were blocking for. Their `open()` completes, the blocking threads return, and the serving
-        // futures finish. (In production these threads leak until a writer appears or the process exits, which
-        // is exactly why the cap above exists; the test just supplies the writer to avoid leaking into the next
-        // test.) The open is itself blocking (a FIFO open for write blocks until a reader is present, which the
-        // parked reads are), so it runs off the async runtime.
-        // Free the parked blocking `open`s so no thread leaks into the next test: open the FIFO `O_RDWR`
-        // (which never blocks) so the parked read-`open`s return, then abort the serving tasks. In production
-        // an unwritten FIFO's `open` leaks its blocking thread until a writer appears or the process exits,
-        // which is exactly the resource the cap bounds; the test supplies a writer so the leak does not bleed
-        // into the next test.
+        // writer they were awaiting. Their reactor readiness fires, the served splice runs, and the futures
+        // finish. Nothing was leaked to clean up (the open is nonblocking and the wait is a reactor
+        // registration, not a parked thread); this write end just unblocks the writer-wait so the tasks end
+        // cleanly rather than being aborted mid-wait. Opening the FIFO `O_RDWR` never blocks.
         let writer_path = fifo.clone();
         tokio::task::spawn_blocking(move || {
             use std::os::unix::fs::OpenOptionsExt as _;

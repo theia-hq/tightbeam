@@ -18,8 +18,13 @@
 //! 1. **Regular-file-or-FIFO only.** `fstat` the opened fd and allow ONLY `S_ISREG` or `S_ISFIFO`. A block
 //!    or character device (`/dev/zero`, `/dev/urandom`) is an infinite drain; a directory or socket is not a
 //!    byte source. All are refused, loudly at open, never as a hang.
-//! 2. **Blocking-open timeout.** A `fifo:` `open()` for read blocks until a writer opens the other end;
-//!    bound it with [`RAW_STREAM_OPEN_TIMEOUT`] so a FIFO whose writer never appears cannot pin the task.
+//! 2. **Nonblocking open, bounded writer-wait.** The open uses `O_NONBLOCK`, so a read-only FIFO `open()`
+//!    returns IMMEDIATELY with a valid fd even with no writer present: no thread ever parks in the syscall.
+//!    But a writer-less FIFO reads as instant EOF, which is not a real byte stream, so the responder then
+//!    awaits READABLE readiness on the fd (a writer connecting/writing) bounded by [`RAW_STREAM_OPEN_TIMEOUT`]
+//!    via [`tokio::io::unix::AsyncFd`]. On elapse it drops the fd (cheap, no parked thread) and refuses,
+//!    same message as a blocking timeout would have given. A regular file needs no writer, so it skips the
+//!    wait and reads immediately.
 //! 3. **No symlink / no traversal at the final component.** Open with `O_NOFOLLOW`, so a symlink AT the path
 //!    the operator named is refused (a swapped final component cannot redirect the read). The path is not
 //!    otherwise widened: the operator named it, and only it is opened.
@@ -28,9 +33,14 @@
 //!    file" is unrepresentable; the splice uses `splice_halves` with `io::sink()` upstream, never the
 //!    duplex `splice`. A writable direction, if ever wanted, is a separate explicit thing, not this.
 
-use std::os::fd::FromRawFd as _;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+use std::io;
+use std::os::fd::{FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
+
+use tokio::io::unix::AsyncFd;
 
 use crate::tunnel::{BoxRead, RAW_STREAM_OPEN_TIMEOUT};
 
@@ -56,7 +66,11 @@ pub struct RawStream(Source);
 #[derive(Debug, Clone)]
 enum Source {
     /// A path (`file:`/`fifo:`) opened under the four guards. Cheap to clone (a path + a kind), re-opened per
-    /// connection: two peers each reading the same file is fine.
+    /// connection. What a re-open MEANS depends on the kind: a regular `file:` re-open is safe fan-out (each
+    /// reader gets its own offset over the same static bytes, so two peers reading one file both see the whole
+    /// file). A `fifo:` re-open is NOT fan-out: a FIFO is a stream, and concurrent readers of one writer SPLIT
+    /// its bytes (each byte is delivered to exactly one reader), so two peers reading one live `fifo:` silently
+    /// corrupt each other's stream. A `fifo:` is effectively single-consumer-at-a-time; expose one to one peer.
     Path { path: PathBuf, kind: Kind },
     /// This process's standard input (`stdin:`), a SINGLE-CONSUMER source: fd 0 is one non-re-openable
     /// stream, so it is taken once. See [`Stdin`].
@@ -164,52 +178,110 @@ impl RawStream {
 }
 
 /// Open a path source under the four guards and box its reader. Split out from [`RawStream::open`] so the
-/// `stdin:` arm (no path, no guards) reads cleanly beside it.
+/// `stdin:` arm (no path, no guards) reads cleanly beside it. The guarded open is NONBLOCKING (guard 2), so it
+/// never parks a thread: for a FIFO it returns a valid fd at once even with no writer, and this function then
+/// awaits a WRITER (readable readiness) bounded by [`RAW_STREAM_OPEN_TIMEOUT`] before handing back the stream,
+/// so the peer gets real bytes, not an instant writer-less EOF. A regular file has no writer to wait for and
+/// is handed back immediately.
 async fn open_path(path: PathBuf, kind: Kind) -> eyre::Result<BoxRead> {
-    // Guard 2 (blocking-open timeout): the `open()` itself blocks for a FIFO with no writer, so it runs on a
-    // blocking thread bounded by the timeout. On elapse the AWAIT is abandoned and the stream is refused, but
-    // `tokio::time::timeout` cancels the await, not the blocking syscall: the parked thread leaks until a
-    // writer appears or the process exits. The per-open timeout bounds ONE open; a FLOOD of never-written
-    // FIFOs is bounded separately by the `RAW_STREAM_OPEN_PERMITS` semaphore the serve path holds around this
-    // call, so parked opens can never approach the blocking-pool size.
-    let for_error = path.clone();
-    let opened = tokio::time::timeout(
-        RAW_STREAM_OPEN_TIMEOUT,
-        tokio::task::spawn_blocking(move || open_guarded(&path, kind)),
-    )
-    .await;
+    // The open is immediate and synchronous (nonblocking, no parked thread), so it runs inline; no
+    // `spawn_blocking`, so nothing can leak past the timeout (that leak was the bug in issue #25).
+    let opened = open_guarded(&path, kind)?;
     match opened {
-        Ok(Ok(Ok(file))) => Ok(Box::new(file)),
-        Ok(Ok(Err(refusal))) => Err(refusal),
-        Ok(Err(join)) => Err(eyre::eyre!("raw-stream open task failed: {join}")),
-        Err(_elapsed) => eyre::bail!(
-            "opening {} timed out after {}s (a FIFO with no writer?)",
-            for_error.display(),
-            RAW_STREAM_OPEN_TIMEOUT.as_secs()
-        ),
+        // A regular file needs no writer: read it straight away.
+        Opened::Regular(fd) => Ok(Box::new(NonblockingReader::new(fd)?)),
+        // A FIFO reads as instant EOF with no writer, so wait for one (readable readiness) up to the timeout
+        // before calling the stream open. On elapse, drop the fd (cheap, no parked thread) and refuse.
+        Opened::Fifo(fd) => {
+            let reader = NonblockingReader::new(fd)?;
+            match tokio::time::timeout(writer_wait_timeout(), reader.readable()).await {
+                Ok(Ok(())) => Ok(Box::new(reader)),
+                Ok(Err(err)) => {
+                    Err(eyre::Error::from(err).wrap_err(format!("waiting on {}", path.display())))
+                }
+                Err(_elapsed) => eyre::bail!(
+                    "opening {} timed out after {}s (a FIFO with no writer?)",
+                    path.display(),
+                    writer_wait_timeout().as_secs()
+                ),
+            }
+        }
     }
 }
 
-/// The blocking body of [`open_path`]: open the final path component with `O_NOFOLLOW` (guard 3), `fstat` the
-/// opened fd and enforce the type (guard 1). Runs on a blocking thread because a FIFO open blocks until a
-/// writer appears; the caller bounds it with a timeout (guard 2).
-fn open_guarded(path: &Path, kind: Kind) -> eyre::Result<tokio::fs::File> {
-    // Guard 3 (no symlink / no traversal at the final component): `O_NOFOLLOW` refuses a symlink AT the path
-    // the operator named, so a swapped final component (a TOCTOU race, or a planted symlink) cannot redirect
-    // the read to another file. `O_RDONLY` fixes the direction at the syscall (guard 4): the fd can only be
-    // read, so peer bytes can never be written into it. Blocking (no `O_NONBLOCK`) so a FIFO read gets a
-    // real writer, with the timeout above as the bound.
+/// How long the FIFO writer-wait may run. Production always uses [`RAW_STREAM_OPEN_TIMEOUT`]; under `cfg(test)`
+/// a test can shrink it (via [`set_writer_wait_timeout_for_test`]) so a no-leak test can drive many writer-less
+/// opens in sequence without waiting the full production budget each time.
+#[cfg(not(test))]
+fn writer_wait_timeout() -> core::time::Duration {
+    RAW_STREAM_OPEN_TIMEOUT
+}
+
+#[cfg(test)]
+static WRITER_WAIT_MILLIS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The writer-wait duration for tests: the test override if one was set, else [`RAW_STREAM_OPEN_TIMEOUT`].
+#[cfg(test)]
+fn writer_wait_timeout() -> core::time::Duration {
+    match WRITER_WAIT_MILLIS.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => RAW_STREAM_OPEN_TIMEOUT,
+        millis => core::time::Duration::from_millis(millis),
+    }
+}
+
+/// Serializes the tests that depend on the writer-wait duration (the one that SHRINKS it to prove no thread
+/// leaks, and the flood test that needs it LONG so its opens stay parked), since [`WRITER_WAIT_MILLIS`] is
+/// process-global and tests run in parallel. Async-aware so a holder can await while holding it. A test holds
+/// this guard for as long as it depends on the value.
+#[cfg(test)]
+pub(crate) static WRITER_WAIT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Shrink the FIFO writer-wait for a test so a writer-less open refuses quickly instead of after the full
+/// production budget. `RAII`-style: restores the previous value on drop so one test cannot bleed into another.
+/// Serialize with [`WRITER_WAIT_TEST_LOCK`] against the flood test, which needs the wait to stay long.
+#[cfg(test)]
+fn set_writer_wait_timeout_for_test(millis: u64) -> impl Drop {
+    let previous = WRITER_WAIT_MILLIS.swap(millis, core::sync::atomic::Ordering::Relaxed);
+    struct Restore(u64);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WRITER_WAIT_MILLIS.store(self.0, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    Restore(previous)
+}
+
+/// A guarded, nonblocking-open fd plus which kind of object it is, so [`open_path`] knows whether to wait for a
+/// writer (a FIFO) or read straight away (a regular file).
+enum Opened {
+    /// A regular file: no writer to wait for.
+    Regular(OwnedFd),
+    /// A FIFO: read-side is EOF until a writer appears, so [`open_path`] awaits readable readiness first.
+    Fifo(OwnedFd),
+}
+
+/// Open the final path component under three of the four guards and return its fd. `O_NONBLOCK` (guard 2) so a
+/// FIFO open returns at once with no writer present and NEVER parks a thread; `O_NOFOLLOW` (guard 3) refuses a
+/// symlink at the final component; `fstat` on the opened fd enforces the type (guard 1); `O_RDONLY` fixes the
+/// direction (guard 4). Synchronous and immediate: the nonblocking open cannot block, so it needs no blocking
+/// thread and the [`open_path`] timeout guards only the subsequent writer-wait, not this call.
+fn open_guarded(path: &Path, kind: Kind) -> eyre::Result<Opened> {
     let mut c_path = path.as_os_str().as_bytes().to_vec();
     if c_path.contains(&0) {
         eyre::bail!("path {} contains a NUL byte", path.display());
     }
     c_path.push(0);
+    // TODO(#25-followup): `O_NONBLOCK` does NOT cover a regular `file:` open on a hung mount (a wedged NFS
+    // server): a regular-file open ignores `O_NONBLOCK` and blocks in the kernel until the mount responds.
+    // This inline (non-`spawn_blocking`) open would then park the async task itself. That variant needs pool
+    // isolation (a dedicated blocking pool the open can be abandoned on), out of scope for the FIFO leak fix.
     // SAFETY: `c_path` is a NUL-terminated C string that outlives the call; the flags are valid; a failed
-    // open returns -1 and is handled below, never wrapped as an fd.
+    // open returns -1 and is handled below, never wrapped as an fd. `O_NONBLOCK` is a no-op on a regular file
+    // (local disk opens do not block); on a FIFO it is what makes the read-only open return without a writer.
     let fd = unsafe {
         libc::open(
             c_path.as_ptr().cast::<libc::c_char>(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
         )
     };
     if fd < 0 {
@@ -225,19 +297,26 @@ fn open_guarded(path: &Path, kind: Kind) -> eyre::Result<tokio::fs::File> {
         }
         return Err(eyre::Error::from(err).wrap_err(format!("cannot open {}", path.display())));
     }
-    // SAFETY: `fd` is a fresh, owned, valid descriptor (checked >= 0 above); `File::from_raw_fd` takes
+    // SAFETY: `fd` is a fresh, owned, valid descriptor (checked >= 0 above); `OwnedFd::from_raw_fd` takes
     // ownership so it is closed on drop, including every early-return error path below.
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
     // Guard 1 (regular-file-or-FIFO only): `fstat` the fd we actually hold (not the path again, which would
     // reintroduce a TOCTOU) and allow ONLY a regular file or a FIFO. A block/char device (`/dev/zero`,
     // `/dev/urandom` = infinite drain), a directory, a socket: all refused.
-    let meta = file
-        .metadata()
-        .map_err(|e| eyre::Error::from(e).wrap_err(format!("cannot stat {}", path.display())))?;
-    // `MetadataExt::mode` is `u32`, but `libc::S_IF*` are `mode_t`, which is `u16` on some targets (macOS)
-    // and `u32` on others (linux); widen the libc constants to `u32` so the mask compares on every platform.
-    let file_type = std::os::unix::fs::MetadataExt::mode(&meta) & u32::from(libc::S_IFMT);
+    // SAFETY: `fd` is a valid owned descriptor; `fstat` writes a fully-initialized `stat` into `st` and
+    // returns 0, or -1 on error (handled below). `st` is zeroed first so no field is read uninitialized.
+    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+    let rc = unsafe { libc::fstat(std::os::fd::AsRawFd::as_raw_fd(&fd), &raw mut st) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(eyre::Error::from(err).wrap_err(format!("cannot stat {}", path.display())));
+    }
+    // Mask in `mode_t` space (`st_mode` and the `S_IF*` constants share that type, `u16` on macOS / `u32` on
+    // linux), then widen the masked result ONCE to `u32` for the platform-independent `describe_type` and the
+    // comparisons below. Masking first keeps this free of a per-platform `u32::from` that would be an identity
+    // conversion (clippy `useless_conversion`) where `mode_t` is already `u32`.
+    let file_type = u32::from(st.st_mode & libc::S_IFMT);
     let is_reg = file_type == u32::from(libc::S_IFREG);
     let is_fifo = file_type == u32::from(libc::S_IFIFO);
     match kind {
@@ -255,7 +334,74 @@ fn open_guarded(path: &Path, kind: Kind) -> eyre::Result<tokio::fs::File> {
         _ => {}
     }
 
-    Ok(tokio::fs::File::from_std(file))
+    Ok(if is_fifo {
+        Opened::Fifo(fd)
+    } else {
+        Opened::Regular(fd)
+    })
+}
+
+/// An [`AsyncRead`](tokio::io::AsyncRead) over a nonblocking fd (guard 2's `O_NONBLOCK` open), so the guarded
+/// FIFO/file open never needs a blocking thread. Registers the fd with the tokio reactor via [`AsyncFd`]:
+/// `EAGAIN` (would-block) yields readable readiness rather than a parked syscall, so a slow or writer-less FIFO
+/// costs a poll registration, never a leaked blocking-pool thread. A regular file is always readiness-ready, so
+/// this reads it inline with no wait.
+struct NonblockingReader(AsyncFd<OwnedFd>);
+
+impl NonblockingReader {
+    /// Register the nonblocking fd with the reactor. Fails only if the reactor cannot take the fd.
+    fn new(fd: OwnedFd) -> io::Result<Self> {
+        Ok(Self(AsyncFd::new(fd)?))
+    }
+
+    /// Await the fd becoming readable: for a FIFO this resolves when a WRITER connects or writes (so the peer
+    /// gets real bytes, not the instant EOF a writer-less nonblocking FIFO would read as). [`open_path`] bounds
+    /// this with [`RAW_STREAM_OPEN_TIMEOUT`]; on elapse the fd is dropped, no thread ever parked.
+    async fn readable(&self) -> io::Result<()> {
+        self.0.readable().await?.retain_ready();
+        Ok(())
+    }
+}
+
+impl tokio::io::AsyncRead for NonblockingReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            let mut ready = match self.0.poll_read_ready(cx) {
+                Poll::Ready(Ok(ready)) => ready,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            };
+            // SAFETY: a `read(2)` writes at most `len` bytes into the fd's readable region of `buf` and never
+            // reads the uninitialized tail, so the count it returns is exactly how many were initialized.
+            let unfilled = unsafe { buf.unfilled_mut() };
+            let rc = unsafe {
+                libc::read(
+                    std::os::fd::AsRawFd::as_raw_fd(self.0.get_ref()),
+                    unfilled.as_mut_ptr().cast::<libc::c_void>(),
+                    unfilled.len(),
+                )
+            };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    // The reactor said readable but the read would block (a spurious wakeup): clear readiness
+                    // and re-poll so the next wakeup re-arms it.
+                    ready.clear_ready();
+                    continue;
+                }
+                return Poll::Ready(Err(err));
+            }
+            let n = rc as usize;
+            // SAFETY: `read` initialized exactly `n` bytes of the unfilled region (checked `rc >= 0` above).
+            unsafe { buf.assume_init(n) };
+            buf.advance(n);
+            return Poll::Ready(Ok(()));
+        }
+    }
 }
 
 /// Whether fd 0 is a terminal. A `stdin:` expose with no pipe would consume the operator's keystrokes, so it
@@ -308,6 +454,18 @@ mod tests {
             std::process::id(),
             n
         ))
+    }
+
+    /// Make a fresh scratch FIFO with `mkfifo`, cleaned by the caller.
+    fn scratch_fifo(tag: &str) -> std::path::PathBuf {
+        let path = scratch(tag);
+        let mut c_path = path.clone().into_os_string().into_encoded_bytes();
+        c_path.push(0);
+        // SAFETY: `c_path` is a NUL-terminated C string that outlives the call; a failed `mkfifo` returns -1
+        // and the assert fails. Mode 0600: scratch, this process only.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr().cast::<libc::c_char>(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo {} failed", path.display());
+        path
     }
 
     /// (a) `file:` to a regular file sources its exact bytes.
@@ -454,5 +612,77 @@ mod tests {
                 .contains("single-consumer source, already in use"),
             "the refusal must name the single-consumer contract: {err}"
         );
+    }
+
+    /// (a) NO-LEAK: a writer-less `fifo:` open times out cleanly and parks NO blocking-pool thread (issue #25).
+    /// Proven deterministically, no thread counting: run on a runtime whose BLOCKING pool holds exactly ONE
+    /// thread (`max_blocking_threads(1)`) and open many writer-less FIFOs in sequence. The OLD blocking open ran
+    /// inside `spawn_blocking` and would LEAK its one parked thread on the very first writer-less open, so the
+    /// second `spawn_blocking` (or any other blocking work) would starve forever and this test would hang. The
+    /// nonblocking open uses NO `spawn_blocking` for the FIFO open, so all N sail through and each still refuses
+    /// on the writer-wait timeout. The whole loop is itself bounded by an outer timeout, so a regression HANGS
+    /// -> fails, it does not pass slowly.
+    #[test]
+    fn writerless_fifo_opens_do_not_park_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("build a single-blocking-thread runtime");
+        runtime.block_on(async {
+            // Hold the writer-wait lock so the flood test (which needs the wait LONG) cannot run while we
+            // shrink it below.
+            let _lock = super::WRITER_WAIT_TEST_LOCK.lock().await;
+            const N: usize = 16;
+            // Shrink the writer-wait so each writer-less open refuses in ~50ms instead of the production budget.
+            let _short = super::set_writer_wait_timeout_for_test(50);
+            let loop_body = async {
+                for _ in 0..N {
+                    let fifo = scratch_fifo("noleak");
+                    let stream =
+                        RawStream::fifo(&fifo.to_string_lossy(), "pipe=fifo:x").expect("parse fifo:");
+                    let opened = stream.open().await;
+                    assert!(
+                        opened.is_err(),
+                        "a writer-less FIFO open must be REFUSED (no writer), not returned as a stream"
+                    );
+                    let _ = std::fs::remove_file(&fifo);
+                }
+            };
+            // Generous outer bound: if a regression reintroduces `spawn_blocking`, the FIRST open leaks the lone
+            // blocking thread and the loop stalls, tripping this timeout instead of passing.
+            tokio::time::timeout(core::time::Duration::from_secs(20), loop_body)
+                .await
+                .expect("writer-less FIFO opens must not park the blocking pool (issue #25 regression)");
+        });
+    }
+
+    /// (b) A `fifo:` WITH a writer streams its bytes end to end: the open resolves when the writer connects, and
+    /// the reader yields exactly what the writer wrote (proving the writer-wait detects a real writer and the
+    /// nonblocking read adapter delivers the bytes, not an empty EOF).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fifo_with_a_writer_streams_its_bytes() {
+        let fifo = scratch_fifo("writer");
+        let body = b"streamed through a named pipe";
+
+        // Write from a blocking thread: opening a FIFO for write blocks until the reader's open is present,
+        // which the `stream.open()` below provides.
+        let writer_path = fifo.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .and_then(|mut f| f.write_all(body))
+                .expect("write into the FIFO");
+        });
+
+        let stream = RawStream::fifo(&fifo.to_string_lossy(), "pipe=fifo:x").expect("parse fifo:");
+        let mut source = stream.open().await.expect("open the FIFO with a writer");
+        writer.await.expect("writer task");
+        let mut got = Vec::new();
+        source.read_to_end(&mut got).await.expect("read the stream");
+        assert_eq!(got, body, "a FIFO with a writer streams its exact bytes");
+
+        let _ = std::fs::remove_file(&fifo);
     }
 }
