@@ -5,7 +5,7 @@
 //! throwaway dial would use. The same secret does double duty: bifrost binds the transport under it (so
 //! the node is reachable at a stable `NodeId`) and [`nauthy::Identity`] roots caps at it (so a minted cap
 //! verifies against the identity peers dial). It persists at `~/.config/tightbeam/identity.key`, mode
-//! 0600, overridable with `--key` / `TIGHTBEAM_KEY`.
+//! 0600, overridable with an explicit key path (or `TIGHTBEAM_KEY`).
 //!
 //! The secret is a [`Secret`] newtype, never a bare `[u8; 32]`: it zeroizes on drop so the key does not
 //! linger in freed memory, and it is unwrapped only at the two boundaries that need it raw, the transport
@@ -96,7 +96,8 @@ pub fn ssh_host_seed(secret: &[u8; 32]) -> [u8; 32] {
 
 /// Write a provided secret as this node's persisted identity: how a machine ADOPTS a minted device seed
 /// to BECOME that identity. Overwrites any key at the path (adopting replaces this node's identity),
-/// mode 0600. The path is `--key` / `TIGHTBEAM_KEY` or the default; `expose` then binds under it.
+/// mode 0600. The path is the explicit one (or `TIGHTBEAM_KEY`) or the default; the exposer then binds
+/// under it.
 pub async fn write(secret: &[u8; 32], explicit: Option<&Path>) -> eyre::Result<()> {
     let path = match explicit {
         Some(path) => path.to_owned(),
@@ -112,7 +113,7 @@ pub async fn write(secret: &[u8; 32], explicit: Option<&Path>) -> eyre::Result<(
 
 /// Load the persisted secret, creating and saving a fresh one on first use.
 ///
-/// An explicit path (`--key` / `TIGHTBEAM_KEY`) overrides the default location. tightbeam's identity is
+/// An explicit path (or `TIGHTBEAM_KEY`) overrides the default location. tightbeam's identity is
 /// always persisted (unlike swoosh's reach-outward verbs) because a cap exposer must be reachable and
 /// verifiable at one stable key across runs.
 pub async fn load(explicit: Option<&Path>) -> eyre::Result<Secret> {
@@ -146,7 +147,8 @@ fn default_path() -> eyre::Result<PathBuf> {
     if let Some(path) = std::env::var_os("TIGHTBEAM_KEY") {
         return Ok(PathBuf::from(path));
     }
-    let home = std::env::var_os("HOME").ok_or_else(|| eyre!("HOME is not set; pass --key"))?;
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| eyre!("HOME is not set; set an explicit key path (or TIGHTBEAM_KEY)"))?;
     Ok(PathBuf::from(home)
         .join(".config")
         .join("tightbeam")

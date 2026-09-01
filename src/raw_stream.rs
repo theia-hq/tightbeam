@@ -1,6 +1,6 @@
 //! The raw-stream forward: source an already-open byte stream and splice it toward the peer. Three
 //! sources share one shape, so `expose` treats them all as a read-only [`crate::tunnel::Target::RawStream`]
-//! (inheriting the source-only splice and the `--public` refusal):
+//! (inheriting the source-only splice and the public-gate refusal):
 //!
 //! - `file:<path>` / `fifo:<path>` — open an OS object the operator named on disk. Its input is an
 //!   untrusted path resolved at DIAL time, so every open goes through four guards (each named at its site
@@ -8,10 +8,9 @@
 //! - `stdin:` — this process's own standard input (fd 0). No path, so none of the path guards apply; it is
 //!   a SINGLE-CONSUMER source (fd 0 is one non-re-openable stream) taken once and never re-armed.
 //!
-//! The path forms mirror `connect --to -` (which streams the service to the connector's stdout): where
-//! `--to -` pumps the far service to a running process's stdout, `file:`/`fifo:` pump the bytes of a path
-//! the operator already made, and `stdin:` pumps whatever a producer pipes in (`producer | tightbeam
-//! expose x=stdin:`).
+//! The path forms mirror piping a service to the connector's stdout: where that pumps the far service to a
+//! running process's stdout, `file:`/`fifo:` pump the bytes of a path the operator already made, and
+//! `stdin:` pumps whatever a producer pipes into this process's standard input.
 //!
 //! The four path guards (`file:`/`fifo:` only; `stdin:` has no path and inherits NONE of them):
 //!
@@ -62,7 +61,7 @@ enum Kind {
 #[derive(Debug, Clone)]
 pub struct RawStream(Source);
 
-/// The two sources a raw stream can splice from, sharing the read-only direction and the `--public` refusal.
+/// The two sources a raw stream can splice from, sharing the read-only direction and the public-gate refusal.
 #[derive(Debug, Clone)]
 enum Source {
     /// A path (`file:`/`fifo:`) opened under the four guards. Cheap to clone (a path + a kind), re-opened per

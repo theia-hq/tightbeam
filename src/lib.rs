@@ -81,8 +81,8 @@ where
     Ok(())
 }
 
-/// Pump this process's stdio against a peer service stream for an ssh-`ProxyCommand`-shaped bridge (`connect
-/// --to -`), finishing as soon as the PEER closes its write half.
+/// Pump this process's stdio against a peer service stream for an ssh-`ProxyCommand`-shaped bridge (piping
+/// the service to this process's stdout), finishing as soon as the PEER closes its write half.
 ///
 /// The asymmetry is the whole point, and the fix for the `ssh <peer> -- <cmd>` hang. The bridge's stdin is
 /// the local ssh's terminal, which never reaches EOF for the life of the session, so a symmetric

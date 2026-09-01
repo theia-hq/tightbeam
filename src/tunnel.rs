@@ -74,7 +74,8 @@ enum Target {
     /// tightbeam's own primitive, the raw-stream half: source an already-open byte stream and splice it
     /// toward the peer, either an OS object the operator named (`file:<path>` / `fifo:<path>`) or this
     /// process's own standard input (`stdin:`, a single-consumer source taken once). The reverse of
-    /// `connect --to -`. Carries a [`RawStream`] whose direction is fixed at parse time (a read-only
+    /// piping a service to the connector's stdout. Carries a [`RawStream`] whose direction is fixed at parse
+    /// time (a read-only
     /// source), so "write peer bytes back into the source" is unrepresentable rather than a runtime error.
     RawStream(RawStream),
     /// A named service handler (`sshd`, `fetch`, `diag`, ...) dispatched through the injected registry.
@@ -129,9 +130,10 @@ impl Services {
     /// The exposed names whose target is a [`Target::RawStream`] (a `file:`/`fifo:` path source, or `stdin:`).
     /// Like a keyless shell, a raw-stream source has no auth of its own: it serves a chosen path's bytes (or
     /// the piped stdin) to whoever the gate admits, so [`Exposer::new`] refuses it behind an [`Gate::Open`]
-    /// gate (a `--public file:` would exfil a secret, a `--public stdin:` the piped bytes, to anyone). A raw
-    /// forward (`host:port`/`unix:`) is a service the operator deliberately stood up, so it stays
-    /// `--public`-able; a bare file path or a piped stdin is one keystroke from a secret, so it does not.
+    /// gate (a public gate over a `file:` source would exfil a secret, over a `stdin:` source the piped
+    /// bytes, to anyone). A raw forward (`host:port`/`unix:`) is a service the operator deliberately stood
+    /// up, so it may still be a public gate; a bare file path or a piped stdin is one keystroke from a
+    /// secret, so it may not.
     fn raw_stream_names(&self) -> impl Iterator<Item = &str> {
         let Self(services) = self;
         services.iter().filter_map(|(name, target)| match target {
@@ -227,11 +229,11 @@ impl Registry {
 }
 
 /// Resolve the exposer's gate from the operator's choices, in ONE place so every embedder (tightbeam's own
-/// CLI and swoosh) applies the SAME policy: an explicit `--public` (and ONLY that) opens the gate; otherwise
-/// a family gate on the node's provisioned `signet`; an UNPROVISIONED node fails LOUD rather than ever
-/// defaulting to open. The caller loads the denylist and passes it as a value. This exists so the three
-/// security-relevant conventions (open-only-on-`--public`, fail-loud-on-unprovisioned, real-loaded-denylist)
-/// are enforced once, not hand-copied into each caller.
+/// CLI and swoosh) applies the SAME policy: an explicit `public` request (and ONLY that) opens the gate;
+/// otherwise a family gate on the node's provisioned `signet`; an UNPROVISIONED node fails LOUD rather than
+/// ever defaulting to open. The caller loads the denylist and passes it as a value. This exists so the
+/// three security-relevant conventions (open-only-when-`public`, fail-loud-on-unprovisioned,
+/// real-loaded-denylist) are enforced once, not hand-copied into each caller.
 pub fn resolve_gate(
     public: bool,
     signet: Option<NodeId>,
@@ -242,8 +244,8 @@ pub fn resolve_gate(
     }
     let root = signet.ok_or_else(|| {
         eyre::eyre!(
-            "this node has no signet to gate on: provision it with `adopt`, or pass --public to expose \
-             to anyone"
+            "this node has no signet to gate on: provision it (adopt a signet), or open it as a public \
+             gate to serve anyone"
         )
     })?;
     Ok(Gate::family(root.verify_key(), denylist))
@@ -274,21 +276,21 @@ impl Exposer {
             if matches!(gate, Gate::Open) && handler.requires_gate {
                 eyre::bail!(
                     "a `{scheme}:` service has no auth of its own and must be gated; \
-                     drop --public, which would expose it to anyone who reaches this node"
+                     a public gate would expose it to anyone who reaches this node"
                 );
             }
         }
         // A raw-stream source (`file:`/`fifo:`/`stdin:`) also has no auth of its own: under an open gate it
-        // would serve a chosen path's bytes (or the piped stdin) to anyone, so `--public file:<secret>` or
-        // `--public stdin:` would exfil it. Refuse it at the same door that refuses a public shell. A raw
-        // forward (`host:port`/`unix:`) stays open-able: it is a service the operator deliberately stood up,
-        // not a bare file path or a piped stream one keystroke from a key.
+        // would serve a chosen path's bytes (or the piped stdin) to anyone, so a public gate over a
+        // `file:<secret>` or a `stdin:` source would exfil it. Refuse it at the same door that refuses a
+        // public shell. A raw forward (`host:port`/`unix:`) stays open-able: it is a service the operator
+        // deliberately stood up, not a bare file path or a piped stream one keystroke from a key.
         if matches!(gate, Gate::Open)
             && let Some(name) = services.raw_stream_names().next()
         {
             eyre::bail!(
                 "a raw-stream service (`{name}`, a file:/fifo:/stdin: source) has no auth of its own and \
-                 must be gated; drop --public, which would serve its bytes to anyone who reaches this node"
+                 must be gated; a public gate would serve its bytes to anyone who reaches this node"
             );
         }
         Ok(Self {
@@ -437,9 +439,9 @@ where
             .await
             .map_err(Into::into);
     };
-    // A node exposing exactly one service should not require `--service`: if the request names no exposed
-    // service (a connector defaulting to `default`) and there is only one, resolve to it. Done BEFORE the
-    // gate so a delegated slip for that service still matches (the gate checks the RESOLVED service).
+    // A node exposing exactly one service should not require the request to name it: if the request names
+    // no exposed service (a connector defaulting to `default`) and there is only one, resolve to it. Done
+    // BEFORE the gate so a delegated slip for that service still matches (the gate checks the RESOLVED service).
     let service = resolve_single_service(service, services);
 
     let admitted = match admit(&gate, peer, request.capability.as_deref(), &service) {
@@ -569,7 +571,7 @@ fn admit(
 }
 
 /// Resolve the requested service against what is exposed: if it names no exposed service but exactly one
-/// service is exposed, return that one, so a single-service node needs no `--service`. Otherwise return
+/// service is exposed, return that one, so a single-service node needs no named service. Otherwise return
 /// the request unchanged (a multi-service node keeps it, to fail later with the "unknown service; this node
 /// exposes: …" hint rather than guessing which one was meant).
 fn resolve_single_service(requested: Service, services: &HashMap<String, Target>) -> Service {
@@ -592,7 +594,7 @@ fn resolve_single_service(requested: Service, services: &HashMap<String, Target>
 fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
     // `stdin:` is a raw-stream source with NO tail (this process's fd 0), so it is a zero-arg target routed
     // FIRST, before the bare-scheme handler arm would read `stdin` as a handler no registry holds. It shares
-    // the raw-stream direction and the `--public` refusal, but inherits none of the path guards (there is no
+    // the raw-stream direction and the public-gate refusal, but inherits none of the path guards (there is no
     // path). Anything after the colon is a typo: `stdin:` takes no argument.
     if addr == "stdin:" {
         return Ok(Target::RawStream(RawStream::stdin()?));
@@ -726,7 +728,7 @@ impl Connector {
 
     /// Reach the peer, confirm the gate ADMITS this connector, and bind the local port, returning a live
     /// [`PortForward`] ready to run. Admission is proven here, before any success is announced: a probe
-    /// stream sends the request and awaits the host's [`Response`], so a refusal (wrong `--service`, a
+    /// stream sends the request and awaits the host's [`Response`], so a refusal (an unexposed service, a
     /// revoked or non-granting cap, an unauthorized identity) surfaces as an `Err` from THIS call, carrying
     /// the host's reason, rather than a silently-reset connection once the caller has already printed
     /// "forwarding …". The caller announces readiness only after this returns `Ok`. Prints nothing.
@@ -755,8 +757,8 @@ impl Connector {
         })
     }
 
-    /// Reach the service over one stream and pipe it against this process's stdin/stdout (the `--to -`
-    /// stdout / ssh `ProxyCommand` shape): ssh speaks its protocol over our stdio and we carry it to the
+    /// Reach the service over one stream and pipe it against this process's stdin/stdout (piping the service
+    /// to this process's stdout, the ssh `ProxyCommand` shape): ssh speaks its protocol over our stdio and we carry it to the
     /// peer. The pump finishes when the peer closes, so a `-- <cmd>` invocation exits when its command does.
     pub async fn pipe_stdio<T: Transport, D: Discovery>(
         self,
@@ -821,7 +823,7 @@ impl<S: Session> PortForward<S> {
                 }
                 Some(result) = pipes.next(), if !pipes.is_empty() => {
                     if let Err(error) = result {
-                        // A refused stream (wrong `--service`, a revoked or non-granting cap) carries a
+                        // A refused stream (an unexposed service, a revoked or non-granting cap) carries a
                         // user-actionable reason. The core is print-free (a library embedder owns its own
                         // output), so route it through `tracing`; the CLI adapter surfaces it to the user.
                         tracing::warn!("connection failed: {error:#}");
@@ -910,8 +912,8 @@ where
     Ok(())
 }
 
-/// Open a service and, if the host accepts, pipe it against this process's stdin/stdout (the `--to -`
-/// stdout/ssh-`ProxyCommand` path). Same handshake as [`request_service`], but the local ends are the
+/// Open a service and, if the host accepts, pipe it against this process's stdin/stdout (piping the service
+/// to this process's stdout, the ssh-`ProxyCommand` path). Same handshake as [`request_service`], but the local ends are the
 /// process's own std streams, and the pump ([`pipe_stdio_bridge`]) returns when the PEER closes rather than
 /// waiting on a stdin that (at a terminal) never EOFs, so `ssh <peer> -- <cmd>` exits when the command does.
 async fn request_stdio<W, R>(request: Request, mut writer: W, mut reader: R) -> eyre::Result<()>
@@ -951,7 +953,7 @@ pub fn narrow_link(
     shorten: Option<Duration>,
 ) -> eyre::Result<String> {
     if service.is_none() && shorten.is_none() {
-        eyre::bail!("give --service and/or --expires to narrow the link");
+        eyre::bail!("narrow it by service and/or a shorter expiry");
     }
     let cap = Cap::parse(link)?;
     let shorten = shorten.map(nauthy::expires_in);
@@ -1126,7 +1128,7 @@ mod tests {
     #[test]
     fn an_exposer_refuses_a_public_raw_stream() {
         // A raw-stream source (`file:`/`fifo:`) has no auth of its own: under an open gate it would serve a
-        // chosen path's bytes to anyone, so `--public file:<secret>` would exfil it. Refused at the same door
+        // chosen path's bytes to anyone, so a public gate over `file:<secret>` would exfil it. Refused at the same door
         // as a public shell.
         let secret = services(&["leak=file:/etc/hosts"]);
         assert!(
@@ -1158,7 +1160,7 @@ mod tests {
     #[test]
     fn an_exposer_refuses_a_public_stdin() {
         // `stdin:` has no auth of its own: under an open gate it would pipe the producer's bytes to anyone, so
-        // `--public stdin:` would exfil them. Refused at the same door as a public shell or a public file:.
+        // a public gate over `stdin:` would exfil them. Refused at the same door as a public shell or a public file:.
         let piped = services(&["cam=stdin:"]);
         assert!(
             super::Exposer::new(piped, super::Registry::new(), Gate::Open).is_err(),
@@ -1182,7 +1184,7 @@ mod tests {
                 let exposer_id = exposer_node.node_id();
                 let consumer = Node::new(MemTransport::bind(), NoDiscovery);
 
-                // Drive the SERVE path directly. `Exposer::new`'s `--public` refusal for a raw-stream source
+                // Drive the SERVE path directly. `Exposer::new`'s public-gate refusal for a raw-stream source
                 // is covered separately (`an_exposer_refuses_a_public_stdin`); here we construct the exposer
                 // past that door so the open gate keeps the peer admitted with no token, and the test isolates
                 // the take-once + splice path a `stdin:` source runs.

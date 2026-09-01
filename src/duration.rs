@@ -1,11 +1,11 @@
-//! A short human duration like `2h`, `30m`, `90s`, for capability expiry flags.
+//! A short human duration like `2h`, `30m`, `90s`, for capability expiry.
 
 use core::str::FromStr;
 use core::time::Duration;
 
 /// A capability lifetime parsed from a suffixed number: `<n>s`, `<n>m`, `<n>h`, or `<n>d`.
 ///
-/// A domain scalar so a flag like `--expires 2h` reaches the command as a real [`Duration`], not a
+/// A domain scalar so an expiry like `2h` reaches the command as a real [`Duration`], not a
 /// string the handler re-parses. parse-don't-validate: an unparseable or zero span never becomes a
 /// `Lifetime`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
