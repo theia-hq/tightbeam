@@ -4788,7 +4788,3 @@ version = "0.0.0"
 [[patch.unused]]
 name = "bifrost-quirk"
 version = "0.0.0"
-
-[[patch.unused]]
-name = "sshh"
-version = "0.0.0"
