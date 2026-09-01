@@ -592,22 +592,43 @@ fn resolve_single_service(requested: Service, services: &HashMap<String, Target>
 /// (`host:port` or `unix:<path>`). All validated here so a typo fails at parse with a teaching message, not
 /// at dial time.
 fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
+    // A trailing `+lossy` is the operator's opt-in to raw-stream FAN-OUT (delib-20 SYNTHESIS + delib-24): the
+    // source may be reached by MANY consumers at once, and a consumer that falls behind has its bytes DROPPED
+    // rather than stall the producer or the others. It is a claim only the operator can make ("this stream
+    // tolerates loss"), so it is legal ONLY on the live single-writer sources `stdin:`/`fifo:` and REFUSED at
+    // parse on anything else: a `file:` (static bytes, already safe fan-out by re-open, loss would be corruption)
+    // or a `host:port`/`unix:`/handler scheme (not a raw-stream source at all). Strip it here, then route the
+    // scheme; a source that keeps it (`file:...+lossy`, `web+lossy`) is rejected below.
+    let (addr, lossy) = match addr.strip_suffix("+lossy") {
+        Some(base) => (base, true),
+        None => (addr, false),
+    };
+    let reject_lossy = |scheme: &str| -> eyre::Result<()> {
+        if lossy {
+            eyre::bail!(
+                "`+lossy` (raw-stream fan-out) is only valid on a `stdin:`/`fifo:` source, not `{scheme}` \
+                 (`{entry}`); drop it, or point the service at a live single-writer source"
+            );
+        }
+        Ok(())
+    };
     // `stdin:` is a raw-stream source with NO tail (this process's fd 0), so it is a zero-arg target routed
     // FIRST, before the bare-scheme handler arm would read `stdin` as a handler no registry holds. It shares
     // the raw-stream direction and the public-gate refusal, but inherits none of the path guards (there is no
     // path). Anything after the colon is a typo: `stdin:` takes no argument.
     if addr == "stdin:" {
-        return Ok(Target::RawStream(RawStream::stdin()?));
+        return Ok(Target::RawStream(RawStream::stdin(lossy)?));
     }
     // A raw-stream forward carries a PATH tail (`file:/tmp/x`, `fifo:/tmp/beam`), so it is a Forward, not a
     // bare-scheme Handler. Route it FIRST: the direction (a read-only source toward the peer) is fixed here
     // at parse time, and a bare `file:`/`fifo:` with no path fails loudly rather than resolving to a
     // handler no registry holds.
     if let Some(path) = addr.strip_prefix("file:") {
+        reject_lossy("file:")?;
         return Ok(Target::RawStream(RawStream::file(path, entry)?));
     }
     if let Some(path) = addr.strip_prefix("fifo:") {
-        return Ok(Target::RawStream(RawStream::fifo(path, entry)?));
+        return Ok(Target::RawStream(RawStream::fifo(path, entry, lossy)?));
     }
     if let Some(scheme) = addr.strip_suffix(':') {
         // A bare `<scheme>:` (nothing after the colon) is a handler selector. `unix:<path>` and `host:port`
@@ -620,9 +641,11 @@ fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
         {
+            reject_lossy(addr)?;
             return Ok(Target::Handler(scheme.to_owned()));
         }
     }
+    reject_lossy(addr)?;
     validate_forward(addr, entry)?;
     Ok(Target::Forward(addr.to_owned()))
 }
@@ -1008,6 +1031,17 @@ mod tests {
         Services(map)
     }
 
+    /// A single-service `Services` whose one target is a `stdin:+lossy`-shaped FAN-OUT source over `reader`, so
+    /// the full multi-consumer served path (one shared ring, N cursors) runs without the process's real fd 0.
+    fn lossy_service(name: &str, reader: BoxRead) -> Services {
+        let mut map = HashMap::new();
+        map.insert(
+            name.to_owned(),
+            Target::RawStream(RawStream::lossy_from_reader(reader)),
+        );
+        Services(map)
+    }
+
     #[test]
     fn a_single_service_node_needs_no_service_name() {
         let Services(one) = services(&["web=127.0.0.1:80"]);
@@ -1081,6 +1115,48 @@ mod tests {
     #[test]
     fn a_named_service_pointed_at_a_bogus_addr_is_rejected() {
         assert!(Services::parse(&["web=nonsense".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn lossy_is_accepted_only_on_stdin_and_fifo_and_rejected_elsewhere() {
+        // `+lossy` opts a live single-writer source into fan-out; it is legal ONLY on `stdin:`/`fifo:`.
+        for entry in ["cam=stdin:+lossy", "cam=fifo:/tmp/cam+lossy"] {
+            let Services(parsed) = services(&[entry]);
+            let target = parsed.values().next().expect("one service parsed");
+            assert!(
+                matches!(target, Target::RawStream(_)),
+                "{entry} must resolve to a raw-stream fan-out target, got {target:?}"
+            );
+        }
+        // On any OTHER scheme `+lossy` is refused at PARSE with a teaching message: a `file:` (static bytes,
+        // dropping would be corruption), a `host:port` / `unix:` forward, or a handler scheme are not
+        // loss-tolerant live sources. Rejected loudly at expose, not silently ignored.
+        for entry in [
+            "doc=file:/etc/hosts+lossy",
+            "web=127.0.0.1:8080+lossy",
+            "db=unix:/run/db.sock+lossy",
+            "ssh=sshd:+lossy",
+        ] {
+            let Err(err) = Services::parse(&[entry.to_owned()]) else {
+                panic!("`+lossy` on {entry} must be rejected at parse");
+            };
+            assert!(
+                err.to_string().contains("`+lossy`"),
+                "the refusal must name the modifier: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_public_gate_over_a_lossy_source_is_refused_at_the_same_door() {
+        // A `+lossy` fan-out is still a raw-stream source with no auth of its own: a public gate over it would
+        // serve the piped bytes to anyone. It must be refused at the SAME door as a non-lossy raw stream, so
+        // `+lossy` cannot reopen the delib-05/11 exfil gate.
+        let lossy = services(&["cam=stdin:+lossy"]);
+        assert!(
+            super::Exposer::new(lossy, super::Registry::new(), Gate::Open).is_err(),
+            "an open gate over a `+lossy` raw-stream source must be refused"
+        );
     }
 
     #[test]
@@ -1215,6 +1291,68 @@ mod tests {
                     err.contains("single-consumer source, already in use"),
                     "the refusal must name the single-consumer contract: {err}"
                 );
+            })
+            .await;
+    }
+
+    /// FAN-OUT (delib-20 ship-blocker): a `+lossy` source served to N consumers over the in-process transport,
+    /// each receiving the source's bytes from ONE shared ring. The source is a duplex whose write half the test
+    /// holds, so all N consumers attach BEFORE any bytes flow (a live session, not a replay); then the body is
+    /// written once and every consumer reads it. This drives the exact `Target::RawStream(RawStream::lossy)`
+    /// serve path the binary uses, proving one source fans out to many independent cursors.
+    #[tokio::test]
+    async fn a_lossy_source_fans_out_to_many_consumers() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let body: &'static [u8] = b"one live source, fanned out to every consumer";
+                // A duplex source: the exposer reads one end, the test writes the other AFTER all consumers
+                // have attached (a live session), so no consumer misses the start.
+                let (mut source_writer, source_reader) = tokio::io::duplex(4096);
+                let services = lossy_service("cam", Box::new(source_reader));
+
+                let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
+                let exposer_id = exposer_node.node_id();
+                let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+
+                // Past the public-gate door (covered by `a_public_gate_over_a_lossy_source_is_refused...`): an
+                // open gate keeps every peer admitted so the test isolates the fan-out splice path.
+                let exposer = Exposer {
+                    services,
+                    registry: std::sync::Arc::new(Registry::new()),
+                    gate: Gate::Open,
+                };
+                tokio::task::spawn_local(async move {
+                    exposer.run(&exposer_node).await.expect("exposer runs");
+                });
+
+                // Attach N consumers: each opens a stream and is admitted (Response::Ok), the first lazy-opening
+                // the source and arming the ring, the rest attaching to it. Hold them all before writing.
+                const N: usize = 4;
+                let mut streams = Vec::new();
+                for _ in 0..N {
+                    let session = consumer.connect(exposer_id).await.expect("connect");
+                    streams.push(
+                        ServiceStream::open(&session, "cam")
+                            .await
+                            .expect("consumer admitted to the fan-out"),
+                    );
+                }
+
+                // Now write the body once and close the source: the pump copies it into the one ring, and every
+                // cursor drains the same bytes. The body fits the ring, so no consumer lags -> each gets it all.
+                source_writer.write_all(body).await.expect("write source");
+                drop(source_writer);
+
+                for stream in streams {
+                    let got = stream.read_all().await.expect("read the fan-out");
+                    assert_eq!(
+                        got, body,
+                        "each of the N consumers receives the source's exact bytes from the one ring"
+                    );
+                }
             })
             .await;
     }

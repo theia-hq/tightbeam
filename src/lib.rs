@@ -29,6 +29,7 @@ pub mod identity;
 pub mod peer;
 #[cfg_attr(not(unix), path = "raw_stream_unsupported.rs")]
 pub mod raw_stream;
+mod raw_stream_fanout;
 pub mod tunnel;
 
 pub mod protocol;

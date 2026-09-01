@@ -1,5 +1,5 @@
-//! The raw-stream forward: source an already-open byte stream and splice it toward the peer. Three
-//! sources share one shape, so `expose` treats them all as a read-only [`crate::tunnel::Target::RawStream`]
+//! The raw-stream forward: source an already-open byte stream and splice it toward the peer. The sources
+//! share one shape, so `expose` treats them all as a read-only [`crate::tunnel::Target::RawStream`]
 //! (inheriting the source-only splice and the public-gate refusal):
 //!
 //! - `file:<path>` / `fifo:<path>` — open an OS object the operator named on disk. Its input is an
@@ -7,6 +7,12 @@
 //!   in [`open_guarded`]).
 //! - `stdin:` — this process's own standard input (fd 0). No path, so none of the path guards apply; it is
 //!   a SINGLE-CONSUMER source (fd 0 is one non-re-openable stream) taken once and never re-armed.
+//! - `stdin:+lossy` / `fifo:<path>+lossy` — the operator's opt-in to FAN-OUT (delib-20 SYNTHESIS + delib-24):
+//!   the source is opened ONCE and read by MANY consumers through one shared bounded ring, a consumer that
+//!   falls behind having its bytes dropped rather than stalling the producer or the others. The `+lossy` claim
+//!   ("this stream tolerates loss") is legal only on these live single-writer sources (a `file:` is already
+//!   safe fan-out by re-open, so dropping would be corruption); the mechanism lives in
+//!   [`crate::raw_stream_fanout`]. See [`Lossy`].
 //!
 //! The path forms mirror piping a service to the connector's stdout: where that pumps the far service to a
 //! running process's stdout, `file:`/`fifo:` pump the bytes of a path the operator already made, and
@@ -41,6 +47,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::io::unix::AsyncFd;
 
+use crate::raw_stream_fanout::Fanout;
 use crate::tunnel::{BoxRead, RAW_STREAM_OPEN_TIMEOUT};
 
 /// Which OS object types a path-based raw-stream forward accepts. Both fix the direction (a read-only source
@@ -61,7 +68,7 @@ enum Kind {
 #[derive(Debug, Clone)]
 pub struct RawStream(Source);
 
-/// The two sources a raw stream can splice from, sharing the read-only direction and the public-gate refusal.
+/// The sources a raw stream can splice from, sharing the read-only direction and the public-gate refusal.
 #[derive(Debug, Clone)]
 enum Source {
     /// A path (`file:`/`fifo:`) opened under the four guards. Cheap to clone (a path + a kind), re-opened per
@@ -74,6 +81,10 @@ enum Source {
     /// This process's standard input (`stdin:`), a SINGLE-CONSUMER source: fd 0 is one non-re-openable
     /// stream, so it is taken once. See [`Stdin`].
     Stdin(Stdin),
+    /// A `+lossy` fan-out source (`stdin:+lossy` / `fifo:...+lossy`): opened ONCE, then read by MANY consumers
+    /// through one shared bounded ring with drop-for-slow. Opt-in and operator-declared (delib-20 SYNTHESIS +
+    /// delib-24); the underlying source is lazy-opened on the first consumer. See [`Lossy`].
+    Lossy(Lossy),
 }
 
 /// The take-once owner of a single-consumer reader (fd 0 for `stdin:`). `stdin:` names ONE non-re-openable OS
@@ -110,40 +121,134 @@ impl Stdin {
     }
 }
 
+/// A `+lossy` fan-out source: one underlying source opened ONCE, then read by MANY consumers through the
+/// shared bounded ring in [`crate::raw_stream_fanout`]. The underlying source is opened lazily (on the first
+/// consumer) because a `fifo:` open is async and fallible and must not run until someone actually connects;
+/// the [`Opener`] is what to open. Once opened, the [`Fanout`] is memoized, so every later consumer attaches
+/// to the SAME ring. Behind a `tokio::sync::Mutex` so the "first consumer opens, the rest attach" transition
+/// is a single critical section.
+#[derive(Clone)]
+struct Lossy(std::sync::Arc<tokio::sync::Mutex<LossyState>>);
+
+/// The lazy-open state of a [`Lossy`] source: what to open on the first consumer, then the memoized fan-out.
+struct LossyState {
+    /// How to open the underlying source, taken once by the first consumer. `None` once opened (the fan-out
+    /// owns the reader now) or once a `stdin:` session ran to completion (non-rewindable, never re-armed).
+    opener: Option<Opener>,
+    /// The shared fan-out, present once the source has been opened. Every consumer after the first attaches to
+    /// this same ring.
+    fanout: Option<Fanout>,
+}
+
+/// What a lazy [`Lossy`] source opens on its first consumer: a `fifo:` path opened under the guards, or a
+/// ready `stdin:`-shaped reader taken directly (fd 0, or a test reader).
+enum Opener {
+    /// A `fifo:` path opened under the four guards on the first consumer.
+    Fifo(PathBuf),
+    /// A ready reader (fd 0 for `stdin:+lossy`, or a test reader) handed straight to the fan-out.
+    Ready(BoxRead),
+}
+
+impl core::fmt::Debug for Lossy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Lossy").finish_non_exhaustive()
+    }
+}
+
+impl Lossy {
+    fn new(opener: Opener) -> Self {
+        Self(std::sync::Arc::new(tokio::sync::Mutex::new(LossyState {
+            opener: Some(opener),
+            fanout: None,
+        })))
+    }
+
+    /// Attach a consumer: on the first, open the underlying source (a `fifo:` under the guards, or take the
+    /// ready reader) and arm the shared fan-out; on every later consumer, attach to the same ring. A cursor is
+    /// returned as a [`BoxRead`]. Refuses if the source already ran to completion and closed (a non-rewindable
+    /// `stdin:+lossy` session): there is nothing left to attach to.
+    async fn open(&self) -> eyre::Result<BoxRead> {
+        let Self(state) = self;
+        let mut state = state.lock().await;
+        // First consumer: open the source and arm the fan-out. The `fifo:` open is async and fallible, so a
+        // failure here is returned as a clean refusal, never a half-armed fan-out.
+        if let Some(opener) = state.opener.take() {
+            let reader = match opener {
+                Opener::Fifo(path) => open_path(path.clone(), Kind::Fifo).await?,
+                Opener::Ready(reader) => reader,
+            };
+            state.fanout = Some(Fanout::new(reader));
+        }
+        let fanout = state
+            .fanout
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("lossy source not armed"))?;
+        match fanout.open() {
+            Some(cursor) => Ok(Box::new(cursor)),
+            None => eyre::bail!("this lossy source's live session has ended"),
+        }
+    }
+}
+
 impl RawStream {
     /// Parse a `file:<path>` tail into a raw-stream forward. Rejects an empty path at parse time (`file:`
-    /// with no tail is a typo, not a target) so it fails loudly at expose, not at dial.
+    /// with no tail is a typo, not a target) so it fails loudly at expose, not at dial. `file:` is never
+    /// `+lossy` (rejected upstream at parse): static bytes are already safe fan-out by re-open, so dropping
+    /// bytes would be corruption, not loss-tolerance.
     pub fn file(path: &str, entry: &str) -> eyre::Result<Self> {
         Self::path(path, Kind::File, entry, "file")
     }
 
     /// Parse a `fifo:<path>` tail into a raw-stream forward. Same shape as [`RawStream::file`], but the type
-    /// guard at open will insist the path is a FIFO.
-    pub fn fifo(path: &str, entry: &str) -> eyre::Result<Self> {
+    /// guard at open will insist the path is a FIFO. `lossy` (from a `+lossy` suffix) makes it a fan-out
+    /// source: opened once, read by many consumers with drop-for-slow.
+    pub fn fifo(path: &str, entry: &str, lossy: bool) -> eyre::Result<Self> {
+        if path.is_empty() {
+            eyre::bail!(
+                "`{entry}` names a `fifo:` target with no path; write `fifo:<path>`, e.g. \
+                 `pipe=fifo:/tmp/beam`"
+            );
+        }
+        if lossy {
+            return Ok(Self(Source::Lossy(Lossy::new(Opener::Fifo(
+                PathBuf::from(path),
+            )))));
+        }
         Self::path(path, Kind::Fifo, entry, "fifo")
     }
 
-    /// The `stdin:` source: this process's standard input, taken once (single-consumer). Refuses a TTY here,
-    /// at parse time (loudly at expose), because a `stdin:` with no pipe would eat the operator's keystrokes,
-    /// the analog of `file:`'s device refusal.
-    pub fn stdin() -> eyre::Result<Self> {
+    /// The `stdin:` source: this process's standard input. Refuses a TTY here, at parse time (loudly at
+    /// expose), because a `stdin:` with no pipe would eat the operator's keystrokes, the analog of `file:`'s
+    /// device refusal. Without `lossy` it is single-consumer (fd 0 is one non-re-openable stream, taken once);
+    /// with `lossy` (a `+lossy` suffix) it is a fan-out source read by many consumers with drop-for-slow.
+    pub fn stdin(lossy: bool) -> eyre::Result<Self> {
         if is_stdin_a_tty() {
             eyre::bail!(
                 "stdin: has no pipe to read: fd 0 is a terminal, so it would consume your keystrokes. \
                  Pipe a producer in, e.g. `ffmpeg ... | tightbeam expose cam=stdin:`"
             );
         }
-        Ok(Self(Source::Stdin(Stdin::new(
-            Box::new(tokio::io::stdin()),
-        ))))
+        let reader: BoxRead = Box::new(tokio::io::stdin());
+        Ok(Self(if lossy {
+            Source::Lossy(Lossy::new(Opener::Ready(reader)))
+        } else {
+            Source::Stdin(Stdin::new(reader))
+        }))
     }
 
-    /// A `stdin:`-shaped single-consumer source over an arbitrary reader, for tests: arm the SAME take-once
-    /// cell with an in-memory reader so the full served path (take-once + splice toward the peer) is exercised
-    /// without the process's real fd 0. Not compiled into the binary.
+    /// A `stdin:`-shaped source over an arbitrary reader, for tests: arm the take-once cell (single-consumer)
+    /// or the fan-out (`lossy`) with an in-memory reader so the full served path is exercised without the
+    /// process's real fd 0. Not compiled into the binary.
     #[cfg(test)]
     pub(crate) fn from_reader(reader: BoxRead) -> Self {
         Self(Source::Stdin(Stdin::new(reader)))
+    }
+
+    /// A `stdin:+lossy`-shaped fan-out source over an arbitrary reader, for tests: arm the fan-out with an
+    /// in-memory reader so the shared-ring served path is exercised without the process's real fd 0.
+    #[cfg(test)]
+    pub(crate) fn lossy_from_reader(reader: BoxRead) -> Self {
+        Self(Source::Lossy(Lossy::new(Opener::Ready(reader))))
     }
 
     fn path(path: &str, kind: Kind, entry: &str, scheme: &str) -> eyre::Result<Self> {
@@ -163,7 +268,8 @@ impl RawStream {
     /// this opens the object under the four guards; errors (a device, a directory, a symlink at the final
     /// component, a FIFO with no writer within the timeout, a missing path) are returned so the caller can
     /// refuse cleanly rather than hang or reset mid-splice. For `stdin:`, this TAKES fd 0 once: a second
-    /// concurrent open finds it already in use and is refused, never a racing second read.
+    /// concurrent open finds it already in use and is refused, never a racing second read. For a `+lossy`
+    /// source, this attaches a fan-out cursor (opening the underlying source on the first consumer).
     pub async fn open(&self) -> eyre::Result<BoxRead> {
         let Self(source) = self;
         match source {
@@ -172,6 +278,7 @@ impl RawStream {
                 Some(reader) => Ok(reader),
                 None => eyre::bail!("stdin is a single-consumer source, already in use"),
             },
+            Source::Lossy(lossy) => lossy.open().await,
         }
     }
 }
@@ -534,7 +641,8 @@ mod tests {
             .and_then(|mut f| f.write_all(b"x"))
             .expect("write scratch file");
 
-        let stream = RawStream::fifo(&path.to_string_lossy(), "p=fifo:z").expect("parse fifo:");
+        let stream =
+            RawStream::fifo(&path.to_string_lossy(), "p=fifo:z", false).expect("parse fifo:");
         let Err(err) = stream.open().await else {
             panic!("a regular file behind fifo: must be refused");
         };
@@ -578,7 +686,7 @@ mod tests {
             "`file:` with no path must be rejected at parse"
         );
         assert!(
-            RawStream::fifo("", "pipe=fifo:").is_err(),
+            RawStream::fifo("", "pipe=fifo:", false).is_err(),
             "`fifo:` with no path must be rejected at parse"
         );
     }
@@ -639,7 +747,7 @@ mod tests {
                 for _ in 0..N {
                     let fifo = scratch_fifo("noleak");
                     let stream =
-                        RawStream::fifo(&fifo.to_string_lossy(), "pipe=fifo:x").expect("parse fifo:");
+                        RawStream::fifo(&fifo.to_string_lossy(), "pipe=fifo:x", false).expect("parse fifo:");
                     let opened = stream.open().await;
                     assert!(
                         opened.is_err(),
@@ -675,7 +783,8 @@ mod tests {
                 .expect("write into the FIFO");
         });
 
-        let stream = RawStream::fifo(&fifo.to_string_lossy(), "pipe=fifo:x").expect("parse fifo:");
+        let stream =
+            RawStream::fifo(&fifo.to_string_lossy(), "pipe=fifo:x", false).expect("parse fifo:");
         let mut source = stream.open().await.expect("open the FIFO with a writer");
         writer.await.expect("writer task");
         let mut got = Vec::new();

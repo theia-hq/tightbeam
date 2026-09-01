@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use crate::raw_stream_fanout::Fanout;
 use crate::tunnel::BoxRead;
 
 /// A resolved raw-stream forward. On non-unix a path source holds the path only to reproduce the loud open
@@ -19,6 +20,9 @@ enum Source {
     Path(PathBuf),
     /// This process's standard input (`stdin:`), a SINGLE-CONSUMER source taken once. See [`Stdin`].
     Stdin(Stdin),
+    /// A `stdin:+lossy` fan-out source (a `fifo:+lossy` needs the unix open, so it fails loudly like `Path`).
+    /// `stdin:` fan-out is supported here (fd 0 is portable), so the shared-ring path works unchanged.
+    Lossy(Fanout),
 }
 
 /// The take-once owner of a single-consumer reader (fd 0), identical in contract to the unix build: `stdin:`
@@ -53,23 +57,28 @@ impl RawStream {
         Self::path(path, entry, "file")
     }
 
-    /// Parse a `fifo:<path>` tail.
-    pub fn fifo(path: &str, entry: &str) -> eyre::Result<Self> {
+    /// Parse a `fifo:<path>` tail. `lossy` is accepted for parse parity but a `fifo:` open needs the unix
+    /// guards, so it fails loudly at open like any `Path`.
+    pub fn fifo(path: &str, entry: &str, _lossy: bool) -> eyre::Result<Self> {
         Self::path(path, entry, "fifo")
     }
 
-    /// The `stdin:` source: this process's standard input, taken once. Refuses a TTY at parse (a `stdin:`
-    /// with no pipe would eat the operator's keystrokes), using a portable `isatty` check.
-    pub fn stdin() -> eyre::Result<Self> {
+    /// The `stdin:` source: this process's standard input. Refuses a TTY at parse (a `stdin:` with no pipe
+    /// would eat the operator's keystrokes), using a portable `isatty` check. Without `lossy` it is taken
+    /// once (single-consumer); with `lossy` it is a fan-out source read by many consumers with drop-for-slow.
+    pub fn stdin(lossy: bool) -> eyre::Result<Self> {
         if is_stdin_a_tty() {
             eyre::bail!(
                 "stdin: has no pipe to read: fd 0 is a terminal, so it would consume your keystrokes. \
                  Pipe a producer in, e.g. `ffmpeg ... | tightbeam expose cam=stdin:`"
             );
         }
-        Ok(Self(Source::Stdin(Stdin::new(
-            Box::new(tokio::io::stdin()),
-        ))))
+        let reader: BoxRead = Box::new(tokio::io::stdin());
+        Ok(Self(if lossy {
+            Source::Lossy(Fanout::new(reader))
+        } else {
+            Source::Stdin(Stdin::new(reader))
+        }))
     }
 
     fn path(path: &str, entry: &str, scheme: &str) -> eyre::Result<Self> {
@@ -82,14 +91,19 @@ impl RawStream {
         Ok(Self(Source::Path(PathBuf::from(path))))
     }
 
-    /// Open the source. A `stdin:` source is taken once (a second concurrent open is refused); a `file:`/
-    /// `fifo:` path needs the unix `O_NOFOLLOW` + `fstat` guards, so it is unsupported here.
+    /// Open the source. A `stdin:` source is taken once (a second concurrent open is refused); a `stdin:+lossy`
+    /// source attaches a fan-out cursor; a `file:`/`fifo:` path needs the unix `O_NOFOLLOW` + `fstat` guards,
+    /// so it is unsupported here.
     pub async fn open(&self) -> eyre::Result<BoxRead> {
         let Self(source) = self;
         match source {
             Source::Stdin(stdin) => match stdin.take() {
                 Some(reader) => Ok(reader),
                 None => eyre::bail!("stdin is a single-consumer source, already in use"),
+            },
+            Source::Lossy(fanout) => match fanout.open() {
+                Some(cursor) => Ok(Box::new(cursor)),
+                None => eyre::bail!("this lossy source's live session has ended"),
             },
             Source::Path(path) => eyre::bail!(
                 "file:/fifo: raw-stream targets ({}) are only supported on unix",
