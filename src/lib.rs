@@ -1,13 +1,26 @@
-//! tightbeam: private peer-to-peer tunnels over the bifrost overlay.
+//! tightbeam: a library for private peer-to-peer tunnels over the bifrost overlay.
 //!
-//! `expose` forwards inbound overlay streams to a local TCP service; `connect` binds a peer's exposed
-//! service to a local port. Each proxied TCP connection rides one bifrost bidirectional stream. Who may
-//! connect is decided by the [`nauthy`] crate's authorization gate: by default the node's signet
-//! (its own devices and their delegates), else `--public` for open. `share` and `attenuate` mint and
-//! narrow the capabilities that gate honors.
+//! Reach a service on a machine by its public key, across any NAT, over any transport. You embed this
+//! crate: an [`Exposer`](tunnel::Exposer) serves local services behind a gate and forwards each inbound
+//! overlay stream to the one it names; a [`Connector`](tunnel::Connector) reaches an exposed service and
+//! hands back a bidirectional stream (bound to a local port, or piped over stdio). A caller supplies the
+//! services, the identity, and the output; the core prints nothing and reads no config path.
+//!
+//! Who may connect is decided by the [`nauthy`] crate's authorization gate: by default the node's signet
+//! (its own devices and their delegates), else an open gate for anyone. A named service (a keyless shell,
+//! an HTTP fetcher, diagnostics) is a [`Handler`](tunnel::Handler) a caller injects into a
+//! [`Registry`](tunnel::Registry); tightbeam knows only the contract, never what a handler does, and
+//! ships none of its own. [`mint_link`](tunnel::mint_link) / [`narrow_link`](tunnel::narrow_link) /
+//! [`revoke_into`](tunnel::revoke_into) mint, narrow, and revoke the `sheer:` capabilities the gate
+//! honors, all offline.
+//!
+//! The tunnel core lives in [`tunnel`]; the wire frames in [`protocol`]. The command-line tool built on
+//! this library is [swoosh](https://github.com/theia-hq/swoosh). The `tightbeam` binary in this crate is a
+//! thin bridge over the same core (it serves only raw forwards, over an empty registry); the modules that
+//! back it (`expose`, `connect`, `share`, `attenuate`, `revoke`) are its CLI adapters.
 //!
 //! Concurrency uses `FuturesUnordered` + `select!` (structured concurrency on one task) rather than
-//! `tokio::spawn`, because the bifrost interface's futures are not `Send`-bounded. This keeps the tool
+//! `tokio::spawn`, because the bifrost interface's futures are not `Send`-bounded. This keeps the library
 //! generic over any transport; see DECISIONS.md for the trade-off.
 
 pub mod attenuate;
@@ -42,8 +55,8 @@ pub use crate::tree::TreeCmd;
 
 /// Copy bytes both ways between a local duplex stream and a bifrost stream until both sides close.
 ///
-/// The shared byte pump every command funnels into once its stream is established: `connect` after a
-/// service is accepted, `expose` after it dials the local target.
+/// The shared byte pump the core funnels into once a stream is established: the exposer after it dials
+/// the local target, the connector after a service is accepted.
 pub(crate) async fn splice<S, W, R>(local: S, writer: W, reader: R) -> io::Result<()>
 where
     S: io::AsyncRead + io::AsyncWrite + Unpin,

@@ -5,9 +5,12 @@ over any transport, across any NAT. That is the whole of what tightbeam is: one 
 stream to a service someone named.
 
 A machine exposes local services under its public key, each behind a gate. Another machine, holding the
-key and passing the gate, reaches a service and gets a plain bidirectional stream to it, bound to a local
-port or piped over stdin/stdout. No port forwarding, no VPN, no public IP. `ssh -L` shaped, but
-pubkey-addressed and peer to peer.
+key and passing the gate, reaches a service and gets a plain bidirectional stream to it. No port
+forwarding, no VPN, no public IP. `ssh -L` shaped, but pubkey-addressed and peer to peer.
+
+tightbeam is a Rust library. You embed it: build an `Exposer` to serve services behind a gate, or a
+`Connector` to reach one and get a stream back. It ships no services of its own and prints nothing; the
+program that embeds it supplies the services, the identity, and the output.
 
 Powered by [bifrost](https://github.com/theia-hq/bifrost) for the keyed connection and
 [nauthy](https://github.com/theia-hq/nauthy) for authorizing who may connect.
@@ -20,149 +23,156 @@ each end.
 
 > Experimental. Works for TCP over the iroh transport; not ready for production use.
 
-## Installation
+## The CLI is swoosh
 
-Not yet published. Build from a checkout:
+tightbeam is the library. The command-line tool built on it is
+[swoosh](https://github.com/theia-hq/swoosh): `swoosh serve` exposes services, `swoosh ssh` reaches an
+sshd, `swoosh forward` binds a service to a local port, `swoosh fetch` sends HTTP through a node. If you
+want a tool to run, reach for swoosh. If you want to build reaching a keyed service into your own program,
+read on.
 
-```sh
-cargo install --path .
+## Add it as a dependency
+
+Not yet published. Point at a checkout:
+
+```toml
+[dependencies]
+tightbeam = { path = "../tightbeam" }
 ```
 
-## Usage
+You also depend on `bifrost` (to bind an overlay node) and `nauthy` (to build the gate).
 
-Expose one or more local services (on the machine that has them). A target may be a `host:port`, a
-`unix:<path>` socket, a `file:`/`fifo:` byte source, or `stdin:` (whatever a producer pipes in):
+## Serve services behind a gate
 
-```sh
-tightbeam expose ssh=127.0.0.1:22 web=127.0.0.1:80 docker=unix:/var/run/docker.sock
+An `Exposer` accepts overlay sessions from permitted peers and forwards each inbound stream to the
+service it asks for. You build it from three things: the services to publish, a `Registry` of handlers
+for the named ones, and the `Gate` that decides who may reach them.
+
+```rust
+use nauthy::{Denylist, Gate};
+use tightbeam::tunnel::{resolve_gate, Exposer, Registry, Services};
+
+// Parse `name=addr` entries. A `host:port` or `unix:<path>` is a raw forward tightbeam
+// serves itself; a bare `scheme:` names a handler you register below.
+let services = Services::parse(&["web=127.0.0.1:8080".into(), "ssh=sshd:".into()])?;
+
+// The gate: `resolve_gate(public, signet, denylist)` applies one policy. `public = true`
+// opens it to anyone; otherwise it admits the signet's own devices and their delegates.
+let gate = resolve_gate(false, Some(signet), Denylist::default())?;
+
+// Serve `web` (a raw forward) and `ssh` (a handler you inject, next).
+let exposer = Exposer::new(services, registry, gate)?;
+exposer.run(&node).await?;   // runs until cancelled; prints nothing
 ```
 
-Reach one from another machine, bound to a local port:
+## Inject a named service
 
-```sh
-tightbeam connect <node-id> --service ssh --to 2222
+A raw forward (a `host:port` or `unix:<path>`) tightbeam splices on its own. Anything else is a handler
+you register: a name maps to code that consumes one admitted stream. tightbeam knows only that contract,
+never what a handler does, and ships none of its own.
+
+```rust
+use std::sync::Arc;
+use futures::FutureExt as _;
+use tightbeam::tunnel::{Handler, Registry, ServeFn};
+
+// A handler receives the gate's `Admitted` witness (proof this stream passed the gate) and
+// the raw stream halves. It does whatever the service is.
+let serve: ServeFn = Arc::new(|_admitted, writer, reader| {
+    async move { my_shell(writer, reader).await }.boxed()
+});
+
+// `gated` marks a handler that has no auth of its own (a shell is remote code execution):
+// an open gate over it is refused at `Exposer::new`. `open` marks one safe to expose publicly.
+let registry = Registry::new().with("sshd", Handler::gated(serve));
 ```
 
-A bare address serves the `default` name, which `connect` reaches without `--service`:
+The `Admitted` witness is single-use and moved into the handler by value, so a handler cannot run for a
+peer the gate did not admit: "authorize before serve" is a compile-time precondition, not a check you
+remember to write.
 
-```sh
-tightbeam expose 127.0.0.1:22       # on the host
-tightbeam connect <node-id> --to 2222
+## Reach a service, get a stream
+
+A `Connector` reaches one exposed service on a peer and hands back a bidirectional stream. Build it from a
+node id (optionally presenting a `sheer:` capability token) or from a `sheer:` link that carries both the
+node to dial and the token.
+
+```rust
+use tightbeam::tunnel::Connector;
+
+// Reach `ssh` on a peer, bind it to local port 2222, forward every connection.
+let connector = Connector::to_node(peer_id, "ssh".into(), None);
+let forward = connector.preflight(&node, 2222).await?;   // proves the gate admits us first
+forward.run().await?;
+
+// Or reach it via a capability link, which supplies the node and the token together.
+let connector = Connector::from_link("sheer:<node>.<token>", "ssh".into())?;
 ```
 
-`connect` is tightbeam's own word for reaching a service and binding it locally. (In swoosh, the same
-leaf is called `forward`; see the closing section.)
+`preflight` proves admission before returning: a refusal (wrong service, a revoked or non-granting token,
+an unauthorized identity) surfaces as an error from that call, carrying the host's reason, not as a
+silently reset connection later. `pipe_stdio` streams the service over this process's stdin/stdout
+instead of binding a port, which is the shape an ssh `ProxyCommand` wants. `open_service` returns a
+`ServiceSession` whose every stream rides the gate, for a protocol that is generic over a bifrost session.
 
-By default a service is gated to this node's signet, set once by `swoosh adopt`: it admits the owner's
-own devices and anyone they delegate a capability to (below), and refuses everyone else. Pass `--public`
-to open a service to anyone, unauthenticated, the one deliberate opt-out.
+## Capabilities: hand out an expiring key
 
-`expose --quiet` suppresses the readiness banner, so the node's key never lands in a log, for unattended
-or CI use. The forward runs the same either way.
+The default gate accepts `sheer:` capability tokens: a signed, expiring, attenuable link rooted at a
+node's signet, verified offline with no server and no allowlist to sync. tightbeam exposes the offline
+operations on them as plain functions.
 
-For worked examples of what to run over a forward (stream a movie, pipe a raw stream, reach a database
-port), see [examples.md](examples.md).
+```rust
+use core::time::Duration;
+use tightbeam::tunnel::{mint_link, narrow_link, revoke_into};
 
-## Share a service as a capability
+// Mint a link granting one service, valid two hours, that the holder may narrow and hand on.
+let link = mint_link(&identity, &service, Duration::from_secs(2 * 3600), true)?;
 
-The default gate already accepts capabilities: a signed, expiring, attenuable link rooted at this node's
-signet, verified offline with no server and no allowlist to sync. Mint one with `share` and hand it to
-someone outside your own devices.
+// A holder narrows it further, offline, before delegating (no key, no network).
+let tighter = narrow_link(&link, Some(&service), Some(Duration::from_secs(1800)))?;
 
-```sh
-# on the host: expose ssh, gated to your signet by default
-tightbeam expose ssh=127.0.0.1:22
-
-# mint a share-link for ssh, valid two hours, that the holder may narrow and hand on
-tightbeam share ssh --expires 2h --delegable      # prints sheer:<node>.<token>
-
-# a holder narrows it further, offline, before delegating (no key, no network)
-tightbeam attenuate <link> --service ssh --expires 30m
-
-# anyone holding the link connects with it; it carries the node to dial and the token to present
-tightbeam connect <link> --to 2222
+// Revoke a link into a denylist, so the gate refuses it and everything attenuated from it.
+revoke_into(&mut denylist, &link).await?;
 ```
 
 The link works only for the service it grants, expires on its own, and can be narrowed and delegated
-without the host's involvement. Drop `--delegable` to seal a link so its recipient can use but not
-re-share it. `tightbeam revoke <link>` cuts a link off at once, without waiting for its expiry; short
-expiry backs that up. There is no server to ask, only a node-local denylist. See
-[DEMO-WEDGE.md](DEMO-WEDGE.md) for a full run over iroh.
+without the host's involvement. Revoking cuts it off at once; short expiry backs that up.
 
-## What the primitive reaches
+## What a forward carries
 
-Every example below is the same one move: forward a stream to a service named behind the family gate.
-None of these is a tightbeam feature with a verb of its own. They are what a raw forwarded stream lets
-you do.
+A forward carries bytes. Anything that speaks over a TCP port or a Unix socket rides it unchanged: the
+program on each end does not know the overlay is there. The service on the host is one of:
 
-**ssh to a machine with no public IP.** Expose the host's own sshd as a service, then point ssh's
-`ProxyCommand` at a forwarded stream. `--to -` streams the service over stdin/stdout instead of binding a
-port, which is exactly the shape a `ProxyCommand` wants: ssh talks to the far sshd through the stream as
-if it were local.
+- a `host:port` or `unix:<path>` (spliced to a local address), tightbeam's own raw forward;
+- a `file:<path>` or `fifo:<path>` (a path's raw bytes sourced to the peer), or `stdin:` (whatever a
+  producer pipes in, single-consumer, one reader takes it);
+- a named handler you injected (a keyless shell, an HTTP fetcher, link diagnostics).
 
-```sh
-tightbeam expose ssh=127.0.0.1:22       # on the host: forward its real sshd
-```
+For worked scenarios (ssh with no public IP, reach a database port, HTTP through a node), see
+[examples.md](examples.md). Those are shown as swoosh commands, since swoosh is the tool; each is the same
+one library move underneath.
 
-`/` is not legal in a hostname (and it is theia's device separator), so you cannot type `ssh alice/desk`
-directly. Give ssh a legal alias in `~/.ssh/config` instead:
+## The thin binary
 
-```
-Host alice-desk
-    ProxyCommand tightbeam connect <peer> --service ssh --to -
-```
+There is a `tightbeam` binary, but it is a thin bridge, not the product: it drives the library over an
+empty registry, so it serves only raw forwards. Its one real use is as an ssh `ProxyCommand` (reach an
+sshd over a stream), before swoosh is on a machine. swoosh owns the full CLI.
 
-Then `ssh alice-desk` reaches the far machine by key. `<peer>` is the host's node id or a `sheer:`
-capability link. With a link, auth composes for free: the link names the node to dial and carries the
-token, so a link that reaches only ssh and expires in an hour becomes an ssh `ProxyCommand` with nothing
-else to configure.
+## The honest limit
 
-**Expose any local service to someone by key.** A database, a media server, a Unix socket. Expose the
-address; the other side binds it to a local port and points a normal client at it.
-
-```sh
-tightbeam expose db=127.0.0.1:5432        # on the host
-tightbeam connect <peer> --service db --to 5432    # on your machine; then: psql -h 127.0.0.1 -p 5432
-```
-
-**HTTP through a node.** tightbeam ships no proxy and no fetcher; it forwards one someone runs. Run an
-HTTP egress on a remote host, expose it, and forward to it: your traffic exits from that node.
-
-```sh
-# on the exit host: run any egress (an ssh SOCKS proxy here; dante / Caddy / mitmproxy also work)
-ssh -D 1080 -N localhost
-tightbeam expose 127.0.0.1:1080
-
-# on your machine: bind it locally, then point apps at socks5://127.0.0.1:1080
-tightbeam connect <exit-node-id> --to 1080
-```
-
-## From primitive to product: swoosh
-
-tightbeam is the primitive. [swoosh](https://github.com/theia-hq/swoosh) is the product: it drives the
-tightbeam library and turns the patterns above into clean, first-class verbs. Exposing a service is
-`swoosh serve`; reaching an sshd is `swoosh ssh`; HTTP through a node is `swoosh fetch`; binding a
-service to a local port is `swoosh forward`. Where tightbeam shows you the raw mechanism, swoosh gives
-you the ergonomic tool built on it.
-
-Reach for tightbeam when you want the primitive itself. Reach for swoosh when you want the polished
-commands.
+A capability is a bearer token: whoever holds an unexpired, un-revoked one gets that one service until it
+expires or you revoke it. Short expiry and revocation are how you bound that.
 
 ## Things to know
 
-- Built on [`bifrost`](https://github.com/theia-hq/bifrost) (reach): each forwarded connection is one
+- Built on [`bifrost`](https://github.com/theia-hq/bifrost): each forwarded connection is one
   bidirectional stream. It is transport-blind and rides any bifrost transport.
-- Only a peer holding the key can dial, and authorization is enforced by the
-  [`nauthy`](https://github.com/theia-hq/nauthy) crate: the default gate admits a presented `sheer:`
-  token rooted at this node's signet (a device's membership badge or a delegated service slip);
-  `--public` is the only opt-out.
-- Targets tightbeam forwards on its own: a `host:port` or `unix:<path>` (spliced to a local address), a
-  `file:<path>` or `fifo:<path>` (a path's raw bytes sourced to the peer), and `stdin:` (whatever a
-  producer pipes into `expose`, sourced to the peer; single-consumer, one reader takes it).
-- A named service beyond a raw forward (a keyless shell, an HTTP fetcher, link diagnostics) is a handler
-  a node injects into the registry. tightbeam knows the contract, never what such a service does, and
-  ships none of its own; see [swoosh](https://github.com/theia-hq/swoosh) for the services a real node
-  serves.
+- Authorization is enforced by [`nauthy`](https://github.com/theia-hq/nauthy): the default gate admits a
+  presented `sheer:` token rooted at the node's signet (a device's membership badge or a delegated service
+  slip); an open gate is the only opt-out, and a handler with no auth of its own may not sit behind one.
+- A named service (a keyless shell, an HTTP fetcher, link diagnostics) is a handler a caller injects into
+  the registry. tightbeam knows the contract, never what such a service does, and ships none of its own;
+  see [swoosh](https://github.com/theia-hq/swoosh) for the services a real node serves.
 
 ## License
 
@@ -178,3 +188,5 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the
 work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
 additional terms or conditions.
+</content>
+</invoke>

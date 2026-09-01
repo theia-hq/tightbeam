@@ -1,18 +1,21 @@
-//! tightbeam: reach a service on a machine that has no public IP, addressed by its public key.
+//! The `tightbeam` binary: a thin bridge over the tunnel library, not the product.
 //!
-//! `tightbeam expose <target>...` publishes local services (a `host:port` or a `unix:<path>`, named
-//! `name=target` or bare for the `default` service) under this machine's key. `tightbeam connect
-//! <node-id|sheer-link> --to <port | - | unix:PATH> [--service <name>]` reaches an exposed service from
-//! another machine and puts it on a local port, stdout (`-`), or a unix listener. Peer to peer, with
-//! nothing in between; `ssh -L` shaped, but you address the far machine by its key, not an IP.
+//! The library is [`tightbeam::tunnel`]; the tool built on it is
+//! [swoosh](https://github.com/theia-hq/swoosh), which owns the real CLI. This binary drives the same
+//! core over an EMPTY registry, so it serves only raw forwards (`host:port` / `unix:<path>` /
+//! `file:` / `fifo:` / `stdin:`), never a named handler. Its one real use is as an ssh `ProxyCommand`
+//! (reach an sshd over a stream, `connect --to -`) before swoosh is on a machine.
 //!
-//! Who may connect is a property of the node, not a per-expose choice: by default `expose` gates a
-//! service to the machine's signet (the key it trusts, set by `swoosh adopt`), admitting the owner's own
-//! devices and anyone they delegate to. `--public` is the one deliberate opt-out: it opens a service to
-//! anyone (never a shell). A capability is a signed, expiring link rooted at a signet: `tightbeam share
-//! <service>` mints one, `tightbeam attenuate <link>` narrows it offline, `tightbeam revoke <link>`
-//! recalls it, and a holder connects with the link directly. The identity is always persisted (it is both
-//! the address peers dial and the key a share-link roots at): `--key` or `TIGHTBEAM_KEY`.
+//! `expose` publishes local services under this machine's key; `connect` reaches an exposed service from
+//! another machine and puts it on a local port, stdout (`-`), or a unix listener. `share` / `attenuate` /
+//! `revoke` mint, narrow, and revoke the `sheer:` capability links the gate honors. Each verb is a thin
+//! adapter that loads the identity and denylist, resolves the gate through the shared
+//! [`resolve_gate`](tightbeam::tunnel::resolve_gate) policy, prints its own banner, and drives the core.
+//!
+//! By default a service is gated to the machine's signet (the key it trusts, set by `swoosh adopt`),
+//! admitting the owner's own devices and their delegates; `--public` is the one deliberate opt-out (never
+//! a shell). The identity is always persisted, since it is both the address peers dial and the key a
+//! share-link roots at: `--key` or `TIGHTBEAM_KEY`.
 
 use core::net::SocketAddr;
 use std::path::PathBuf;
