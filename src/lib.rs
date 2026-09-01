@@ -15,26 +15,20 @@
 //! honors, all offline.
 //!
 //! The tunnel core lives in [`tunnel`]; the wire frames in [`protocol`]. The command-line tool built on
-//! this library is [swoosh](https://github.com/theia-hq/swoosh). The `tightbeam` binary in this crate is a
-//! thin bridge over the same core (it serves only raw forwards, over an empty registry); the modules that
-//! back it (`expose`, `connect`, `share`, `attenuate`, `revoke`) are its CLI adapters.
+//! this library is [swoosh](https://github.com/theia-hq/swoosh). This crate also ships a `tightbeam`
+//! binary (`src/bin/tightbeam/`), a thin bridge over the same core that serves only raw forwards over an
+//! empty registry; its CLI command tree lives in the binary, never in this library.
 //!
 //! Concurrency uses `FuturesUnordered` + `select!` (structured concurrency on one task) rather than
 //! `tokio::spawn`, because the bifrost interface's futures are not `Send`-bounded. This keeps the library
 //! generic over any transport; see DECISIONS.md for the trade-off.
 
-pub mod attenuate;
 pub mod config;
-pub mod connect;
 pub mod duration;
-pub mod expose;
 pub mod identity;
 pub mod peer;
 #[cfg_attr(not(unix), path = "raw_stream_unsupported.rs")]
 pub mod raw_stream;
-pub mod revoke;
-pub mod share;
-pub mod tree;
 pub mod tunnel;
 
 pub mod protocol;
@@ -45,13 +39,6 @@ mod duration_tests;
 mod protocol_tests;
 
 use tokio::io::{self, AsyncWriteExt as _};
-
-pub use crate::attenuate::AttenuateCmd;
-pub use crate::connect::{ConnectCmd, To};
-pub use crate::expose::ExposeCmd;
-pub use crate::revoke::RevokeCmd;
-pub use crate::share::ShareCmd;
-pub use crate::tree::TreeCmd;
 
 /// Copy bytes both ways between a local duplex stream and a bifrost stream until both sides close.
 ///

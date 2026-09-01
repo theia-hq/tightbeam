@@ -2,8 +2,7 @@
 
 use clap::Args;
 use nauthy::Denylist;
-
-use crate::config::revoked_path;
+use tightbeam::config::revoked_path;
 
 /// Revoke a `sheer:` capability link so this node refuses it from now on.
 ///
@@ -25,7 +24,7 @@ impl RevokeCmd {
         // The adapter opens tightbeam's own denylist and passes it by ref to the core, which never reads
         // a config path.
         let mut denylist = Denylist::load(revoked_path()?).await?;
-        crate::tunnel::revoke_into(&mut denylist, &self.link).await?;
+        tightbeam::tunnel::revoke_into(&mut denylist, &self.link).await?;
         println!("revoked ({})", denylist.path().display());
         Ok(())
     }

@@ -2,8 +2,7 @@
 
 use clap::Args;
 use nauthy::Service;
-
-use crate::duration::Lifetime;
+use tightbeam::duration::Lifetime;
 
 /// Narrow a capability link, offline: tighten its service and/or shorten its expiry, then print the
 /// tighter link.
@@ -28,7 +27,7 @@ impl AttenuateCmd {
     /// Narrow the link and print the result.
     pub fn run(self) -> eyre::Result<()> {
         let shorten = self.expires.map(Lifetime::duration);
-        let narrowed = crate::tunnel::narrow_link(&self.link, self.service.as_ref(), shorten)?;
+        let narrowed = tightbeam::tunnel::narrow_link(&self.link, self.service.as_ref(), shorten)?;
         println!("{narrowed}");
         Ok(())
     }

@@ -2,8 +2,7 @@
 
 use clap::Args;
 use nauthy::{Identity, Service};
-
-use crate::duration::Lifetime;
+use tightbeam::duration::Lifetime;
 
 /// Mint a share-link that IS a capability: a signed, expiring, attenuable grant to one service.
 ///
@@ -26,7 +25,7 @@ pub struct ShareCmd {
 impl ShareCmd {
     /// Mint the link and print it.
     pub fn run(self, identity: &Identity) -> eyre::Result<()> {
-        let link = crate::tunnel::mint_link(
+        let link = tightbeam::tunnel::mint_link(
             identity,
             &self.service,
             self.expires.duration(),

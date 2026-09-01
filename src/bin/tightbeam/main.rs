@@ -20,15 +20,27 @@
 use core::net::SocketAddr;
 use std::path::PathBuf;
 
-use bifrost::{Node, NodeId, Transport};
+use bifrost::Node;
 use bifrost_iroh::Endpoint;
 use clap::{CommandFactory, Parser, Subcommand};
 use nauthy::Denylist;
 use tightbeam::config::{load_signet, revoked_path};
 use tightbeam::identity::{self, Secret};
 use tightbeam::peer::{Discovery, Peer};
-use tightbeam::tunnel::{self, Exposer, Registry, Services};
-use tightbeam::{AttenuateCmd, ConnectCmd, ExposeCmd, RevokeCmd, ShareCmd, To, TreeCmd};
+
+mod attenuate;
+mod connect;
+mod expose;
+mod revoke;
+mod share;
+mod tree;
+
+use attenuate::AttenuateCmd;
+use connect::ConnectCmd;
+use expose::ExposeCmd;
+use revoke::RevokeCmd;
+use share::ShareCmd;
+use tree::TreeCmd;
 
 /// Reach a service on another machine by its public key, no public IP needed.
 #[derive(Debug, Parser)]
@@ -99,110 +111,13 @@ async fn main() -> eyre::Result<()> {
             // loaded list, never a path (the same seam swoosh drives on its own store).
             let denylist = Denylist::load(revoked_path()?).await?;
             let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
-            expose(&node, cmd, signet, denylist).await
+            cmd.run(&node, signet, denylist).await
         }
         Command::Connect(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
             let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
-            connect(&node, cmd).await
+            cmd.run(&node).await
         }
-    }
-}
-
-/// tightbeam's `expose` adapter: a thin glue over [`tightbeam::tunnel`], symmetric with swoosh's. Parse
-/// the services, resolve the gate through the shared `resolve_gate` policy (`--public` opens, else a family
-/// gate on the signet, else a loud error), print tightbeam's OWN banner, and run the exposer. The core
-/// prints nothing; the banner is this CLI's to own.
-///
-/// tightbeam's binary is a thin demo of the tunnel: it exposes only the raw-forward primitive
-/// (`host:port` / `unix:<path>`), so it hands the exposer an EMPTY registry and names no service crate. A
-/// handler service (`sshd:`, `fetch:`, `ping:`) lives in its own crate that swoosh injects; a bare scheme
-/// here resolves to a handler no registry holds and is refused loudly at [`Exposer::new`].
-async fn expose<T: Transport, D: bifrost::Discovery>(
-    node: &Node<T, D>,
-    cmd: ExposeCmd,
-    signet: Option<NodeId>,
-    denylist: Denylist,
-) -> eyre::Result<()>
-where
-    <T::Session as bifrost::Session>::Write: Send + 'static,
-    <T::Session as bifrost::Session>::Read: Send + 'static,
-{
-    let services = Services::parse(&cmd.services)?;
-    // Build the gate before announcing readiness: an unprovisioned node with no `--public` fails HERE,
-    // loudly, through the ONE shared policy point, never on a permissive default.
-    let gate = tunnel::resolve_gate(cmd.public, signet, denylist)?;
-    // The core assembles the exposer over an empty registry (tightbeam ships no handler of its own), so a
-    // named-service scheme is refused at construction, and only raw forwards are served.
-    let exposer = Exposer::new(services.clone(), Registry::new(), gate)?;
-    if !cmd.quiet {
-        expose_banner(
-            node.node_id(),
-            services.names(),
-            &gate_description(&cmd, signet),
-        );
-    }
-    exposer.run(node).await
-}
-
-/// Print tightbeam's readiness banner: the copyable node id set off by blank lines, a header, and a trailer
-/// naming the exposed services, the effective gate, and how to stop. Points at `tightbeam share` (this
-/// CLI's own mint verb). Only public material (the node id) is printed; the host seed and signet secret
-/// never appear. Withheld under `--quiet`.
-///
-/// Printed to STDERR, never stdout: a `stdin:` producer pipes its bytes into this process's stdin, and stdout
-/// is a data path (`connect --to -` mirrors it), so a human banner on stdout could interleave into the
-/// stream. stderr is for the human; stdout/stdin carry data.
-fn expose_banner<'a>(node_id: NodeId, names: impl Iterator<Item = &'a str>, gate: &str) {
-    eprintln!("tightbeam ready. peers can reach these services at:\n");
-    eprintln!(
-        "    {node_id}                     (share this key, or mint a link with `tightbeam share`)\n"
-    );
-    let names: Vec<&str> = names.collect();
-    eprintln!(
-        "exposing {}. gate: {}. ctrl-c to stop.",
-        names.join(", "),
-        gate
-    );
-}
-
-/// A one-line description of the effective gate, for the readiness banner: trust made visible.
-fn gate_description(cmd: &ExposeCmd, signet: Option<NodeId>) -> String {
-    if cmd.public {
-        "public (anyone, unauthenticated)".to_owned()
-    } else {
-        match signet {
-            Some(root) => format!("signet {}", root.short()),
-            None => "unprovisioned".to_owned(),
-        }
-    }
-}
-
-/// tightbeam's `connect` adapter: resolve the target into a library [`Connector`], then drive the sink the
-/// single `--to` selector names -- bind a local port and forward each accepted connection, stream the
-/// service to stdout (`--to -`, the ssh `ProxyCommand` shape), or a reserved unix listener. `To` is one
-/// closed enum, so the sink is unambiguous with no arg group and no missing-means-stdio inference.
-async fn connect<T: Transport, D: bifrost::Discovery>(
-    node: &Node<T, D>,
-    cmd: ConnectCmd,
-) -> eyre::Result<()> {
-    let connector = cmd.connector()?;
-    match cmd.to {
-        To::Port(port) => {
-            // Prove the gate admits us BEFORE announcing readiness: `preflight` reaches, probes admission,
-            // and binds the port, returning an error (with the host's reason) on refusal. Only past it is
-            // "forwarding …" true, so an unauthorized forward fails loudly here, never a fake success then
-            // a silent reset.
-            let (dial, service) = (connector.dial(), connector.service().to_owned());
-            let forward = connector.preflight(node, port).await?;
-            println!("forwarding 127.0.0.1:{port} to {dial} ({service})");
-            forward.run().await
-        }
-        To::Stdout => connector.pipe_stdio(node).await,
-        To::UnixListener(path) => eyre::bail!(
-            "--to unix:{} is reserved, not yet built (bind a port and connect to it, or use `--to -`)",
-            path.display()
-        ),
     }
 }
 

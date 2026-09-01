@@ -1,19 +1,18 @@
-//! `tightbeam connect`: the clap surface for binding a peer's exposed service to a local port, streaming
-//! it to stdout, or (reserved) a local unix-socket listener, by node id or by capability link.
+//! `tightbeam connect`: bind a peer's exposed service to a local port, stream it to stdout, or (reserved) a
+//! local unix-socket listener, by node id or by capability link.
 //!
-//! The `Args` struct + its `Target` parse type + the `connector` resolver live here; the driving body
-//! (forward a port or stream stdout) is `main.rs` glue over the library [`Connector`], so tightbeam's CLI
-//! is a thin adapter symmetric with swoosh's. The single `--to` selector ([`To`]) replaces the old
-//! `--to`/`--stdio` pair, so "which local sink" is one unambiguous, unrepresentable-when-wrong choice.
+//! The `Args` struct, its `Target` parse type, and the driving body ([`ConnectCmd::run`]) live here, a thin
+//! adapter over the library [`Connector`] symmetric with swoosh's. The single `--to` selector ([`To`])
+//! replaces the old `--to`/`--stdio` pair, so "which local sink" is one unambiguous,
+//! unrepresentable-when-wrong choice.
 
 use core::str::FromStr;
 use std::path::PathBuf;
 
-use bifrost::NodeId;
+use bifrost::{Node, NodeId, Transport};
 use clap::Args;
 use nauthy::{Cap, SCHEME};
-
-use crate::tunnel::Connector;
+use tightbeam::tunnel::Connector;
 
 /// Where a reached service's bytes go locally: the one `--to` selector, parsed to a closed enum so the
 /// three sinks are disjoint and "two sinks at once" is unrepresentable (no `ArgGroup`, no two-bool trap).
@@ -106,10 +105,37 @@ impl FromStr for Target {
 }
 
 impl ConnectCmd {
+    /// tightbeam's `connect` adapter: resolve the target into a library [`Connector`], then drive the sink
+    /// the single `--to` selector names -- bind a local port and forward each accepted connection, stream the
+    /// service to stdout (`--to -`, the ssh `ProxyCommand` shape), or a reserved unix listener. [`To`] is one
+    /// closed enum, so the sink is unambiguous with no arg group and no missing-means-stdio inference.
+    pub async fn run<T: Transport, D: bifrost::Discovery>(
+        self,
+        node: &Node<T, D>,
+    ) -> eyre::Result<()> {
+        let connector = self.connector()?;
+        match self.to {
+            To::Port(port) => {
+                // Prove the gate admits us BEFORE announcing readiness: `preflight` reaches, probes
+                // admission, and binds the port, returning an error (with the host's reason) on refusal.
+                // Only past it is "forwarding …" true, so an unauthorized forward fails loudly here, never
+                // a fake success then a silent reset.
+                let (dial, service) = (connector.dial(), connector.service().to_owned());
+                let forward = connector.preflight(node, port).await?;
+                println!("forwarding 127.0.0.1:{port} to {dial} ({service})");
+                forward.run().await
+            }
+            To::Stdout => connector.pipe_stdio(node).await,
+            To::UnixListener(path) => eyre::bail!(
+                "--to unix:{} is reserved, not yet built (bind a port and connect to it, or use `--to -`)",
+                path.display()
+            ),
+        }
+    }
+
     /// Resolve the target into a [`Connector`]: a raw node id (optionally presenting a link) or a link that
-    /// supplies both the node to dial and the token. The driving (`preflight`+`run` for a port, `pipe_stdio`
-    /// for `-`, chosen by [`To`]) is `main.rs` glue over the returned connector.
-    pub fn connector(&self) -> eyre::Result<Connector> {
+    /// supplies both the node to dial and the token.
+    fn connector(&self) -> eyre::Result<Connector> {
         let service = String::clone(&self.service);
         match &self.target {
             Target::Node(node) => Ok(Connector::to_node(*node, service, self.present.clone())),
