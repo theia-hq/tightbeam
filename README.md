@@ -145,12 +145,33 @@ program on each end does not know the overlay is there. The service on the host 
 
 - a `host:port` or `unix:<path>` (spliced to a local address), tightbeam's own raw forward;
 - a `file:<path>` or `fifo:<path>` (a path's raw bytes sourced to the peer), or `stdin:` (whatever a
-  producer pipes in, single-consumer, one reader takes it);
+  producer pipes in). A `stdin:`/`fifo:` source is single-consumer by default; `+lossy` opts it into
+  fan-out to many (see below);
 - a named handler you injected (a keyless shell, an HTTP fetcher, link diagnostics).
 
 For worked scenarios (ssh with no public IP, reach a database port, HTTP through a node), see
 [examples.md](examples.md). Those are shown as swoosh commands, since swoosh is the tool; each is the same
 one library move underneath.
+
+## Fan-out (opt-in, loss-tolerant only)
+
+By default a `stdin:` or `fifo:` source serves ONE consumer: the second connector is refused. Add `+lossy`
+to send one live source to many consumers at once, dropping bytes for any consumer that falls behind:
+
+```sh
+# one webcam, many viewers; a slow viewer drops frames, it never stalls the others
+ffmpeg ... | swoosh serve cam=stdin:+lossy
+```
+
+A consumer that reads too slowly has its oldest unread bytes discarded and jumps to the live edge. The
+producer never waits on a consumer, and one slow consumer never gaps another. A late joiner starts from
+now, not the beginning.
+
+Use `+lossy` only for content where a dropped byte does not matter: a webcam, an audio feed, a log tail.
+Never use it for EXACT bytes. A `tar`, a file, any byte-precise stream: a dropped byte is silent
+corruption, not a skipped frame. Those stay single-consumer, or use `file:`, which re-opens per reader so
+each gets the whole thing. Only the operator knows whether the content tolerates loss, so only the operator
+can declare it: `+lossy` is refused on any scheme other than `stdin:`/`fifo:`, and refused under `--public`.
 
 ## The thin binary
 
