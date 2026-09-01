@@ -8,7 +8,7 @@
 //! Run it on one machine, no network and no config needed:
 //!
 //! ```sh
-//! cargo run --example reach_a_service_by_key
+//! cargo run --example reach_by_key
 //! ```
 //!
 //! It uses bifrost's in-process transport so the two nodes talk without touching the network. Swap

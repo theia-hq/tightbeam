@@ -45,9 +45,9 @@ You also depend on `bifrost` (to bind an overlay node) and `nauthy` (to build th
 Three runnable examples show the whole library, each one capability, no network needed (`cargo run
 --example <name>`):
 
-- [`reach_a_service_by_key`](examples/reach_a_service_by_key.rs): expose a service on one node and reach it
+- [`reach_by_key`](examples/reach_by_key.rs): expose a service on one node and reach it
   by key from another (the core loop).
-- [`gate_a_service_with_a_capability`](examples/gate_a_service_with_a_capability.rs): put it behind a signet
+- [`gate_a_service`](examples/gate_a_service.rs): put it behind a signet
   gate, mint a capability, and watch it admitted with the cap and refused without.
 - [`named_handler`](examples/named_handler.rs): inject your own `Handler` and reach it by name (the
   extension point every service is built on).

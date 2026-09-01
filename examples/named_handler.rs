@@ -1,6 +1,6 @@
 //! Serve a NAMED service by injecting your own handler, and reach it by name.
 //!
-//! The companion to `reach_a_service_by_key` (a raw forward) and `gate_a_service_with_a_capability` (the
+//! The companion to `reach_by_key` (a raw forward) and `gate_a_service` (the
 //! gate). Here the node serves a NAMED service: you write a [`Handler`](tightbeam::tunnel::Handler),
 //! register it under a scheme name, and tightbeam hands every admitted stream for that name to your code.
 //! tightbeam knows only the contract, never what the handler does: a keyless shell, an HTTP fetch, and this

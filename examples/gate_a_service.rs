@@ -1,6 +1,6 @@
 //! Gate a service behind a capability, then reach it by presenting one, over the bifrost overlay.
 //!
-//! The companion to [`reach_a_service_by_key`](../reach_a_service_by_key/index.html): that one admits
+//! The companion to [`reach_by_key`](../reach_by_key/index.html): that one admits
 //! anyone who reaches the key ([`Gate::Open`](nauthy::Gate::Open)); this one admits only a caller holding a
 //! `sheer:` capability the exposer's identity signed. The exposer stands its service behind a *signet gate*
 //! (its own key); the owner [`mint_link`](tightbeam::tunnel::mint_link)s a capability granting one service;
@@ -10,7 +10,7 @@
 //! Run it on one machine, no network and no config needed:
 //!
 //! ```sh
-//! cargo run --example gate_a_service_with_a_capability
+//! cargo run --example gate_a_service
 //! ```
 //!
 //! It uses bifrost's in-process transport so the two nodes talk without touching the network. One wrinkle
