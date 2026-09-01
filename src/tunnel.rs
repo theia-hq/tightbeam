@@ -18,6 +18,7 @@ use futures::stream::FuturesUnordered;
 use nauthy::{Admitted, Cap, Denylist, Gate, Identity, Refusal, Service};
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 use crate::identity::{AsNodeId as _, AsVerifyKey as _};
 use crate::protocol::{Request, Response};
@@ -41,6 +42,18 @@ const MAX_SESSIONS: usize = 256;
 
 /// The maximum number of in-flight streams per session, bounding what a single connected peer can pin.
 const MAX_STREAMS_PER_SESSION: usize = 256;
+
+/// The maximum number of raw-stream opens (`file:`/`fifo:`/`stdin:`) in flight across the whole node. A
+/// `fifo:` open blocks a tokio blocking-pool thread until a writer appears (up to [`RAW_STREAM_OPEN_TIMEOUT`],
+/// and the thread can leak past it since `timeout` cancels the await, not the blocking syscall). The
+/// per-open timeout bounds ONE open, but not a flood: without a concurrency cap an admitted peer (or anyone
+/// under `--public`) could request hundreds of never-written `fifo:` streams and park hundreds of blocking
+/// threads at once, saturating the pool (tokio's default is 512) and starving all other `spawn_blocking`
+/// work. This semaphore caps concurrent opens well below the pool so parked opens can never approach it; a
+/// request over the cap is refused cleanly rather than parking one more thread. Small because a legitimate
+/// node serves a handful of raw streams, never hundreds; `file:`/`stdin:` opens return fast and hold a
+/// permit only briefly, so the cap does not penalize the common single-stream case.
+const RAW_STREAM_OPEN_PERMITS: usize = 16;
 
 /// The single, indistinguishable refusal a not-admitted dialer receives on the wire. A dialer the gate does
 /// not admit gets THIS and nothing else: no reason that separates a stranger (missing token) from a
@@ -298,6 +311,10 @@ impl Exposer {
         } = self;
         let services = Arc::new(services);
         let gate = Arc::new(gate);
+        // Cap concurrent raw-stream opens across the whole node (all sessions share this one semaphore), so a
+        // flood of never-written `fifo:` opens cannot park unbounded blocking threads. See
+        // `RAW_STREAM_OPEN_PERMITS`.
+        let raw_stream_opens = Arc::new(Semaphore::new(RAW_STREAM_OPEN_PERMITS));
         let mut sessions = FuturesUnordered::new();
         loop {
             tokio::select! {
@@ -318,6 +335,7 @@ impl Exposer {
                         Arc::clone(&gate),
                         Arc::clone(&services),
                         Arc::clone(&registry),
+                        Arc::clone(&raw_stream_opens),
                     ));
                 }
                 Some(result) = sessions.next(), if !sessions.is_empty() => {
@@ -336,6 +354,7 @@ async fn serve_session<S: Session>(
     gate: Arc<Gate>,
     services: Arc<Services>,
     registry: Arc<Registry>,
+    raw_stream_opens: Arc<Semaphore>,
 ) -> eyre::Result<()>
 where
     S::Write: Send + 'static,
@@ -360,6 +379,7 @@ where
                         Arc::clone(&gate),
                         Arc::clone(&services),
                         Arc::clone(&registry),
+                        Arc::clone(&raw_stream_opens),
                     )),
                     Err(error) => {
                         tracing::warn!(%peer, %error, "accept_bi failed; draining in-flight streams");
@@ -391,6 +411,7 @@ async fn serve_request<W, R>(
     gate: Arc<Gate>,
     services: Arc<Services>,
     registry: Arc<Registry>,
+    raw_stream_opens: Arc<Semaphore>,
 ) -> eyre::Result<()>
 where
     W: io::AsyncWrite + Unpin + Send + 'static,
@@ -446,22 +467,38 @@ where
         // succeeds, so a peer learns "refused" (not a silent hang or a mid-stream reset) when the target is a
         // device, a directory, a symlink, a FIFO whose writer never appears, or a `stdin:` already taken by a
         // concurrent connection (the single-consumer refusal).
-        Some(Target::RawStream(stream)) => match stream.open().await {
-            Ok(source) => {
-                Response::Ok.write(&mut writer).await?;
-                // Direction is fixed at parse time: read the source, send its bytes to the peer, and
-                // discard any bytes the peer sends upstream (a read-only source has nowhere to put them).
-                // Using `splice_halves` (never the duplex `splice`) is what makes "write peer bytes back
-                // into the source" unrepresentable.
-                splice_halves(source, io::sink(), writer, reader).await?;
+        Some(Target::RawStream(stream)) => {
+            // Take a raw-stream open permit BEFORE opening (a `fifo:` open blocks a thread until a writer
+            // appears): `try_acquire` refuses immediately when the cap is reached rather than parking another
+            // blocking thread, so a flood of never-written `fifo:` opens cannot saturate the pool. The permit
+            // is held only across the open (the splice below holds no blocking thread) and dropped when
+            // `_permit` leaves scope. See `RAW_STREAM_OPEN_PERMITS`.
+            let opened = match raw_stream_opens.try_acquire() {
+                Ok(_permit) => stream.open().await,
+                Err(_at_cap) => {
+                    tracing::warn!(%peer, service = %service, "raw-stream open cap reached; refusing");
+                    Err(eyre::eyre!(
+                        "the host is opening too many raw streams right now; try again shortly"
+                    ))
+                }
+            };
+            match opened {
+                Ok(source) => {
+                    Response::Ok.write(&mut writer).await?;
+                    // Direction is fixed at parse time: read the source, send its bytes to the peer, and
+                    // discard any bytes the peer sends upstream (a read-only source has nowhere to put them).
+                    // Using `splice_halves` (never the duplex `splice`) is what makes "write peer bytes back
+                    // into the source" unrepresentable.
+                    splice_halves(source, io::sink(), writer, reader).await?;
+                }
+                Err(error) => {
+                    tracing::warn!(%peer, service = %service, %error, "raw-stream open refused");
+                    Response::Error(error.to_string())
+                        .write(&mut writer)
+                        .await?;
+                }
             }
-            Err(error) => {
-                tracing::warn!(%peer, service = %service, %error, "raw-stream open refused");
-                Response::Error(error.to_string())
-                    .write(&mut writer)
-                    .await?;
-            }
-        },
+        }
         // A named service: hand the admitted stream to the caller-injected handler. The `Admitted` witness
         // proves the gate ruled on THIS stream and is moved into the handler by value (single-use), so a
         // handler can never run for an unauthorized peer; the guarantee holds only because the admit
@@ -941,7 +978,10 @@ mod tests {
     use nauthy::{Gate, Service};
     use tokio::io::AsyncReadExt as _;
 
-    use super::{BoxRead, Exposer, Registry, Services, Target, resolve_single_service};
+    use super::{
+        BoxRead, Exposer, RAW_STREAM_OPEN_PERMITS, Registry, Semaphore, Services, Target,
+        resolve_single_service, serve_request,
+    };
     use crate::raw_stream::RawStream;
 
     fn svc(name: &str) -> Service {
@@ -1174,6 +1214,202 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    /// Make a named FIFO with no writer, so opening it for read BLOCKS (the parking a flood exploits). The
+    /// path is unique per process + a counter so parallel tests never collide; the caller removes it.
+    fn never_written_fifo(tag: &str) -> std::path::PathBuf {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "tightbeam-fifo-cap-{}-{tag}-{}",
+            std::process::id(),
+            n
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut c_path = path.clone().into_os_string().into_encoded_bytes();
+        c_path.push(0);
+        // SAFETY: `c_path` is a NUL-terminated C string that outlives the call; a failed mkfifo returns -1
+        // and the test fails on it. Mode 0600: the FIFO is scratch, readable/writable by this process only.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr().cast::<libc::c_char>(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo {} failed", path.display());
+        path
+    }
+
+    /// Drive one `serve_request` for `service` against a `Gate::Open` node sharing `permits`, and return the
+    /// client's stream end plus the serving future. The serving future is returned UN-awaited so a caller can
+    /// let it park (a never-written FIFO) or poll it for the refusal, and the returned reader carries the
+    /// host's `Response`. Uses `tokio::io::duplex` so no transport is needed.
+    fn drive_open(
+        service: &str,
+        services: std::sync::Arc<Services>,
+        permits: std::sync::Arc<Semaphore>,
+    ) -> (
+        tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        impl core::future::Future<Output = eyre::Result<()>>,
+    ) {
+        let (client, server) = tokio::io::duplex(1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let service = service.to_owned();
+        // The peer id is only for the host's log line here; any valid NodeId does.
+        let peer = bifrost::NodeId::from_ed25519_secret(&[9u8; 32]);
+        let serve = async move {
+            crate::protocol::Request {
+                service: service.clone(),
+                capability: None,
+            }
+            .write(&mut client_write)
+            .await
+            .expect("write request");
+            // Close the client's write half now the request is sent: the served splice's downstream copy
+            // (peer -> `io::sink()`) ends on this EOF, so a served stream can actually finish (otherwise the
+            // splice's `try_join!` would wait forever for the client to hang up).
+            drop(client_write);
+            serve_request(
+                peer,
+                server_write,
+                server_read,
+                std::sync::Arc::new(Gate::Open),
+                services,
+                std::sync::Arc::new(Registry::new()),
+                permits,
+            )
+            .await
+        };
+        (client_read, serve)
+    }
+
+    /// AVAILABILITY (Adversary A-1, delib 05): a flood of never-written `fifo:` opens cannot park more than
+    /// `RAW_STREAM_OPEN_PERMITS` blocking threads at once. With a cap of N, launch N+K concurrent opens of a
+    /// FIFO that has no writer: exactly N acquire a permit and park in the blocking open (no `Response` yet),
+    /// while every over-cap open is refused CLEANLY and FAST with the cap message, never parking one more
+    /// thread. Proven with a small explicit permit count so the test does not wait the full open timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flood_of_fifo_opens_cannot_exceed_the_cap() {
+        use tokio::io::AsyncReadExt as _;
+
+        let fifo = never_written_fifo("flood");
+        let services = std::sync::Arc::new(services(&[&format!("pipe=fifo:{}", fifo.display())]));
+
+        const CAP: usize = 3;
+        const OVER: usize = 4;
+        let permits = std::sync::Arc::new(Semaphore::new(CAP));
+
+        // CAP opens grab a permit and park in the blocking FIFO open; hold their serving futures so the
+        // permits stay taken. They MUST NOT respond (they are blocked waiting for a writer that never comes).
+        let mut parked = Vec::new();
+        for _ in 0..CAP {
+            let (mut client_read, serve) = drive_open(
+                "pipe",
+                std::sync::Arc::clone(&services),
+                std::sync::Arc::clone(&permits),
+            );
+            let handle = tokio::spawn(serve);
+            // Give the open a moment to acquire its permit and enter the blocking syscall.
+            let mut byte = [0u8; 1];
+            let responded = tokio::time::timeout(
+                core::time::Duration::from_millis(200),
+                client_read.read(&mut byte),
+            )
+            .await;
+            assert!(
+                responded.is_err(),
+                "a permit-holding FIFO open must PARK (no response), not answer before a writer appears"
+            );
+            parked.push((handle, client_read));
+        }
+
+        // With every permit taken, the OVER-cap opens must be refused immediately with the cap message, never
+        // parking another thread. Each returns a `Response::Error` a client can read at once.
+        for _ in 0..OVER {
+            let (mut client_read, serve) = drive_open(
+                "pipe",
+                std::sync::Arc::clone(&services),
+                std::sync::Arc::clone(&permits),
+            );
+            tokio::spawn(serve);
+            let response = tokio::time::timeout(
+                core::time::Duration::from_secs(2),
+                crate::protocol::Response::read(&mut client_read),
+            )
+            .await
+            .expect("an over-cap open must answer promptly, not park")
+            .expect("read response");
+            match response {
+                crate::protocol::Response::Error(message) => assert!(
+                    message.contains("too many raw streams"),
+                    "the over-cap refusal must name the cap: {message}"
+                ),
+                crate::protocol::Response::Ok => {
+                    panic!("an over-cap open must be refused, not served")
+                }
+            }
+        }
+
+        // Release the parked opens so the test's runtime can shut down: open the FIFO's write end, which is the
+        // writer they were blocking for. Their `open()` completes, the blocking threads return, and the serving
+        // futures finish. (In production these threads leak until a writer appears or the process exits, which
+        // is exactly why the cap above exists; the test just supplies the writer to avoid leaking into the next
+        // test.) The open is itself blocking (a FIFO open for write blocks until a reader is present, which the
+        // parked reads are), so it runs off the async runtime.
+        // Free the parked blocking `open`s so no thread leaks into the next test: open the FIFO `O_RDWR`
+        // (which never blocks) so the parked read-`open`s return, then abort the serving tasks. In production
+        // an unwritten FIFO's `open` leaks its blocking thread until a writer appears or the process exits,
+        // which is exactly the resource the cap bounds; the test supplies a writer so the leak does not bleed
+        // into the next test.
+        let writer_path = fifo.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let _rdwr = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_RDWR)
+                .open(&writer_path);
+        })
+        .await
+        .expect("open the FIFO read-write end");
+        for (handle, _client) in parked {
+            handle.abort();
+        }
+        let _ = std::fs::remove_file(&fifo);
+    }
+
+    /// A single raw-stream open under the cap still works: one `file:` open (the common case) acquires a
+    /// permit, opens fast, and serves its bytes. The cap never penalizes normal single-stream serving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_single_raw_stream_open_is_unaffected_by_the_cap() {
+        use std::io::Write as _;
+
+        use tokio::io::AsyncReadExt as _;
+
+        let path = std::env::temp_dir().join(format!("tightbeam-cap-ok-{}", std::process::id()));
+        let body = b"one open, under the cap";
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(body))
+            .expect("write scratch file");
+
+        let services = std::sync::Arc::new(services(&[&format!("doc=file:{}", path.display())]));
+        let permits = std::sync::Arc::new(Semaphore::new(RAW_STREAM_OPEN_PERMITS));
+
+        let (mut client_read, serve) = drive_open("doc", services, permits);
+        tokio::spawn(serve);
+        // First the Ok, then the source's exact bytes.
+        match crate::protocol::Response::read(&mut client_read)
+            .await
+            .expect("read response")
+        {
+            crate::protocol::Response::Ok => {}
+            crate::protocol::Response::Error(message) => {
+                panic!("a single open under the cap must succeed, got: {message}")
+            }
+        }
+        let mut got = Vec::new();
+        client_read.read_to_end(&mut got).await.expect("read bytes");
+        assert_eq!(got, body, "the single open serves the file's exact bytes");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A tiny test client that speaks tightbeam's `Request`/`Response` handshake on one stream, so the unit

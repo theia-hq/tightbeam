@@ -167,8 +167,11 @@ impl RawStream {
 /// `stdin:` arm (no path, no guards) reads cleanly beside it.
 async fn open_path(path: PathBuf, kind: Kind) -> eyre::Result<BoxRead> {
     // Guard 2 (blocking-open timeout): the `open()` itself blocks for a FIFO with no writer, so it runs on a
-    // blocking thread bounded by the timeout. On elapse the open is abandoned (the blocking thread completes
-    // or dies with the runtime); the stream is refused rather than pinned.
+    // blocking thread bounded by the timeout. On elapse the AWAIT is abandoned and the stream is refused, but
+    // `tokio::time::timeout` cancels the await, not the blocking syscall: the parked thread leaks until a
+    // writer appears or the process exits. The per-open timeout bounds ONE open; a FLOOD of never-written
+    // FIFOs is bounded separately by the `RAW_STREAM_OPEN_PERMITS` semaphore the serve path holds around this
+    // call, so parked opens can never approach the blocking-pool size.
     let for_error = path.clone();
     let opened = tokio::time::timeout(
         RAW_STREAM_OPEN_TIMEOUT,
