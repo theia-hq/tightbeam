@@ -5,7 +5,7 @@ use core::time::Duration;
 use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
 use nauthy::Gate;
-use tightbeam::tunnel::{Connector, Exposer, Services};
+use tightbeam::tunnel::{CancellationToken, Connector, Exposer, Services};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
 
@@ -46,7 +46,7 @@ async fn tunnels_to_a_unix_socket() {
                 let services = Services::parse(&[service]).unwrap();
                 Exposer::new(services, tightbeam::tunnel::Registry::new(), Gate::Open)
                     .unwrap()
-                    .run(&exposer)
+                    .run(&exposer, CancellationToken::new())
                     .await
                     .unwrap();
             });

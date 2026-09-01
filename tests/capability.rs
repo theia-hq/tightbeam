@@ -15,7 +15,7 @@ use core::time::Duration;
 use bifrost::{NoDiscovery, Node, NodeId};
 use bifrost_mem::MemTransport;
 use nauthy::{Denylist, Identity, Service};
-use tightbeam::tunnel::{self, Connector, Exposer, Services};
+use tightbeam::tunnel::{self, CancellationToken, Connector, Exposer, Services};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -41,7 +41,7 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
                     tunnel::resolve_gate(false, Some(signet), empty_denylist().await).unwrap();
                 Exposer::new(services, tightbeam::tunnel::Registry::new(), gate)
                     .unwrap()
-                    .run(&exposer)
+                    .run(&exposer, CancellationToken::new())
                     .await
                     .unwrap();
             });

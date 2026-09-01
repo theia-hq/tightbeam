@@ -19,6 +19,9 @@ use nauthy::{Admitted, Cap, Denylist, Gate, Identity, Refusal, Service};
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
+// Re-exported below: it is part of `Exposer::run`'s contract (the node's teardown authority), so a caller
+// reaches it through `tightbeam::tunnel` alongside `Exposer` rather than depending on tokio-util directly.
+pub use tokio_util::sync::CancellationToken;
 
 use crate::identity::{AsNodeId as _, AsVerifyKey as _};
 use crate::protocol::{Request, Response};
@@ -301,8 +304,20 @@ impl Exposer {
     }
 
     /// Accept overlay sessions from permitted peers and forward each inbound stream to its service. Runs
-    /// until cancelled; prints nothing (the caller printed its own readiness banner before calling).
-    pub async fn run<T: Transport, D: Discovery>(self, node: &Node<T, D>) -> eyre::Result<()>
+    /// until `cancel` fires, then stops accepting and returns gracefully; prints nothing (the caller printed
+    /// its own readiness banner before calling).
+    ///
+    /// `cancel` is the node's ONE teardown authority. The exposer is the single owner of that authority: it
+    /// is the only thing that ACTS on the token (stops accepting, drains, returns). A local timer
+    /// (`serve --for`) or an admitted `control.stop` handler holds a CLONE of the same token as a
+    /// node-control CAPABILITY -- they may REQUEST teardown by cancelling it, but they never hold a node
+    /// handle and never tear anything down themselves. So "who may stop the node" stays a property of who
+    /// holds a token clone (a cap-gated question), while "how the node stops" lives here, in one place.
+    pub async fn run<T: Transport, D: Discovery>(
+        self,
+        node: &Node<T, D>,
+        cancel: CancellationToken,
+    ) -> eyre::Result<()>
     where
         <T::Session as Session>::Write: Send + 'static,
         <T::Session as Session>::Read: Send + 'static,
@@ -321,6 +336,11 @@ impl Exposer {
         let mut sessions = FuturesUnordered::new();
         loop {
             tokio::select! {
+                // Teardown: the cancel token fired (a local `--for` deadline, or an admitted `control.stop`
+                // caller holding a clone). Stop accepting and return gracefully. The in-flight sessions in
+                // `sessions` are dropped with this future; the caller closes the node next (`node.close()`),
+                // which tears their transport down. One owner of teardown, here.
+                () = cancel.cancelled() => return Ok(()),
                 // Cap concurrent sessions: past the cap, stop polling `accept` so new connections queue at
                 // the transport (backpressure) rather than each pinning a task set, bounding a peer flood.
                 accepted = node.accept(), if sessions.len() < MAX_SESSIONS => {
@@ -1270,7 +1290,10 @@ mod tests {
                     gate: Gate::Open,
                 };
                 tokio::task::spawn_local(async move {
-                    exposer.run(&exposer_node).await.expect("exposer runs");
+                    exposer
+                        .run(&exposer_node, super::CancellationToken::new())
+                        .await
+                        .expect("exposer runs");
                 });
 
                 // First consumer: opens a service stream, gets Ok, and reads the source's exact bytes.
@@ -1293,6 +1316,39 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    /// The cancel seam (delib-18/S18): `Exposer::run` returns gracefully when its cancel token fires, so a
+    /// local `serve --for` timer or an admitted `control.stop` caller (each holding a CLONE of this token as
+    /// the node-control capability) can stop the node. Here the token is cancelled from OUTSIDE the run (the
+    /// shape both the timer and the handler use); the run must finish with `Ok(())` rather than accept
+    /// forever. Uses the mem transport so no real socket is bound.
+    #[tokio::test]
+    async fn run_returns_gracefully_when_its_cancel_token_fires() {
+        let node = Node::new(MemTransport::bind(), NoDiscovery);
+        let exposer = Exposer {
+            services: services(&["web=127.0.0.1:80"]),
+            registry: std::sync::Arc::new(Registry::new()),
+            gate: Gate::Open,
+        };
+        let cancel = super::CancellationToken::new();
+
+        // Run the exposer, then cancel it: the run is idle (no peer connects), so its accept loop is parked
+        // on `accept`. Cancelling must wake it and return `Ok(())`, bounded so a regression (a run that
+        // ignores the token and accepts forever) fails as a timeout rather than hanging the suite.
+        let handle = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { exposer.run(&node, cancel).await }
+        });
+        cancel.cancel();
+        let ended = tokio::time::timeout(core::time::Duration::from_secs(5), handle)
+            .await
+            .expect("a cancelled run must return promptly, not accept forever")
+            .expect("the run task joins");
+        assert!(
+            ended.is_ok(),
+            "a cancelled run returns Ok(()), not an error: {ended:?}"
+        );
     }
 
     /// FAN-OUT (delib-20 ship-blocker): a `+lossy` source served to N consumers over the in-process transport,
@@ -1325,7 +1381,7 @@ mod tests {
                     gate: Gate::Open,
                 };
                 tokio::task::spawn_local(async move {
-                    exposer.run(&exposer_node).await.expect("exposer runs");
+                    exposer.run(&exposer_node, super::CancellationToken::new()).await.expect("exposer runs");
                 });
 
                 // Attach N consumers: each opens a stream and is admitted (Response::Ok), the first lazy-opening
@@ -1691,7 +1747,7 @@ mod tests {
                 let exposer_id = exposer_node.node_id();
                 let consumer = Node::new(MemTransport::bind(), NoDiscovery);
                 tokio::task::spawn_local(async move {
-                    exposer.run(&exposer_node).await.expect("exposer runs");
+                    exposer.run(&exposer_node, super::CancellationToken::new()).await.expect("exposer runs");
                 });
 
                 // Every dial opens a fresh session/stream (each stream is gated on its own merits).
@@ -1783,7 +1839,7 @@ mod tests {
                 let exposer_id = exposer_node.node_id();
                 let consumer = Node::new(MemTransport::bind(), NoDiscovery);
                 tokio::task::spawn_local(async move {
-                    exposer.run(&exposer_node).await.expect("exposer runs");
+                    exposer.run(&exposer_node, super::CancellationToken::new()).await.expect("exposer runs");
                 });
 
                 let session = consumer.connect(exposer_id).await.expect("connect");

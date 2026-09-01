@@ -7,7 +7,7 @@
 use bifrost::{Node, NodeId, Session, Transport};
 use clap::Args;
 use nauthy::Denylist;
-use tightbeam::tunnel::{self, Exposer, Registry, Services};
+use tightbeam::tunnel::{self, CancellationToken, Exposer, Registry, Services};
 
 /// Expose a local service to peers.
 ///
@@ -68,7 +68,11 @@ impl ExposeCmd {
                 &gate_description(&self, signet),
             );
         }
-        exposer.run(node).await
+        // This thin demo binary has no remote-stop and no local `--for` surface, so it holds no teardown
+        // authority to hand out: it runs until the process is signalled (SIGINT), passing a token that is
+        // never cancelled. swoosh is where the same token is wired to `serve --for` and a gated
+        // `control.stop` handler; here it is inert.
+        exposer.run(node, CancellationToken::new()).await
     }
 }
 

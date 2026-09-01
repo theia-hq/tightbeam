@@ -3777,6 +3777,7 @@ dependencies = [
  "rand 0.8.8",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "zeroize",
@@ -4781,7 +4782,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[patch.unused]]
-name = "sshh"
+name = "quirk"
 version = "0.0.0"
 
 [[patch.unused]]
@@ -4789,5 +4790,5 @@ name = "bifrost-quirk"
 version = "0.0.0"
 
 [[patch.unused]]
-name = "quirk"
+name = "sshh"
 version = "0.0.0"

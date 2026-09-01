@@ -20,7 +20,7 @@ use bifrost::{NoDiscovery, Node, NodeId};
 use bifrost_mem::MemTransport;
 use nauthy::{Denylist, Identity};
 use tightbeam::identity::AsVerifyKey as _;
-use tightbeam::tunnel::{self, Connector, Exposer, Services};
+use tightbeam::tunnel::{self, CancellationToken, Connector, Exposer, Services};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -46,7 +46,7 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
                 let gate = tunnel::resolve_gate(false, Some(signet), empty_denylist().await).unwrap();
                 Exposer::new(services, tightbeam::tunnel::Registry::new(), gate)
                     .unwrap()
-                    .run(&exposer)
+                    .run(&exposer, CancellationToken::new())
                     .await
                     .unwrap();
             });
@@ -115,7 +115,7 @@ async fn a_refused_forward_fails_at_preflight_with_the_reason() {
                     tunnel::resolve_gate(false, Some(signet), empty_denylist().await).unwrap();
                 Exposer::new(services, tightbeam::tunnel::Registry::new(), gate)
                     .unwrap()
-                    .run(&exposer)
+                    .run(&exposer, CancellationToken::new())
                     .await
                     .unwrap();
             });
