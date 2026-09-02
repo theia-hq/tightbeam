@@ -14,15 +14,46 @@
 //! in a real service and the wiring is identical.
 
 use core::time::Duration;
-use std::sync::Arc;
 
 use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
-use futures::FutureExt as _;
-use nauthy::Gate;
-use tightbeam::tunnel::{CancellationToken, Connector, Exposer, Handler, Registry, ServeFn, Services};
+use nauthy::{Admitted, Gate};
+use tightbeam::open_policy::OptIn;
+use tightbeam::tunnel::{
+    BoxRead, BoxWrite, CancellationToken, Connector, Exposer, Handler, Registry, Services,
+};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
+
+/// A named handler: code that consumes ONE admitted stream. This one upper-cases every chunk it receives and
+/// writes it back. It gets the gate's `Admitted` witness BY VALUE (proof this peer passed the gate), so it can
+/// never run for a peer the gate turned away. `type Public = OptIn` marks it legitimately public (safe to
+/// expose openly if the operator opts in); a service that is remote code execution (a shell) names
+/// `type Public = Never`, which refuses an open gate at `Exposer::new`.
+struct Shout;
+
+impl Handler for Shout {
+    type Public = OptIn;
+
+    async fn serve(
+        &self,
+        _admitted: Admitted,
+        mut writer: BoxWrite,
+        mut reader: BoxRead,
+    ) -> eyre::Result<()> {
+        let mut buf = [0u8; 1024];
+        loop {
+            let read = reader.read(&mut buf).await?;
+            if read == 0 {
+                break;
+            }
+            buf[..read].make_ascii_uppercase();
+            writer.write_all(&buf[..read]).await?;
+            writer.flush().await?;
+        }
+        Ok(())
+    }
+}
 
 // tightbeam's overlay futures are not `Send`, so its tasks run on one thread inside a `LocalSet`.
 #[tokio::main(flavor = "current_thread")]
@@ -31,28 +62,8 @@ async fn main() -> eyre::Result<()> {
 }
 
 async fn run() -> eyre::Result<()> {
-    // 1. A named handler: code that consumes ONE admitted stream. This one upper-cases every chunk it
-    //    receives and writes it back. It gets the gate's `Admitted` witness BY VALUE (proof this peer
-    //    passed the gate), so it can never run for a peer the gate turned away. `Handler::open` marks it
-    //    safe to expose publicly; a service that is remote code execution (a shell) uses `Handler::gated`,
-    //    which refuses an open gate at `Exposer::new`.
-    let shout: ServeFn = Arc::new(|_admitted, mut writer, mut reader| {
-        async move {
-            let mut buf = [0u8; 1024];
-            loop {
-                let read = reader.read(&mut buf).await?;
-                if read == 0 {
-                    break;
-                }
-                buf[..read].make_ascii_uppercase();
-                writer.write_all(&buf[..read]).await?;
-                writer.flush().await?;
-            }
-            Ok(())
-        }
-        .boxed()
-    });
-    let registry = Registry::new().with("shout", Handler::open(shout));
+    // 1. Register the `Shout` handler (see its definition above) under the `shout` scheme.
+    let registry = Registry::new().with("shout", Shout);
 
     // 2. Two overlay nodes, and expose the `shout` service under the exposer's key. `shout=shout:` names a
     //    service `shout` served by the `shout` handler registered above.
