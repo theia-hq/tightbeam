@@ -26,6 +26,7 @@
 pub mod config;
 pub mod duration;
 pub mod identity;
+pub mod open_policy;
 pub mod peer;
 #[cfg_attr(not(unix), path = "raw_stream_unsupported.rs")]
 pub mod raw_stream;
@@ -36,6 +37,8 @@ pub mod protocol;
 
 #[cfg(test)]
 mod duration_tests;
+#[cfg(test)]
+mod open_policy_tests;
 #[cfg(test)]
 mod protocol_tests;
 
