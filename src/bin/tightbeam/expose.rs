@@ -56,9 +56,15 @@ impl ExposeCmd {
         <T::Session as Session>::Read: Send + 'static,
     {
         let services = Services::parse(&self.services)?;
-        // Build the gate before announcing readiness: an unprovisioned node with no `--public` fails HERE,
-        // loudly, through the ONE shared policy point, never on a permissive default.
-        let gate = tunnel::resolve_gate(self.public, signet, denylist)?;
+        // Build the gate before announcing readiness. This thin demo has no auto-added `control.*` services,
+        // so its `--public` stays a whole-node opt-out (a deliberate `Gate::Open` BASE); a richer consumer
+        // (swoosh) opens individual services per-service instead. An unprovisioned node with NO `--public`
+        // fails HERE, loudly, through the shared `resolve_gate` policy, never on a permissive default.
+        let gate = if self.public {
+            nauthy::Gate::Open
+        } else {
+            tunnel::resolve_gate(signet, denylist)?
+        };
         // The core assembles the exposer over an empty registry (tightbeam ships no handler of its own), so a
         // named-service scheme is refused at construction, and only raw forwards are served.
         let exposer = Exposer::new(services.clone(), Registry::new(), gate)?;

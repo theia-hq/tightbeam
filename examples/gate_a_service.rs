@@ -65,7 +65,7 @@ async fn run() -> eyre::Result<()> {
     let consumer = Node::new(MemTransport::bind(), NoDiscovery);
 
     // 3. Stand the `ssh` service behind a signet gate rooted at that identity: only a caller presenting a
-    //    capability this identity signed (for this service, unexpired) is admitted. `resolve_gate(false, ..)`
+    //    capability this identity signed (for this service, unexpired) is admitted. `resolve_gate(..)`
     //    is the same policy every embedder applies: not-public means a family gate on the signet, and an
     //    empty denylist admits everything not yet revoked.
     let services = Services::parse(&[format!("ssh={echo_addr}")])?;
@@ -75,7 +75,7 @@ async fn run() -> eyre::Result<()> {
     // `NodeId` (two names for the same ed25519 key on either side of the cap/transport boundary). A real
     // exposer loads this signet from config as a `NodeId` already and never crosses the bridge by hand.
     let signet = identity.node_id().node_id();
-    let gate = tunnel::resolve_gate(false, Some(signet), Denylist::empty(PathBuf::new()))?;
+    let gate = tunnel::resolve_gate(Some(signet), Denylist::empty(PathBuf::new()))?;
     tokio::task::spawn_local(async move {
         if let Err(e) = Exposer::new(services, Registry::new(), gate)?
             .run(&exposer, CancellationToken::new())

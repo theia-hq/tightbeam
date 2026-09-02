@@ -9,7 +9,7 @@
 
 use core::future::Future;
 use core::time::Duration;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bifrost::{ConnInfo, Discovery, Node, NodeId, Session, Transport};
@@ -67,7 +67,12 @@ const RAW_STREAM_OPEN_PERMITS: usize = 16;
 /// and verdict of a service are revealed ONLY AFTER the gate admits the caller for that service, so the
 /// refusal path is not a pre-authorization capability-enumeration or revocation oracle (deliberation 18).
 /// The real reason still reaches the SERVER'S OWN logs (`tracing`); it is only the WIRE that is uniform.
-const UNIFORM_REFUSAL: &str = "refused";
+///
+/// Public so a dialer-side renderer can RECOGNIZE this exact token and phrase it descriptively ("reached,
+/// but refused at the gate") rather than echoing the bare word doubled (`refused (refused)`). Recognizing
+/// the token leaks nothing new: it is what every not-admitted dialer already receives; the descriptive
+/// phrasing is client-side rendering of an outcome the dialer already holds, not a new on-wire signal.
+pub const UNIFORM_REFUSAL: &str = "refused";
 
 /// A forwarding target for one exposed service, resolved once at parse time so `serve_request` matches an
 /// enum rather than a string prefix: either tightbeam's own raw forward (a local socket it splices to) or a
@@ -85,6 +90,31 @@ enum Target {
     RawStream(RawStream),
     /// A named service handler (a bare `<name>:` scheme) dispatched through the injected registry.
     Handler(String),
+}
+
+impl Target {
+    /// Whether this target may be OPENED to strangers (added to an [`Exposer`]'s public overlay). A TOTAL
+    /// function over [`Target`], resolved THROUGH the target rather than off its served name, so an alias
+    /// (`foo=sshd:`) or a raw stream cannot be opened by naming it: the target's own posture decides, never
+    /// the name.
+    ///
+    /// The exhaustive match is the guarantee, split by which mechanism proves each arm safe. The TYPE
+    /// guarantee (the sealed, uninhabited `Public` marker erased to [`ErasedHandler::open_safe`]) covers
+    /// [`Handler`](Target::Handler) only: a `Never` handler (a keyless shell) reads `false`, an `OptIn`
+    /// handler `true`, and an unregistered scheme fails closed (`false`). The EXHAUSTIVE-MATCH guarantee
+    /// covers the other two arms: a [`Forward`](Target::Forward) is a socket the operator deliberately stood
+    /// up, so it is openable (`true`, today's rule); a [`RawStream`](Target::RawStream) (`file:`/`fifo:`/
+    /// `stdin:`) has no auth of its own and is one keystroke from a secret, so it is NOT (`false`). A future
+    /// `Target` variant forces a decision here rather than defaulting into either answer.
+    fn open_safe(&self, registry: &Registry) -> bool {
+        match self {
+            Target::Handler(scheme) => registry
+                .get(scheme)
+                .is_some_and(|handler| handler.open_safe()),
+            Target::Forward(_) => true,
+            Target::RawStream(_) => false,
+        }
+    }
 }
 
 /// The local services an exposer publishes: a map of service name to its [`Target`], validated once at
@@ -113,6 +143,27 @@ impl Services {
         Ok(Self(services))
     }
 
+    /// Add a handler-target service under `name`, dispatched to registry `scheme`, constructed DIRECTLY
+    /// rather than through the addr grammar ([`parse`](Self::parse) -> `parse_target`). Because it bypasses
+    /// that grammar, `scheme` may be one an operator's own service entry could NEVER spell: a caller that
+    /// needs per-service handler isolation (one handler instance per served name) registers each instance
+    /// under a synthetic scheme carrying a byte the handler-scheme grammar rejects (e.g. `fetch_0`, whose
+    /// `_` `parse_target` refuses), so no `x=fetch_0:` entry can ever resolve onto a synthetic instance. The
+    /// `name` is validated through the [`Service`] domain type; a duplicate `name` is refused.
+    ///
+    /// The `scheme` is deliberately NOT validated against the addr grammar (that is the whole point: it is a
+    /// registry key, not a spellable address), so a caller is responsible for pairing it with a matching
+    /// [`Registry`] entry, which [`Exposer::new`] then checks is present like any other named handler.
+    pub fn with_handler(mut self, name: &str, scheme: &str) -> eyre::Result<Self> {
+        let Self(services) = &mut self;
+        name.parse::<Service>()?;
+        if services.contains_key(name) {
+            eyre::bail!("service `{name}` is already defined; a name may map to only one target");
+        }
+        services.insert(name.to_owned(), Target::Handler(scheme.to_owned()));
+        Ok(self)
+    }
+
     /// The exposed service names, sorted, for a caller's readiness banner.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         let Self(services) = self;
@@ -121,21 +172,27 @@ impl Services {
         names.into_iter()
     }
 
-    /// The served services and their reach posture under `gate`, for the `control.services` read: a
-    /// name-sorted [`ServiceCatalog`] snapshot. The posture is the EFFECTIVE one a dialer faces, read off
-    /// the node gate (an [`Gate::Open`] node serves every service to anyone; any other gate requires a member
-    /// badge), not the handler's compile-time ceiling. A pure read over the parsed services, no mutable state.
-    pub fn catalog(&self, gate: &Gate) -> ServiceCatalog {
-        let posture = if matches!(gate, Gate::Open) {
-            Posture::Open
-        } else {
-            Posture::Gated
-        };
+    /// The served services and their reach posture, for the `control.services` read: a name-sorted
+    /// [`ServiceCatalog`] snapshot. The posture is the EFFECTIVE one a dialer faces, PER SERVICE: a service
+    /// is [`Open`](Posture::Open) if the node's base `gate` is [`Gate::Open`] (everything is open to anyone)
+    /// OR the service is a member of the public overlay `public` (opened per-service); otherwise it is
+    /// [`Gated`](Posture::Gated) behind a member badge. Not the handler's compile-time ceiling. A pure read
+    /// over the parsed services, no mutable state.
+    ///
+    /// `public` is the raw operator request (the display side reads what was ASKED); the security wall is
+    /// [`Exposer::with_public`], which proves every requested name open-safe before the node serves. So a
+    /// catalog naming a service `open` is only ever served once that proof passed for the same request.
+    pub fn catalog(&self, gate: &Gate, public: &PublicRequest) -> ServiceCatalog {
+        let node_open = matches!(gate, Gate::Open);
         let mut entries: Vec<ServiceEntry> = self
             .names()
             .map(|name| ServiceEntry {
+                posture: if node_open || public.contains(name) {
+                    Posture::Open
+                } else {
+                    Posture::Gated
+                },
                 name: name.to_owned(),
-                posture,
             })
             .collect();
         // `names()` already sorts, so this is stable; kept explicit so the wire canonical-order invariant is
@@ -455,27 +512,79 @@ impl Registry {
     }
 }
 
-/// Resolve the exposer's gate from the operator's choices, in ONE place so every embedder (tightbeam's own
-/// CLI and any other consumer) applies the SAME policy: an explicit `public` request (and ONLY that) opens the gate;
-/// otherwise a family gate on the node's provisioned `signet`; an UNPROVISIONED node fails LOUD rather than
-/// ever defaulting to open. The caller loads the denylist and passes it as a value. This exists so the
-/// three security-relevant conventions (open-only-when-`public`, fail-loud-on-unprovisioned,
+/// Resolve the exposer's node BASE gate, in ONE place so every embedder (tightbeam's own CLI and any other
+/// consumer) applies the SAME policy: a family gate on the node's provisioned `signet`; an UNPROVISIONED
+/// node fails LOUD rather than ever defaulting to open. The caller loads the denylist and passes it as a
+/// value. This exists so the two security-relevant conventions (fail-loud-on-unprovisioned,
 /// real-loaded-denylist) are enforced once, not hand-copied into each caller.
-pub fn resolve_gate(
-    public: bool,
-    signet: Option<NodeId>,
-    denylist: Denylist,
-) -> eyre::Result<Gate> {
-    if public {
-        return Ok(Gate::Open);
-    }
+///
+/// The base gate is the node-wide FAMILY authority; opening individual services is a SEPARATE, per-service
+/// overlay ([`Exposer::with_public`]), never a node-wide value this function returns. Building a node-wide
+/// [`Gate::Open`] base is a caller's own deliberate choice (nauthy's [`Gate::Open`]), not something a
+/// gate-resolution policy hands back from a flag: that node-wide-open flag was exactly the whole-node blast
+/// radius per-service exposure removes (delib-39).
+pub fn resolve_gate(signet: Option<NodeId>, denylist: Denylist) -> eyre::Result<Gate> {
     let root = signet.ok_or_else(|| {
         eyre::eyre!(
-            "this node has no signet to gate on: provision it (adopt a signet), or open it as a public \
-             gate to serve anyone"
+            "this node has no signet to gate on: provision it (adopt a signet), or open individual services \
+             with --public to serve anyone"
         )
     })?;
     Ok(Gate::family(root.verify_key(), denylist))
+}
+
+/// The raw, UNVALIDATED set of service names an operator asked to open to strangers (the value of swoosh's
+/// `--public`, or any embedder's equivalent), before [`Exposer::with_public`] proves each one exposed and
+/// open-safe. Kept DISTINCT from [`PublicServices`] (the proven set the gate consults) so an unvalidated set
+/// can never reach admission: the only way to a [`PublicServices`] is through the proof, so "opened a name
+/// the node does not serve / a keyless shell" is a build-time bail, not a silently-open service.
+#[derive(Debug, Clone, Default)]
+pub struct PublicRequest(Vec<String>);
+
+impl PublicRequest {
+    /// An empty request: no service is opened (every service faces the base gate). The default a node builds
+    /// when the operator names nothing public.
+    pub fn none() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Build a request from the operator's raw `--public` names, verbatim (no validation here: this is the
+    /// UNPROVEN side of parse-don't-validate; [`Exposer::with_public`] is the wall).
+    pub fn new(names: impl IntoIterator<Item = String>) -> Self {
+        Self(names.into_iter().collect())
+    }
+
+    /// Whether `name` was requested public, for a display read (the `control.services` catalog). This reads
+    /// the raw request, never the proof, so it is a DISPLAY predicate only, never an admission decision.
+    pub fn contains(&self, name: &str) -> bool {
+        let Self(names) = self;
+        names.iter().any(|requested| requested == name)
+    }
+
+    /// Whether the operator requested nothing public.
+    pub fn is_empty(&self) -> bool {
+        let Self(names) = self;
+        names.is_empty()
+    }
+}
+
+/// The PROVEN-open set of served service names an [`Exposer`] admits any reaching peer to: every member was
+/// validated at [`Exposer::with_public`] against the served set AND its target's [`open_safe`](Target::open_safe)
+/// posture, so a member is, by construction, an exposed, open-safe service. Membership is the ONLY fast/open
+/// path at admission ([`admit`]); a `Never` handler, a raw stream, or a name the node does not serve can
+/// never be a member, so `control.*` and every keyless shell stay member-only by SET NON-MEMBERSHIP, a
+/// stronger guarantee than a map entry that merely holds a permissive value.
+#[derive(Debug, Clone, Default)]
+struct PublicServices(HashSet<String>);
+
+impl PublicServices {
+    /// Whether `service` is a proven-open member: the one branch [`admit`] takes on the requested name. A
+    /// pure set-membership test with no side branch on member content, so a HIT (open) and a MISS (gated or
+    /// absent) differ only in the one bit the model intends, never in timing on the member's identity.
+    fn contains(&self, service: &str) -> bool {
+        let Self(names) = self;
+        names.contains(service)
+    }
 }
 
 /// An exposer: the services to publish, the caller-injected handler registry that serves the named ones,
@@ -485,13 +594,20 @@ pub struct Exposer {
     services: Services,
     registry: Arc<Registry>,
     gate: Gate,
+    public: PublicServices,
 }
 
 impl Exposer {
-    /// Assemble an exposer from the parsed services, the caller-injected handler registry, and the gate,
-    /// enforcing two invariants at the door: every named handler is actually registered (a typo or an
-    /// unbuilt feature fails HERE, not at dial time), and a handler with no auth of its own (a keyless
-    /// shell) may not sit behind an [`Gate::Open`] gate, which would hand it to anyone who reaches the node.
+    /// Assemble an exposer from the parsed services, the caller-injected handler registry, and the node BASE
+    /// gate, enforcing two invariants at the door: every named handler is actually registered (a typo or an
+    /// unbuilt feature fails HERE, not at dial time), and a handler with no auth of its own (a keyless shell)
+    /// may not sit behind a node-wide [`Gate::Open`] BASE, which would hand it to anyone who reaches the node.
+    ///
+    /// No service is opened per-service by this constructor: the exposer starts with an EMPTY public overlay
+    /// (every service faces the base gate). A caller opens individual services with [`with_public`](Self::with_public),
+    /// which proves each requested name exposed and open-safe. So `Exposer::new(..)` alone is a fully-gated
+    /// node (or, over a [`Gate::Open`] base, a fully-open one), and the per-service overlay is a deliberate
+    /// second step.
     pub fn new(services: Services, registry: Registry, gate: Gate) -> eyre::Result<Self> {
         for scheme in services.handler_schemes() {
             let Some(handler) = registry.get(scheme) else {
@@ -512,6 +628,9 @@ impl Exposer {
         // `file:<secret>` or a `stdin:` source would exfil it. Refuse it at the same door that refuses a
         // public shell. A raw forward (`host:port`/`unix:`) stays open-able: it is a service the operator
         // deliberately stood up, not a bare file path or a piped stream one keystroke from a key.
+        //
+        // These two bails guard the node-wide-open BASE gate (a tightbeam primitive any consumer may pass).
+        // The per-service public OVERLAY takes the SAME wall, per service, in [`with_public`].
         if matches!(gate, Gate::Open)
             && let Some(name) = services.raw_stream_names().next()
         {
@@ -524,7 +643,47 @@ impl Exposer {
             services,
             registry: Arc::new(registry),
             gate,
+            public: PublicServices::default(),
         })
+    }
+
+    /// Open the requested services to any reaching peer, per-service, PROVING each one first: this is the
+    /// wall that turns a raw [`PublicRequest`] into the exposer's proven [`PublicServices`] overlay. Every
+    /// requested name must (1) be an EXACT served name (a typo, a casing miss, or a name the node does not
+    /// serve bails, never silently opening nothing), and (2) resolve THROUGH its [`Target`] to an
+    /// [`open_safe`](Target::open_safe) posture (a `Never` handler, an aliased shell, or a raw stream bails
+    /// with a teaching message). Resolving through the target, matched by served name, is what stops an alias
+    /// (`foo=sshd:` named in `--public`) or a raw stream from being opened by naming it: the target's posture
+    /// decides, never the name. A survivor set freezes into the overlay [`admit`] consults.
+    ///
+    /// This REPLACES a node-wide open value with a per-service one: a caller opens `speed` and `fetch` by
+    /// name while `control.*` and every keyless shell stay member-only by set non-membership. The teaching
+    /// bails fire at BUILD time to the operator's own terminal (no remote party observes them), so there is
+    /// no dial-time oracle. It never names a marker type (`Never`/`OptIn`), only the constraint.
+    pub fn with_public(mut self, requested: PublicRequest) -> eyre::Result<Self> {
+        let PublicRequest(names) = requested;
+        let Services(services) = &self.services;
+        let mut proven = HashSet::with_capacity(names.len());
+        for name in names {
+            let Some(target) = services.get(&name) else {
+                let mut served: Vec<&str> = services.keys().map(String::as_str).collect();
+                served.sort_unstable();
+                eyre::bail!(
+                    "no service named `{name}` to open; this node serves: {}",
+                    served.join(", ")
+                );
+            };
+            if !target.open_safe(&self.registry) {
+                eyre::bail!(
+                    "keep `{name}` gated, not public: it has no legitimate public use (a keyless shell, or \
+                     a raw file/fifo/stdin source with no auth of its own), so opening it would hand it to \
+                     anyone who reaches this node"
+                );
+            }
+            proven.insert(name);
+        }
+        self.public = PublicServices(proven);
+        Ok(self)
     }
 
     /// Accept overlay sessions from permitted peers and forward each inbound stream to its service. Runs
@@ -550,13 +709,22 @@ impl Exposer {
             services,
             registry,
             gate,
+            public,
         } = self;
-        let services = Arc::new(services);
-        let gate = Arc::new(gate);
         // Cap concurrent raw-stream opens across the whole node (all sessions share this one semaphore) as
         // cheap defense-in-depth: the nonblocking open cannot park a thread, so this bounds the fds held
         // mid-open, not a leak. See `RAW_STREAM_OPEN_PERMITS`.
-        let raw_stream_opens = Arc::new(Semaphore::new(RAW_STREAM_OPEN_PERMITS));
+        //
+        // The whole per-node serving context (gate + public overlay + services + registry + the open pool)
+        // is bundled behind ONE `Arc` so each accepted session carries a single handle rather than a fistful
+        // of clones.
+        let serving = Arc::new(Serving {
+            gate,
+            public,
+            services,
+            registry,
+            raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
+        });
         let mut sessions = FuturesUnordered::new();
         loop {
             tokio::select! {
@@ -577,13 +745,7 @@ impl Exposer {
                             continue;
                         }
                     };
-                    sessions.push(serve_session(
-                        session,
-                        Arc::clone(&gate),
-                        Arc::clone(&services),
-                        Arc::clone(&registry),
-                        Arc::clone(&raw_stream_opens),
-                    ));
+                    sessions.push(serve_session(session, Arc::clone(&serving)));
                 }
                 Some(result) = sessions.next(), if !sessions.is_empty() => {
                     if let Err(error) = result {
@@ -595,14 +757,20 @@ impl Exposer {
     }
 }
 
-/// Serve one accepted session: handle each inbound stream's service request under the gate.
-async fn serve_session<S: Session>(
-    session: S,
-    gate: Arc<Gate>,
-    services: Arc<Services>,
+/// The per-node shared state every accepted session and inbound stream is served under: the node BASE
+/// [`Gate`], the per-service [`PublicServices`] overlay it composes with, the parsed [`Services`], the
+/// injected handler [`Registry`], and the raw-stream open permit pool. Assembled once in [`Exposer::run`]
+/// and shared by one `Arc` across every session/stream, so a serving future carries a single handle.
+struct Serving {
+    gate: Gate,
+    public: PublicServices,
+    services: Services,
     registry: Arc<Registry>,
-    raw_stream_opens: Arc<Semaphore>,
-) -> eyre::Result<()>
+    raw_stream_opens: Semaphore,
+}
+
+/// Serve one accepted session: handle each inbound stream's service request under the gate.
+async fn serve_session<S: Session>(session: S, serving: Arc<Serving>) -> eyre::Result<()>
 where
     S::Write: Send + 'static,
     S::Read: Send + 'static,
@@ -619,15 +787,9 @@ where
             // buffer. A single peer cannot exhaust the node with unbounded concurrent streams.
             accepted = session.accept_bi(), if accepting && pipes.len() < MAX_STREAMS_PER_SESSION => {
                 match accepted {
-                    Ok((writer, reader)) => pipes.push(serve_request(
-                        peer,
-                        writer,
-                        reader,
-                        Arc::clone(&gate),
-                        Arc::clone(&services),
-                        Arc::clone(&registry),
-                        Arc::clone(&raw_stream_opens),
-                    )),
+                    Ok((writer, reader)) => {
+                        pipes.push(serve_request(peer, writer, reader, Arc::clone(&serving)))
+                    }
                     Err(error) => {
                         tracing::warn!(%peer, %error, "accept_bi failed; draining in-flight streams");
                         accepting = false;
@@ -655,16 +817,20 @@ async fn serve_request<W, R>(
     peer: NodeId,
     mut writer: W,
     mut reader: R,
-    gate: Arc<Gate>,
-    services: Arc<Services>,
-    registry: Arc<Registry>,
-    raw_stream_opens: Arc<Semaphore>,
+    serving: Arc<Serving>,
 ) -> eyre::Result<()>
 where
     W: io::AsyncWrite + Unpin + Send + 'static,
     R: io::AsyncRead + Unpin + Send + 'static,
 {
-    let Services(services) = &*services;
+    let Serving {
+        gate,
+        public,
+        services,
+        registry,
+        raw_stream_opens,
+    } = &*serving;
+    let Services(services) = services;
     // Bound the pre-gate read: a peer that opens a stream but never sends its request would otherwise
     // park this task (and its buffer) indefinitely, BEFORE the gate runs, so unauthenticated peers could
     // exhaust the node one slow stream at a time. Time out and drop a silent stream.
@@ -688,7 +854,7 @@ where
     // BEFORE the gate so a delegated slip for that service still matches (the gate checks the RESOLVED service).
     let service = resolve_single_service(service, services);
 
-    let admitted = match admit(&gate, peer, request.capability.as_deref(), &service) {
+    let admitted = match admit(gate, public, peer, request.capability.as_deref(), &service) {
         Ok(admitted) => admitted,
         Err(refusal) => {
             // The real reason (missing / not-granted / revoked / malformed) is a LOCAL log line for the
@@ -790,30 +956,81 @@ where
     Ok(())
 }
 
-/// Apply the gate to a request, returning the [`Admitted`] witness on success or a DISTINGUISHING refusal
-/// string for the node's OWN logs. The witness is required to reach a service handler, so "authorize before
+/// Rule on a request under the node's per-service admission: the `public` overlay composed with the `base`
+/// family gate, returning the [`Admitted`] witness on success or a DISTINGUISHING refusal string for the
+/// node's OWN logs. A service the operator opened (a `public` member) admits any reaching peer; every other
+/// service faces the `base` gate. The witness is required to reach a service handler, so "authorize before
 /// serve" is a compile-time precondition (see [`nauthy::Admitted`]). The reason returned here NEVER crosses
 /// the wire (the caller sends [`UNIFORM_REFUSAL`] to a not-admitted dialer); it exists only so the operator
 /// can see WHY on their own `tracing` output. Distinguishing missing/not-granted/revoked to the wire would
 /// be a revocation + capability-enumeration oracle for an unauthorized peer (deliberation 18).
 fn admit(
-    gate: &Gate,
+    base: &Gate,
+    public: &PublicServices,
     peer: NodeId,
     capability: Option<&str>,
     service: &Service,
 ) -> Result<Admitted, String> {
+    // The ONLY branch admission takes on the service NAME is this public-set membership test, and it runs
+    // BEFORE any dispatch (the `services.get` in `serve_request` is reached only past this admit). A HIT is
+    // the sole fast/open path: the service was proven open at `with_public`, so this admits with no cap
+    // parse and no crypto, minting the witness through nauthy's OWN `Gate::Open` primitive (tightbeam picks
+    // WHICH nauthy primitive per service; it never mints authority itself). A public member is by
+    // construction an exposed served name, so the later dispatch always resolves it.
+    if public.contains(service.as_str()) {
+        return mint(Gate::Open.admit_witnessed(peer.verify_key(), None, service));
+    }
+    // A MISS is EITHER a gated-present name OR a name the node does not serve at all: both take this
+    // identical family path (the same cap parse, the same two ed25519 verifies, the same refusal), so a
+    // gated service and an absent one are timing- and response-identical. There is no cheaper path for
+    // "absent" than for "gated-present", so hit-vs-miss reveals only what is already public (a public name
+    // is reachable by anyone), never the gated menu (delib-18/39 anti-oracle).
+    //
     // Parse a presented capability at the edge; a malformed token is a refusal, not a hard error, so the
     // stream ends cleanly rather than being dropped mid-read.
     let cap = match capability.map(Cap::parse).transpose() {
         Ok(cap) => cap,
         Err(_) => return Err("malformed capability".to_owned()),
     };
-    gate.admit_witnessed(peer.verify_key(), cap.as_ref(), service)
-        .map_err(|refusal| match refusal {
-            Refusal::Missing => "this service requires a capability".to_owned(),
-            Refusal::NotGranted => "capability does not grant this service".to_owned(),
-            Refusal::Revoked => "capability has been revoked".to_owned(),
-        })
+    mint(base.admit_witnessed(peer.verify_key(), cap.as_ref(), service))
+}
+
+/// Map a nauthy admission result to the [`admit`] contract: the witness on success, or a DISTINGUISHING
+/// reason for the node's OWN logs on refusal (never the wire). Shared by the public-HIT path (whose
+/// [`Gate::Open`] admission never actually refuses) and the family MISS path, so both surface a refusal the
+/// same way.
+fn mint(result: Result<Admitted, Refusal>) -> Result<Admitted, String> {
+    result.map_err(|refusal| match refusal {
+        Refusal::Missing => "this service requires a capability".to_owned(),
+        Refusal::NotGranted => "capability does not grant this service".to_owned(),
+        Refusal::Revoked => "capability has been revoked".to_owned(),
+    })
+}
+
+/// Render, for a DIALER, the reason a host returned on the wire, descriptively. The dialer REACHED the host
+/// and was refused (an unreachable peer never receives a [`Response`]), so this is the "reached but refused"
+/// outcome, distinct from "could not reach". It recognizes the [`UNIFORM_REFUSAL`] token a not-admitted
+/// dialer gets and phrases it as a reason a person can act on, rather than echoing the bare word (which a
+/// caller wrapping it in "refused (…)" would double into `refused (refused)`). A host that returned a MORE
+/// specific reason (a service that admitted the stream, then declined the requested method) keeps it
+/// verbatim. This is purely client-side rendering of the outcome the dialer already holds: it reveals
+/// nothing the wire did not, so the anti-oracle stands (a true stranger still cannot tell WHICH gated
+/// service exists, only that this dial was refused).
+pub fn refusal_reason(message: &str) -> String {
+    if message == UNIFORM_REFUSAL {
+        "not admitted: not a member of this node's family, and no capability for this service"
+            .to_owned()
+    } else {
+        message.to_owned()
+    }
+}
+
+/// A one-line dialer-side refusal for a REACHED host: `reached <node>, but refused: <reason>`. Used where a
+/// probe reached the peer and its gate refused (e.g. [`Connector::preflight`]); it names the peer, states it
+/// was reached (not unreachable), and renders the reason through [`refusal_reason`] so a bare gate refusal
+/// is descriptive and never doubled.
+fn refusal_reached(dial: NodeId, message: &str) -> String {
+    format!("reached {dial}, but refused: {}", refusal_reason(message))
 }
 
 /// Resolve the requested service against what is exposed: if it names no exposed service but exactly one
@@ -1015,7 +1232,7 @@ impl Connector {
         let (mut writer, mut reader) = session.open_bi().await?;
         request.write(&mut writer).await?;
         if let Response::Error(message) = Response::read(&mut reader).await? {
-            eyre::bail!("refused by {}: {message}", self.dial);
+            eyre::bail!("{}", refusal_reached(self.dial, &message));
         }
         drop((writer, reader));
         let listener = TcpListener::bind(("127.0.0.1", port)).await?;
@@ -1252,8 +1469,9 @@ mod tests {
     use tokio::io::AsyncReadExt as _;
 
     use super::{
-        BoxRead, BoxWrite, Exposer, Handler, Posture, RAW_STREAM_OPEN_PERMITS, Registry, Semaphore,
-        ServiceCatalog, ServiceEntry, Services, Target, resolve_single_service, serve_request,
+        BoxRead, BoxWrite, Exposer, Handler, Posture, PublicRequest, PublicServices,
+        RAW_STREAM_OPEN_PERMITS, Registry, Semaphore, ServiceCatalog, ServiceEntry, Services,
+        Target, resolve_single_service, serve_request,
     };
     use crate::open_policy::{Never, OptIn};
     use crate::raw_stream::RawStream;
@@ -1266,7 +1484,7 @@ mod tests {
         let signet = nauthy::Identity::from_secret(&[7u8; 32]).expect("valid secret");
         let denylist = nauthy::Denylist::empty(std::env::temp_dir().join("tb-catalog-gated"));
         let gate = Gate::family(signet.node_id(), denylist);
-        let catalog = services.catalog(&gate);
+        let catalog = services.catalog(&gate, &PublicRequest::none());
 
         let names: Vec<&str> = catalog.entries().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, ["a", "b", "c"], "entries are name-sorted");
@@ -1286,7 +1504,7 @@ mod tests {
     #[test]
     fn an_open_catalog_reports_open() {
         let services = services(&["a=127.0.0.1:80", "b=handler:"]);
-        let catalog = services.catalog(&Gate::Open);
+        let catalog = services.catalog(&Gate::Open, &PublicRequest::none());
         assert!(
             catalog
                 .entries()
@@ -1618,6 +1836,7 @@ mod tests {
                     services,
                     registry: std::sync::Arc::new(Registry::new()),
                     gate: Gate::Open,
+                    public: PublicServices::default(),
                 };
                 tokio::task::spawn_local(async move {
                     exposer
@@ -1659,6 +1878,7 @@ mod tests {
             services: services(&["web=127.0.0.1:80"]),
             registry: std::sync::Arc::new(Registry::new()),
             gate: Gate::Open,
+            public: PublicServices::default(),
         };
         let cancel = super::CancellationToken::new();
 
@@ -1708,6 +1928,7 @@ mod tests {
                     services,
                     registry: std::sync::Arc::new(Registry::new()),
                     gate: Gate::Open,
+                    public: PublicServices::default(),
                 };
                 tokio::task::spawn_local(async move {
                     exposer.run(&exposer_node, super::CancellationToken::new()).await.expect("exposer runs");
@@ -1763,14 +1984,26 @@ mod tests {
         path
     }
 
-    /// Drive one `serve_request` for `service` against a `Gate::Open` node sharing `permits`, and return the
-    /// client's stream end plus the serving future. The serving future is returned UN-awaited so a caller can
-    /// let it park (a never-written FIFO) or poll it for the refusal, and the returned reader carries the
-    /// host's `Response`. Uses `tokio::io::duplex` so no transport is needed.
+    /// A `Serving` context over `services` sharing one `permits` pool, on a `Gate::Open` base with an empty
+    /// public overlay and an empty registry: the shared node state the raw-stream cap tests drive many
+    /// `serve_request`s against.
+    fn open_serving(services: Services, permits: Semaphore) -> std::sync::Arc<super::Serving> {
+        std::sync::Arc::new(super::Serving {
+            gate: Gate::Open,
+            public: PublicServices::default(),
+            services,
+            registry: std::sync::Arc::new(Registry::new()),
+            raw_stream_opens: permits,
+        })
+    }
+
+    /// Drive one `serve_request` for `service` against the shared `serving` context, and return the client's
+    /// stream end plus the serving future. The serving future is returned UN-awaited so a caller can let it
+    /// park (a never-written FIFO) or poll it for the refusal, and the returned reader carries the host's
+    /// `Response`. Uses `tokio::io::duplex` so no transport is needed.
     fn drive_open(
         service: &str,
-        services: std::sync::Arc<Services>,
-        permits: std::sync::Arc<Semaphore>,
+        serving: std::sync::Arc<super::Serving>,
     ) -> (
         tokio::io::ReadHalf<tokio::io::DuplexStream>,
         impl core::future::Future<Output = eyre::Result<()>>,
@@ -1793,16 +2026,7 @@ mod tests {
             // (peer -> `io::sink()`) ends on this EOF, so a served stream can actually finish (otherwise the
             // splice's `try_join!` would wait forever for the client to hang up).
             drop(client_write);
-            serve_request(
-                peer,
-                server_write,
-                server_read,
-                std::sync::Arc::new(Gate::Open),
-                services,
-                std::sync::Arc::new(Registry::new()),
-                permits,
-            )
-            .await
+            serve_request(peer, server_write, server_read, serving).await
         };
         (client_read, serve)
     }
@@ -1822,21 +2046,18 @@ mod tests {
         let _lock = crate::raw_stream::WRITER_WAIT_TEST_LOCK.lock().await;
 
         let fifo = never_written_fifo("flood");
-        let services = std::sync::Arc::new(services(&[&format!("pipe=fifo:{}", fifo.display())]));
+        let services = services(&[&format!("pipe=fifo:{}", fifo.display())]);
 
         const CAP: usize = 3;
         const OVER: usize = 4;
-        let permits = std::sync::Arc::new(Semaphore::new(CAP));
+        // One shared serving context (so all opens draw on the SAME `CAP`-sized permit pool).
+        let serving = open_serving(services, Semaphore::new(CAP));
 
         // CAP opens grab a permit and park in the blocking FIFO open; hold their serving futures so the
         // permits stay taken. They MUST NOT respond (they are blocked waiting for a writer that never comes).
         let mut parked = Vec::new();
         for _ in 0..CAP {
-            let (mut client_read, serve) = drive_open(
-                "pipe",
-                std::sync::Arc::clone(&services),
-                std::sync::Arc::clone(&permits),
-            );
+            let (mut client_read, serve) = drive_open("pipe", std::sync::Arc::clone(&serving));
             let handle = tokio::spawn(serve);
             // Give the open a moment to acquire its permit and enter the blocking syscall.
             let mut byte = [0u8; 1];
@@ -1855,11 +2076,7 @@ mod tests {
         // With every permit taken, the OVER-cap opens must be refused immediately with the cap message, never
         // parking another thread. Each returns a `Response::Error` a client can read at once.
         for _ in 0..OVER {
-            let (mut client_read, serve) = drive_open(
-                "pipe",
-                std::sync::Arc::clone(&services),
-                std::sync::Arc::clone(&permits),
-            );
+            let (mut client_read, serve) = drive_open("pipe", std::sync::Arc::clone(&serving));
             tokio::spawn(serve);
             let response = tokio::time::timeout(
                 core::time::Duration::from_secs(2),
@@ -1915,10 +2132,10 @@ mod tests {
             .and_then(|mut f| f.write_all(body))
             .expect("write scratch file");
 
-        let services = std::sync::Arc::new(services(&[&format!("doc=file:{}", path.display())]));
-        let permits = std::sync::Arc::new(Semaphore::new(RAW_STREAM_OPEN_PERMITS));
+        let services = services(&[&format!("doc=file:{}", path.display())]);
+        let serving = open_serving(services, Semaphore::new(RAW_STREAM_OPEN_PERMITS));
 
-        let (mut client_read, serve) = drive_open("doc", services, permits);
+        let (mut client_read, serve) = drive_open("doc", serving);
         tokio::spawn(serve);
         // First the Ok, then the source's exact bytes.
         match crate::protocol::Response::read(&mut client_read)
@@ -2066,6 +2283,7 @@ mod tests {
                     services,
                     registry: std::sync::Arc::new(Registry::new()),
                     gate: Gate::family(signet.node_id(), denylist),
+                    public: PublicServices::default(),
                 };
 
                 let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
@@ -2158,6 +2376,7 @@ mod tests {
                     services: Services(map),
                     registry: std::sync::Arc::new(Registry::new()),
                     gate: Gate::Open,
+                    public: PublicServices::default(),
                 };
 
                 let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
@@ -2179,5 +2398,253 @@ mod tests {
                 }
             })
             .await;
+    }
+
+    /// A family gate + a `speed` service; a helper to build the two postures the per-service tests need.
+    fn family_gate(tag: &str) -> Gate {
+        let signet = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
+        Gate::family(
+            signet.node_id(),
+            nauthy::Denylist::empty(std::env::temp_dir().join(format!("tb-per-service-{tag}"))),
+        )
+    }
+
+    /// The per-service admission core (BLOCKER-1): a `PublicServices` HIT admits any peer with no token
+    /// (minting a `Slip`, never a member), while EVERY miss -- a gated-present name AND a name the node does
+    /// not serve at all -- takes the identical family path and is refused. The one branch on the service name
+    /// is the set-membership test; there is no cheaper path for "absent" than for "gated-present".
+    #[test]
+    fn a_public_member_admits_a_stranger_and_every_miss_takes_the_family_path() {
+        let gate = family_gate("admit");
+        let public = super::PublicServices(["speed".to_owned()].into_iter().collect());
+        let stranger = bifrost::NodeId::from_ed25519_secret(&[5u8; 32]);
+
+        // HIT: the opened `speed` admits a tokenless stranger, and the witness is a Slip (an opened service
+        // proves nothing about the peer), never a whole-node member.
+        let admitted = super::admit(&gate, &public, stranger, None, &svc("speed"))
+            .expect("an opened service admits a stranger");
+        assert!(
+            !admitted.is_member(),
+            "an opened service admits as a Slip, never a whole-node member"
+        );
+
+        // MISS (gated-present): `control.stop` is served but NOT public, so a stranger takes the family path
+        // and is refused. MISS (absent): a name the node does not serve takes the SAME path and is refused.
+        assert!(
+            super::admit(&gate, &public, stranger, None, &svc("control.stop")).is_err(),
+            "a served-but-gated service is refused for a stranger (family path)"
+        );
+        assert!(
+            super::admit(&gate, &public, stranger, None, &svc("nope")).is_err(),
+            "an absent service is refused for a stranger, on the same family path"
+        );
+    }
+
+    /// The flagship, at the tunnel level (delib-39): a family-gated node opens ONE service per-service via
+    /// `with_public`; a stranger with no token is ADMITTED to that service but still REFUSED, uniformly, for
+    /// a gated service and for the always-on `control.stop`, which can never be opened. Proves the anti-oracle
+    /// survives the overlay: the gated refusals are byte-identical.
+    #[tokio::test]
+    async fn a_stranger_is_admitted_to_an_opened_service_and_uniformly_refused_for_the_rest() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // `open` is an OptIn responder (openable); `locked` is a Never handler (never openable);
+                // `control.stop` stands in for the always-on gated control surface (also a Never handler).
+                let services = services(&["open=open:", "locked=locked:", "control.stop=locked:"]);
+                let registry = Registry::new()
+                    .with("open", OpenNoop)
+                    .with("locked", GatedNoop);
+                let exposer = Exposer::new(services, registry, family_gate("flagship"))
+                    .expect("assembles")
+                    .with_public(PublicRequest::new(["open".to_owned()]))
+                    .expect("`open` is OptIn, so it opens");
+
+                let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
+                let exposer_id = exposer_node.node_id();
+                let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+                tokio::task::spawn_local(async move {
+                    exposer
+                        .run(&exposer_node, super::CancellationToken::new())
+                        .await
+                        .expect("runs");
+                });
+
+                // A stranger (no token) is ADMITTED to the opened service and reads it to a clean EOF.
+                let session = consumer.connect(exposer_id).await.expect("connect");
+                let opened = ServiceStream::open(&session, "open")
+                    .await
+                    .expect("a stranger is admitted to the opened service");
+                opened
+                    .read_all()
+                    .await
+                    .expect("the opened service serves the stranger");
+
+                // The same stranger is REFUSED for a gated service AND for control.stop, byte-identically:
+                // opening one service leaks nothing about the gated ones.
+                let session = consumer.connect(exposer_id).await.expect("connect");
+                let Err(gated) = ServiceStream::open(&session, "locked").await else {
+                    panic!("a gated service must refuse the stranger");
+                };
+                let session = consumer.connect(exposer_id).await.expect("connect");
+                let Err(control) = ServiceStream::open(&session, "control.stop").await else {
+                    panic!("the always-on control surface must refuse the stranger");
+                };
+                assert_eq!(
+                    gated, control,
+                    "a gated service and the control surface refuse byte-identically (no oracle)"
+                );
+                assert_eq!(
+                    gated,
+                    super::UNIFORM_REFUSAL,
+                    "the refusal is the uniform token"
+                );
+            })
+            .await;
+    }
+
+    /// `with_public` is the wall (BLOCKER-2): it refuses a `Never` handler named public with a teaching error
+    /// (leading with the fix, never leaking the marker names), and refuses a name the node does not serve.
+    #[test]
+    fn with_public_refuses_a_never_handler_and_an_unexposed_name() {
+        let services = services(&["ssh=locked:", "speed=open:"]);
+        let registry = || {
+            Registry::new()
+                .with("locked", GatedNoop)
+                .with("open", OpenNoop)
+        };
+
+        // A Never handler named public is refused: the teaching error names the SERVICE and the fix, never a
+        // marker type. (A stranger never sees it; it is a build-time bail to the operator's own terminal.)
+        let assembled =
+            Exposer::new(services.clone(), registry(), family_gate("never")).expect("assembles");
+        let Err(never) = assembled.with_public(PublicRequest::new(["ssh".to_owned()])) else {
+            panic!("a Never handler cannot be opened");
+        };
+        let message = never.to_string();
+        assert!(
+            message.contains("ssh") && message.contains("gated"),
+            "the refusal names the service and leads with the fix: {message:?}"
+        );
+        for marker in ["Never", "OptIn"] {
+            assert!(
+                !message.contains(marker),
+                "the refusal must not leak the marker name {marker:?}: {message:?}"
+            );
+        }
+
+        // A name the node does not serve is refused, and the error names what it DOES serve.
+        let assembled =
+            Exposer::new(services, registry(), family_gate("unknown")).expect("assembles");
+        let Err(unknown) = assembled.with_public(PublicRequest::new(["nope".to_owned()])) else {
+            panic!("an unexposed name cannot be opened");
+        };
+        assert!(
+            unknown.to_string().contains("no service named"),
+            "an unexposed public name is refused with the served list: {unknown}"
+        );
+    }
+
+    /// `open_safe` is TOTAL over `Target` (BLOCKER-2): a forward is openable, a raw stream never, a Never
+    /// handler never, an OptIn handler yes, and an unregistered scheme fails closed.
+    #[test]
+    fn open_safe_is_total_over_target() {
+        let registry = Registry::new()
+            .with("open", OpenNoop)
+            .with("locked", GatedNoop);
+        let forward = Target::Forward("127.0.0.1:80".to_owned());
+        let raw = Target::RawStream(RawStream::from_reader(Box::new(&b"x"[..])));
+        let opt_in = Target::Handler("open".to_owned());
+        let never = Target::Handler("locked".to_owned());
+        let missing = Target::Handler("unregistered".to_owned());
+
+        assert!(
+            forward.open_safe(&registry),
+            "a deliberately stood-up forward is openable"
+        );
+        assert!(
+            !raw.open_safe(&registry),
+            "a raw stream has no auth of its own"
+        );
+        assert!(opt_in.open_safe(&registry), "an OptIn handler is openable");
+        assert!(
+            !never.open_safe(&registry),
+            "a Never handler is never openable"
+        );
+        assert!(
+            !missing.open_safe(&registry),
+            "an unregistered scheme fails closed"
+        );
+    }
+
+    /// B1 (BLOCKER-3): a synthetic per-service scheme carries a byte the handler-scheme grammar rejects
+    /// (`_`), so an operator entry `x=fetch_0:` can NEVER resolve onto a synthetic instance -- it is a parse
+    /// error. The same mapping is reachable ONLY through `with_handler`, which constructs it directly.
+    #[test]
+    fn a_synthetic_underscore_scheme_is_unspellable_but_constructible_directly() {
+        // Spelled as an operator entry, `fetch_0:` is not a handler scheme (the grammar rejects `_`), so it
+        // falls through to the forward grammar and is refused. The pivot `x=fetch_0: --public x` cannot open.
+        assert!(
+            Services::parse(&["x=fetch_0:".to_owned()]).is_err(),
+            "`fetch_0:` must not be a spellable handler scheme"
+        );
+        // Built directly, the same served name maps to the synthetic handler, verbatim as the registry key.
+        let Services(map) = Services::parse(&["ping=ping:".to_owned()])
+            .expect("base parses")
+            .with_handler("pub", "fetch_0")
+            .expect("a direct synthetic handler is constructible");
+        let Some(Target::Handler(scheme)) = map.get("pub") else {
+            panic!("`pub` must map to the synthetic handler target");
+        };
+        assert_eq!(
+            scheme, "fetch_0",
+            "the synthetic scheme is the verbatim registry key"
+        );
+    }
+
+    /// The catalog reports each service's PER-SERVICE posture: a service in the public request reads `open`,
+    /// the rest `gated`, under a family base gate. This is what the `control.services` read serves.
+    #[test]
+    fn a_catalog_reports_public_services_open_and_the_rest_gated() {
+        let services = services(&["speed=open:", "ssh=locked:", "web=127.0.0.1:80"]);
+        let catalog = services.catalog(
+            &family_gate("catalog"),
+            &PublicRequest::new(["speed".to_owned()]),
+        );
+        for entry in catalog.entries() {
+            let expected = if entry.name == "speed" {
+                Posture::Open
+            } else {
+                Posture::Gated
+            };
+            assert_eq!(
+                entry.posture,
+                expected,
+                "`{}` should read {:?} under `--public speed`",
+                entry.name,
+                expected.label()
+            );
+        }
+    }
+
+    /// B3: a dialer-side render recognizes the uniform refusal token and phrases it descriptively (not the
+    /// bare word, which a `refused (…)` wrapper would double), while a more specific host reason is kept.
+    #[test]
+    fn a_dialer_refusal_reason_is_descriptive_for_the_uniform_token() {
+        let uniform = super::refusal_reason(super::UNIFORM_REFUSAL);
+        assert_ne!(
+            uniform,
+            super::UNIFORM_REFUSAL,
+            "the bare token is not echoed back"
+        );
+        assert!(
+            uniform.contains("not admitted"),
+            "the uniform refusal renders as a reason a person can act on: {uniform:?}"
+        );
+        assert_eq!(
+            super::refusal_reason("this service does not serve that method"),
+            "this service does not serve that method",
+            "a specific host reason is preserved verbatim"
+        );
     }
 }

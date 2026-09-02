@@ -43,7 +43,7 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             let signet = NodeId::from_ed25519_secret(&SIGNET_SECRET);
             tokio::task::spawn_local(async move {
                 let services = Services::parse(&[format!("web={echo_addr}")]).unwrap();
-                let gate = tunnel::resolve_gate(false, Some(signet), empty_denylist().await).unwrap();
+                let gate = tunnel::resolve_gate(Some(signet), empty_denylist().await).unwrap();
                 Exposer::new(services, tightbeam::tunnel::Registry::new(), gate)
                     .unwrap()
                     .run(&exposer, CancellationToken::new())
@@ -113,8 +113,7 @@ async fn a_refused_forward_fails_at_preflight_with_the_reason() {
             let signet = NodeId::from_ed25519_secret(&SIGNET_SECRET);
             tokio::task::spawn_local(async move {
                 let services = Services::parse(&[format!("web={echo_addr}")]).unwrap();
-                let gate =
-                    tunnel::resolve_gate(false, Some(signet), empty_denylist().await).unwrap();
+                let gate = tunnel::resolve_gate(Some(signet), empty_denylist().await).unwrap();
                 Exposer::new(services, tightbeam::tunnel::Registry::new(), gate)
                     .unwrap()
                     .run(&exposer, CancellationToken::new())
@@ -135,8 +134,16 @@ async fn a_refused_forward_fails_at_preflight_with_the_reason() {
                 .expect("an unauthorized forward must be refused at preflight, not admitted");
             let message = format!("{error:#}");
             assert!(
-                message.contains("refused by") && message.contains(&exposer_id.to_string()),
-                "the refusal must name the peer it came from: {message}"
+                message.contains("reached")
+                    && message.contains("refused")
+                    && message.contains(&exposer_id.to_string()),
+                "the refusal must name the peer it came from and say it was reached, not unreachable: \
+                 {message}"
+            );
+            // B3: the bare on-wire refusal token is rendered descriptively, never echoed doubled.
+            assert!(
+                message.contains("not admitted") && !message.contains("refused: refused"),
+                "a bare gate refusal reads as a reason, not the word doubled: {message}"
             );
         })
         .await;
