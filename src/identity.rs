@@ -56,7 +56,7 @@ pub struct Secret([u8; 32]);
 
 impl Secret {
     /// A fresh random secret, kept only in memory. `rand::random` draws from a CSPRNG seeded by the OS,
-    /// the same source swoosh mints its keys from.
+    /// the same source every ephemeral key mint draws from.
     pub fn ephemeral() -> Self {
         Self(rand::random())
     }
@@ -87,7 +87,7 @@ impl Secret {
 
 /// The ssh host-key seed for a raw node secret, the KDF shared by every exposer.
 ///
-/// The one place the `sshd:` host-key derivation lives, so a swoosh node exposing over its own persisted
+/// The one place the `sshd:` host-key derivation lives, so any node exposing over its own persisted
 /// secret computes the SAME host key tightbeam would for the same key. Domain-separated (BLAKE3
 /// `derive_key`), so the ssh host key is distinct from the node key yet stable across runs.
 pub fn ssh_host_seed(secret: &[u8; 32]) -> [u8; 32] {
@@ -114,7 +114,7 @@ pub async fn write(secret: &[u8; 32], explicit: Option<&Path>) -> eyre::Result<(
 /// Load the persisted secret, creating and saving a fresh one on first use.
 ///
 /// An explicit path (or `TIGHTBEAM_KEY`) overrides the default location. tightbeam's identity is
-/// always persisted (unlike swoosh's reach-outward verbs) because a cap exposer must be reachable and
+/// always persisted (unlike an ephemeral reach-outward client) because a cap exposer must be reachable and
 /// verifiable at one stable key across runs.
 pub async fn load(explicit: Option<&Path>) -> eyre::Result<Secret> {
     let path = match explicit {

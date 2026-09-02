@@ -4,7 +4,7 @@
 //! sessions and forwards inbound streams to local services, a [`Connector`] that reaches a peer's exposed
 //! service, the [`resolve_gate`] policy, and the offline capability operations ([`mint_link`],
 //! [`narrow_link`], [`revoke_into`]). It prints NOTHING and reads no config path: a caller (tightbeam's
-//! own CLI, or a future swoosh) loads the signet, denylist, and identity, prints its own banner, and drives
+//! own CLI, or any other consumer) loads the signet, denylist, and identity, prints its own banner, and drives
 //! this core. Everything here already speaks `bifrost` and `nauthy`, never clap or a store.
 
 use core::future::Future;
@@ -219,7 +219,7 @@ impl Posture {
 /// One served service in a node's catalog: its name and the [`Posture`] a dialer faces reaching it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceEntry {
-    /// The service name as `serve` published it (the name a connector requests).
+    /// The service name the exposer published it under (the name a connector requests).
     pub name: String,
     /// The posture a dialer faces reaching this service (gated behind a member badge, or open to anyone).
     pub posture: Posture,
@@ -430,7 +430,7 @@ impl Registry {
 
     /// Merge another registry's handlers into this one. The merge is ADD-ONLY: a collision with a scheme
     /// already present is refused HERE at merge intent, never silently overwritten. tightbeam ships no
-    /// handler of its own, so the caller (swoosh) assembles the whole registry; this guard keeps that
+    /// handler of its own, so the caller assembles the whole registry; this guard keeps that
     /// assembly honest, so a second `extend` cannot shadow (and silently downgrade the gate of) a handler
     /// the caller already registered, rather than repairing the collision after the fact.
     pub fn extend(mut self, other: Registry) -> eyre::Result<Self> {
@@ -456,7 +456,7 @@ impl Registry {
 }
 
 /// Resolve the exposer's gate from the operator's choices, in ONE place so every embedder (tightbeam's own
-/// CLI and swoosh) applies the SAME policy: an explicit `public` request (and ONLY that) opens the gate;
+/// CLI and any other consumer) applies the SAME policy: an explicit `public` request (and ONLY that) opens the gate;
 /// otherwise a family gate on the node's provisioned `signet`; an UNPROVISIONED node fails LOUD rather than
 /// ever defaulting to open. The caller loads the denylist and passes it as a value. This exists so the
 /// three security-relevant conventions (open-only-when-`public`, fail-loud-on-unprovisioned,
@@ -532,11 +532,12 @@ impl Exposer {
     /// its own readiness banner before calling).
     ///
     /// `cancel` is the node's ONE teardown authority. The exposer is the single owner of that authority: it
-    /// is the only thing that ACTS on the token (stops accepting, drains, returns). A local timer
-    /// (`serve --for`) or an admitted `control.stop` handler holds a CLONE of the same token as a
-    /// node-control CAPABILITY -- they may REQUEST teardown by cancelling it, but they never hold a node
-    /// handle and never tear anything down themselves. So "who may stop the node" stays a property of who
-    /// holds a token clone (a cap-gated question), while "how the node stops" lives here, in one place.
+    /// is the only thing that ACTS on the token (stops accepting, drains, returns). Anything else that may
+    /// trigger teardown holds a CLONE of the same token as a node-control CAPABILITY, whether a local timer
+    /// counting down a deadline or an admitted stop caller acting on a remote stop request: it may REQUEST
+    /// teardown by cancelling the token, but it never holds a node handle and never tears anything down
+    /// itself. So "who may stop the node" stays a property of who holds a token clone (a cap-gated question),
+    /// while "how the node stops" lives here, in one place.
     pub async fn run<T: Transport, D: Discovery>(
         self,
         node: &Node<T, D>,
@@ -560,8 +561,8 @@ impl Exposer {
         let mut sessions = FuturesUnordered::new();
         loop {
             tokio::select! {
-                // Teardown: the cancel token fired (a local `--for` deadline, or an admitted `control.stop`
-                // caller holding a clone). Stop accepting and return gracefully. The in-flight sessions in
+                // Teardown: the cancel token fired (a local deadline timer, or an admitted stop caller
+                // holding a clone). Stop accepting and return gracefully. The in-flight sessions in
                 // `sessions` are dropped with this future; the caller closes the node next (`node.close()`),
                 // which tears their transport down. One owner of teardown, here.
                 () = cancel.cancelled() => return Ok(()),
@@ -1648,7 +1649,7 @@ mod tests {
     }
 
     /// The cancel seam (delib-18/S18): `Exposer::run` returns gracefully when its cancel token fires, so a
-    /// local `serve --for` timer or an admitted `control.stop` caller (each holding a CLONE of this token as
+    /// local deadline timer or an admitted stop caller (each holding a CLONE of this token as
     /// the node-control capability) can stop the node. Here the token is cancelled from OUTSIDE the run (the
     /// shape both the timer and the handler use); the run must finish with `Ok(())` rather than accept
     /// forever. Uses the mem transport so no real socket is bound.

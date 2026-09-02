@@ -14,10 +14,10 @@
 //! [`revoke_into`](tunnel::revoke_into) mint, narrow, and revoke the `sheer:` capabilities the gate
 //! honors, all offline.
 //!
-//! The tunnel core lives in [`tunnel`]; the wire frames in [`protocol`]. The command-line tool built on
-//! this library is [swoosh](https://github.com/theia-hq/swoosh). This crate also ships a `tightbeam`
-//! binary (`src/bin/tightbeam/`), a thin bridge over the same core that serves only raw forwards over an
-//! empty registry; its CLI command tree lives in the binary, never in this library.
+//! The tunnel core lives in [`tunnel`]; the wire frames in [`protocol`]. A command-line tool can be built
+//! on this library; this crate also ships a `tightbeam` binary (`src/bin/tightbeam/`), a thin bridge over
+//! the same core that serves only raw forwards over an empty registry; its CLI command tree lives in the
+//! binary, never in this library.
 //!
 //! Concurrency uses `FuturesUnordered` + `select!` (structured concurrency on one task) rather than
 //! `tokio::spawn`, because the bifrost interface's futures are not `Send`-bounded. This keeps the library

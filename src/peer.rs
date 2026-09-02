@@ -4,7 +4,7 @@
 //! a known address (a container on the same Docker network, say), going out to n0 is needless latency and
 //! an internet dependency. This layers explicit peer-address hints (the [`Peer`] inputs, `<key>=<addr>`)
 //! over LAN mDNS: a hinted or heard peer is reached directly, and n0 stays the fallback for a remote peer
-//! with no local hint. Mirrors swoosh's seam. (mDNS does not cross a Docker bridge, so in containers an
+//! with no local hint. (mDNS does not cross a Docker bridge, so in containers an
 //! explicit [`Peer`] hint is the mechanism.)
 
 use core::net::SocketAddr;

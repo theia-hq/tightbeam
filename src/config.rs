@@ -7,7 +7,7 @@ use eyre::eyre;
 
 /// The persisted signet location, `~/.config/tightbeam/signet`, overridable with `TIGHTBEAM_SIGNET`.
 /// Holds one thing: the public [`NodeId`] of the signet this node trusts, written once by provisioning
-/// (`swoosh adopt`). Public material (a key you already share), so it sits beside the secret identity,
+/// (an adopt step). Public material (a key you already share), so it sits beside the secret identity,
 /// never inside it.
 pub fn signet_path() -> eyre::Result<PathBuf> {
     if let Some(path) = std::env::var_os("TIGHTBEAM_SIGNET") {
