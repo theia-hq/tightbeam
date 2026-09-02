@@ -7,6 +7,7 @@
 //! own CLI, or a future swoosh) loads the signet, denylist, and identity, prints its own banner, and drives
 //! this core. Everything here already speaks `bifrost` and `nauthy`, never clap or a store.
 
+use core::future::Future;
 use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,6 +25,7 @@ use tokio::sync::Semaphore;
 pub use tokio_util::sync::CancellationToken;
 
 use crate::identity::{AsNodeId as _, AsVerifyKey as _};
+use crate::open_policy::PublicUse;
 use crate::protocol::{Request, Response};
 use crate::raw_stream::RawStream;
 use crate::{pipe_stdio_bridge, splice, splice_halves};
@@ -156,31 +158,65 @@ pub type BoxRead = Box<dyn io::AsyncRead + Unpin + Send>;
 /// to a thing that consumes an admitted stream), never what a handler does; a caller that depends on the
 /// service crates injects them. The handler receives the gate's [`Admitted`] witness by value (single-use,
 /// so "authorize before serve" is a compile-time precondition) and the raw stream halves for ONE stream.
-pub type ServeFn =
-    Arc<dyn Fn(Admitted, BoxWrite, BoxRead) -> BoxFuture<'static, eyre::Result<()>> + Send + Sync>;
+///
+/// Whether the handler may EVER face an unauthenticated stranger is a COMPILE-TIME property, stated once as
+/// the associated [`type Public`](Handler::Public): a keyless shell names [`Never`](crate::open_policy::Never)
+/// (an open gate over it is refused at [`Exposer::new`]), a legitimately-public responder names
+/// [`OptIn`](crate::open_policy::OptIn). There is no default and no runtime bool: omitting the choice does not
+/// compile, and the marker is sealed + uninhabited, so "a keyless service mislabeled open" is unrepresentable
+/// rather than a guarded default (delib-37).
+///
+/// The `serve` future is `+ Send`: the exposer is `tokio::spawn`ed on a multi-thread runtime and holds the
+/// boxed serve future across `.await`, so it must be `Send` (delib-32 r2, compiler-forced). Authors may still
+/// write a plain `async fn serve` whose body is `Send`; on the pinned toolchain that coerces to the `+ Send`
+/// RPITIT bound at the impl site with no `trait_variant` needed.
+pub trait Handler: Send + Sync + 'static {
+    /// This handler's open-safety CEILING, stated as a type (no default, so the author MUST pick one of
+    /// [`Never`](crate::open_policy::Never) / [`OptIn`](crate::open_policy::OptIn)). Erased to a frozen
+    /// `const bool` at the [`ErasedHandler`] bridge, read once at [`Exposer::new`] to refuse an open gate over
+    /// a [`Never`](crate::open_policy::Never) handler.
+    type Public: PublicUse;
 
-/// One registered service: how to serve it, and whether it MUST be gated. A handler with no auth of its own
-/// (a keyless shell) declares `requires_gate`, so an open gate over it is refused at [`Exposer::new`].
-pub struct Handler {
-    serve: ServeFn,
-    requires_gate: bool,
+    /// Serve ONE admitted stream: the gate's single-use [`Admitted`] witness by value, and the stream halves.
+    fn serve(
+        &self,
+        admitted: Admitted,
+        writer: BoxWrite,
+        reader: BoxRead,
+    ) -> impl Future<Output = eyre::Result<()>> + Send;
 }
 
-impl Handler {
-    /// A handler that may be exposed under any gate (it has auth of its own, or is safe to open).
-    pub fn open(serve: ServeFn) -> Self {
-        Self {
-            serve,
-            requires_gate: false,
-        }
+/// The object-safe, stored-in-the-`HashMap` view of a [`Handler`]: the associated `Public` marker is erased
+/// here to a `const bool` ([`open_safe`](ErasedHandler::open_safe)) and the RPITIT `serve` future is boxed
+/// ([`BoxFuture`], `Send`-bearing), so heterogeneous handlers (a [`Never`](crate::open_policy::Never) sshd and
+/// an [`OptIn`](crate::open_policy::OptIn) ping) share ONE `Arc<dyn ErasedHandler>` storage type. The marker
+/// never enters these signatures, so it does its job at the impl-site type-check and then vanishes into the
+/// object's frozen `open_safe()` answer (delib-37: this is why the associated type, not a generic, survives
+/// erasure).
+trait ErasedHandler: Send + Sync {
+    /// The erased open-safety ceiling: `<H::Public as PublicUse>::OPEN_SAFE`, read once at [`Exposer::new`].
+    fn open_safe(&self) -> bool;
+    /// The boxed serve future, tied to `&'a self` (`'a`, not `'static`: it borrows the handler's fields).
+    fn serve_erased<'a>(
+        &'a self,
+        admitted: Admitted,
+        writer: BoxWrite,
+        reader: BoxRead,
+    ) -> BoxFuture<'a, eyre::Result<()>>;
+}
+
+impl<H: Handler> ErasedHandler for H {
+    fn open_safe(&self) -> bool {
+        <H::Public as PublicUse>::OPEN_SAFE
     }
 
-    /// A handler with no auth of its own: the gate IS its authentication, so an open gate over it is refused.
-    pub fn gated(serve: ServeFn) -> Self {
-        Self {
-            serve,
-            requires_gate: true,
-        }
+    fn serve_erased<'a>(
+        &'a self,
+        admitted: Admitted,
+        writer: BoxWrite,
+        reader: BoxRead,
+    ) -> BoxFuture<'a, eyre::Result<()>> {
+        Box::pin(Handler::serve(self, admitted, writer, reader))
     }
 }
 
@@ -188,7 +224,7 @@ impl Handler {
 /// depends on no service crate and ships no handler of its own. Keyed by the `<scheme>:` an exposed service
 /// resolves to (`sshd`, `fetch`, `diag`).
 #[derive(Default)]
-pub struct Registry(HashMap<String, Handler>);
+pub struct Registry(HashMap<String, Arc<dyn ErasedHandler>>);
 
 impl Registry {
     /// An empty registry.
@@ -196,11 +232,13 @@ impl Registry {
         Self::default()
     }
 
-    /// Register `scheme` -> `handler`, returning self for chaining.
+    /// Register `scheme` -> `handler`, returning self for chaining. The handler's open-safety marker
+    /// (`type Public`) is erased to a `const bool` as it is boxed into the shared `Arc<dyn ErasedHandler>`
+    /// storage, so heterogeneous handlers live in one map.
     #[must_use]
-    pub fn with(mut self, scheme: impl Into<String>, handler: Handler) -> Self {
+    pub fn with(mut self, scheme: impl Into<String>, handler: impl Handler) -> Self {
         let Self(handlers) = &mut self;
-        handlers.insert(scheme.into(), handler);
+        handlers.insert(scheme.into(), Arc::new(handler));
         self
     }
 
@@ -225,7 +263,7 @@ impl Registry {
     }
 
     /// Look up a handler by scheme.
-    fn get(&self, scheme: &str) -> Option<&Handler> {
+    fn get(&self, scheme: &str) -> Option<&Arc<dyn ErasedHandler>> {
         let Self(handlers) = self;
         handlers.get(scheme)
     }
@@ -272,14 +310,14 @@ impl Exposer {
         for scheme in services.handler_schemes() {
             let Some(handler) = registry.get(scheme) else {
                 eyre::bail!(
-                    "no handler is registered for `{scheme}:` \
-                     (is the feature that provides it built in?)"
+                    "register a handler for `{scheme}:` before exposing it (or drop the service): \
+                     no handler is registered for it (is the feature that provides it built in?)"
                 );
             };
-            if matches!(gate, Gate::Open) && handler.requires_gate {
+            if matches!(gate, Gate::Open) && !handler.open_safe() {
                 eyre::bail!(
-                    "a `{scheme}:` service has no auth of its own and must be gated; \
-                     a public gate would expose it to anyone who reaches this node"
+                    "gate the `{scheme}:` service instead of opening it: it has no legitimate public use, \
+                     so a public gate would hand it to anyone who reaches this node"
                 );
             }
         }
@@ -529,7 +567,9 @@ where
         Some(Target::Handler(scheme)) => match registry.get(scheme) {
             Some(handler) => {
                 Response::Ok.write(&mut writer).await?;
-                (handler.serve)(admitted, Box::new(writer), Box::new(reader)).await?;
+                handler
+                    .serve_erased(admitted, Box::new(writer), Box::new(reader))
+                    .await?;
             }
             // `Exposer::new` proved every exposed handler is registered, so this is unreachable in practice;
             // answer defensively rather than panic if an exposer was hand-built around that invariant.
@@ -1025,10 +1065,41 @@ mod tests {
     use tokio::io::AsyncReadExt as _;
 
     use super::{
-        BoxRead, Exposer, RAW_STREAM_OPEN_PERMITS, Registry, Semaphore, Services, Target,
-        resolve_single_service, serve_request,
+        BoxRead, BoxWrite, Exposer, Handler, RAW_STREAM_OPEN_PERMITS, Registry, Semaphore, Services,
+        Target, resolve_single_service, serve_request,
     };
+    use crate::open_policy::{Never, OptIn};
     use crate::raw_stream::RawStream;
+
+    /// A do-nothing GATED handler (`type Public = Never`): stands in for a keyless shell, so an open gate over
+    /// it must be refused at `Exposer::new`.
+    struct GatedNoop;
+    impl Handler for GatedNoop {
+        type Public = Never;
+        async fn serve(
+            &self,
+            _admitted: nauthy::Admitted,
+            _writer: BoxWrite,
+            _reader: BoxRead,
+        ) -> eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A do-nothing OPEN handler (`type Public = OptIn`): a legitimately-public responder, exposable under any
+    /// gate.
+    struct OpenNoop;
+    impl Handler for OpenNoop {
+        type Public = OptIn;
+        async fn serve(
+            &self,
+            _admitted: nauthy::Admitted,
+            _writer: BoxWrite,
+            _reader: BoxRead,
+        ) -> eyre::Result<()> {
+            Ok(())
+        }
+    }
 
     fn svc(name: &str) -> Service {
         name.parse()
@@ -1199,14 +1270,11 @@ mod tests {
 
     #[test]
     fn an_exposer_refuses_a_public_shell() {
-        use futures::FutureExt as _;
-        // A gated handler standing in for the keyless shell (it declares `requires_gate`): a shell has no
-        // auth of its own, so an open gate over it would hand anyone a shell. `Exposer::new` must reject
+        // A gated handler standing in for the keyless shell (`type Public = Never`): a shell has no
+        // legitimate public use, so an open gate over it would hand anyone a shell. `Exposer::new` must reject
         // that pairing, wherever the caller assembles it.
-        let noop: super::ServeFn =
-            std::sync::Arc::new(|_admitted, _writer, _reader| async { Ok(()) }.boxed());
         let shell = services(&["ssh=sshd:"]);
-        let registry = super::Registry::new().with("sshd", super::Handler::gated(noop));
+        let registry = super::Registry::new().with("sshd", GatedNoop);
         assert!(
             super::Exposer::new(shell, registry, Gate::Open).is_err(),
             "an open gate over a shell service must be refused"
@@ -1680,18 +1748,14 @@ mod tests {
 
     #[test]
     fn extend_is_add_only_and_refuses_a_collision() {
-        use futures::FutureExt as _;
-        let noop: super::ServeFn =
-            std::sync::Arc::new(|_admitted, _writer, _reader| async { Ok(()) }.boxed());
         // Adding a NEW scheme (an embedder injecting its own `ping:` beside `fetch:`) is allowed.
-        let base = super::Registry::new().with("fetch", super::Handler::open(noop.clone()));
-        let added =
-            base.extend(super::Registry::new().with("ping", super::Handler::open(noop.clone())));
+        let base = super::Registry::new().with("fetch", OpenNoop);
+        let added = base.extend(super::Registry::new().with("ping", OpenNoop));
         assert!(added.is_ok(), "injecting a new scheme must be allowed");
         // Re-injecting a scheme already registered is refused at merge intent, so a second `extend` can
         // never shadow (and silently downgrade the gate of) a handler the caller already registered.
-        let base = super::Registry::new().with("sshd", super::Handler::gated(noop.clone()));
-        let shadowed = base.extend(super::Registry::new().with("sshd", super::Handler::open(noop)));
+        let base = super::Registry::new().with("sshd", GatedNoop);
+        let shadowed = base.extend(super::Registry::new().with("sshd", OpenNoop));
         assert!(
             shadowed.is_err(),
             "re-injecting an already-registered scheme must be refused so it cannot shadow a handler"

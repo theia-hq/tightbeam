@@ -13,8 +13,9 @@
 //! value can be forged and named where a marker type is expected. Both properties make "a keyless service
 //! mislabeled open" a compile error, not a runtime hope.
 //!
-//! This is a dead-code scaffold this increment: [`Handler`](crate::tunnel::Handler) gains its
-//! `type Public: PublicUse` in a later increment, and the assembler's open-gate refusal is wired then.
+//! [`Handler`](crate::tunnel::Handler) names one of these markers as its `type Public: PublicUse`, and
+//! [`Exposer::new`](crate::tunnel::Exposer::new) reads the erased `OPEN_SAFE` once to refuse an open gate over
+//! a [`Never`] handler.
 //!
 //! The seal is load-bearing, so it is guarded by a compile-fail probe: a downstream marker is REJECTED
 //! because the `sealed::Sealed` supertrait it would need is private and unnameable. This doc-test fails to
