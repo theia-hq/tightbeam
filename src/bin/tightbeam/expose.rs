@@ -1,8 +1,8 @@
 //! `tightbeam expose`: publish local services under this node's key.
 //!
 //! The parse -> gate -> banner -> assemble -> run body is [`ExposeCmd::run`], a thin adapter over
-//! [`tightbeam::tunnel`], so tightbeam's CLI drives the same library core swoosh does and differs only in
-//! identity, banner, and surface.
+//! [`tightbeam::tunnel`], so this CLI drives the same library core any richer consumer does and differs only
+//! in identity, banner, and surface.
 
 use bifrost::{Node, NodeId, Session, Transport};
 use clap::Args;
@@ -13,11 +13,12 @@ use tightbeam::tunnel::{self, CancellationToken, Exposer, Registry, Services};
 ///
 /// tightbeam's binary is a thin demo of the tunnel: it forwards the raw primitives (`host:port` /
 /// `unix:<path>`, and the raw-stream `file:<path>` / `fifo:<path>` that source a path's bytes to the peer)
-/// only. A named handler service (`sshd:`, `fetch:`, `ping:`) lives in its own crate that a product
-/// (swoosh) injects, so it is not served here.
+/// only. A named handler service (a bare `<name>:` scheme) lives in its own crate that a richer consumer
+/// injects, so it is not served here.
 ///
 /// Authorization is a property of the node, not a per-expose choice: by default a service is gated to this
-/// node's signet (set once by `swoosh adopt`), admitting the owner's own devices (membership badges) and
+/// node's signet (set once when the node adopts an identity), admitting the owner's own devices (membership
+/// badges) and
 /// anyone they delegate a slip to. `--public` is the one deliberate exception: it opens a service to
 /// anyone, unauthenticated.
 #[derive(Debug, Args)]
@@ -35,15 +36,15 @@ pub struct ExposeCmd {
 }
 
 impl ExposeCmd {
-    /// tightbeam's `expose` adapter: a thin glue over [`tightbeam::tunnel`], symmetric with swoosh's. Parse
-    /// the services, resolve the gate through the shared `resolve_gate` policy (`--public` opens, else a
-    /// family gate on the signet, else a loud error), print tightbeam's OWN banner, and run the exposer. The
-    /// core prints nothing; the banner is this CLI's to own.
+    /// tightbeam's `expose` adapter: a thin glue over [`tightbeam::tunnel`], symmetric with any richer
+    /// consumer's. Parse the services, resolve the gate through the shared `resolve_gate` policy (`--public`
+    /// opens, else a family gate on the signet, else a loud error), print tightbeam's OWN banner, and run the
+    /// exposer. The core prints nothing; the banner is this CLI's to own.
     ///
     /// tightbeam's binary is a thin demo of the tunnel: it exposes only the raw-forward primitive
     /// (`host:port` / `unix:<path>`), so it hands the exposer an EMPTY registry and names no service crate. A
-    /// handler service (`sshd:`, `fetch:`, `ping:`) lives in its own crate that swoosh injects; a bare scheme
-    /// here resolves to a handler no registry holds and is refused loudly at [`Exposer::new`].
+    /// handler service (a bare `<name>:` scheme) lives in its own crate that a richer consumer injects; a bare
+    /// scheme here resolves to a handler no registry holds and is refused loudly at [`Exposer::new`].
     pub async fn run<T: Transport, D: bifrost::Discovery>(
         self,
         node: &Node<T, D>,
@@ -68,10 +69,10 @@ impl ExposeCmd {
                 &gate_description(&self, signet),
             );
         }
-        // This thin demo binary has no remote-stop and no local `--for` surface, so it holds no teardown
+        // This thin demo binary has no scheduled or remote teardown surface, so it holds no teardown
         // authority to hand out: it runs until the process is signalled (SIGINT), passing a token that is
-        // never cancelled. swoosh is where the same token is wired to `serve --for` and a gated
-        // `control.stop` handler; here it is inert.
+        // never cancelled. A richer consumer is where the same token is wired to a teardown surface (a local
+        // timer and a gated stop handler); here it is inert.
         exposer.run(node, CancellationToken::new()).await
     }
 }

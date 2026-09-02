@@ -7,8 +7,8 @@
 //! services, the identity, and the output; the core prints nothing and reads no config path.
 //!
 //! Who may connect is decided by the [`nauthy`] crate's authorization gate: by default the node's signet
-//! (its own devices and their delegates), else an open gate for anyone. A named service (a keyless shell,
-//! an HTTP fetcher, diagnostics) is a [`Handler`](tunnel::Handler) a caller injects into a
+//! (its own devices and their delegates), else an open gate for anyone. A named service is a
+//! [`Handler`](tunnel::Handler) a caller injects into a
 //! [`Registry`](tunnel::Registry); tightbeam knows only the contract, never what a handler does, and
 //! ships none of its own. [`mint_link`](tunnel::mint_link) / [`narrow_link`](tunnel::narrow_link) /
 //! [`revoke_into`](tunnel::revoke_into) mint, narrow, and revoke the `sheer:` capabilities the gate
@@ -85,16 +85,16 @@ where
     Ok(())
 }
 
-/// Pump this process's stdio against a peer service stream for an ssh-`ProxyCommand`-shaped bridge (piping
-/// the service to this process's stdout), finishing as soon as the PEER closes its write half.
+/// Pump this process's stdio against a peer service stream for a ProxyCommand-shaped bridge (piping the
+/// service to this process's stdout), finishing as soon as the PEER closes its write half.
 ///
-/// The asymmetry is the whole point, and the fix for the `ssh <peer> -- <cmd>` hang. The bridge's stdin is
-/// the local ssh's terminal, which never reaches EOF for the life of the session, so a symmetric
-/// wait-for-both pump ([`splice_halves`]) would park forever after the remote command exits (the remote
-/// closes its write half, but local stdin stays open). A stdio bridge is done when the SERVICE is done:
-/// when the peer half-closes (its command exited, or an interactive session ended), copy any final bytes to
-/// stdout, then return, rather than waiting on a stdin that will never close. The local-to-peer copy runs
-/// concurrently and is dropped on return (its writer is shut down first, so the peer sees a clean close).
+/// The asymmetry is the whole point, and the fix for the hang a stdio bridge otherwise takes when its local
+/// stdin never reaches EOF (a bridge whose stdin is an interactive terminal). A symmetric wait-for-both pump
+/// ([`splice_halves`]) would park forever after the remote command exits (the remote closes its write half,
+/// but local stdin stays open). A stdio bridge is done when the SERVICE is done: when the peer half-closes
+/// (its command exited, or an interactive session ended), copy any final bytes to stdout, then return,
+/// rather than waiting on a stdin that will never close. The local-to-peer copy runs concurrently and is
+/// dropped on return (its writer is shut down first, so the peer sees a clean close).
 pub(crate) async fn pipe_stdio_bridge<W, R>(mut writer: W, mut reader: R) -> io::Result<()>
 where
     W: io::AsyncWrite + Unpin,
@@ -112,7 +112,8 @@ where
     };
     tokio::select! {
         // The peer closed (remote command exited / session ended): the service is done, so return without
-        // waiting on local stdin (which, at a terminal, never EOFs). This is what unhangs `ssh -- <cmd>`.
+        // waiting on local stdin (which, at a terminal, never EOFs). This is what keeps a reached command
+        // from hanging the bridge open after it exits.
         result = downstream => result,
         // Local stdin closed first (a piped, finite input): half-close toward the peer, then keep draining
         // the peer's remaining output to stdout so nothing it still had to say is lost.

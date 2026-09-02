@@ -83,7 +83,7 @@ enum Target {
     /// time (a read-only
     /// source), so "write peer bytes back into the source" is unrepresentable rather than a runtime error.
     RawStream(RawStream),
-    /// A named service handler (`sshd`, `fetch`, `diag`, ...) dispatched through the injected registry.
+    /// A named service handler (a bare `<name>:` scheme) dispatched through the injected registry.
     Handler(String),
 }
 
@@ -93,9 +93,9 @@ enum Target {
 pub struct Services(HashMap<String, Target>);
 
 impl Services {
-    /// Parse `name=addr` service entries; a bare `addr` becomes the `default` service. A bare scheme
-    /// (`sshd:`, `fetch:`, `ping:`) resolves to a handler; a `host:port` / `unix:<path>` to a raw
-    /// forward. A scheme may be dotted (`control.status`, `control.restart`) for a method on an interface.
+    /// Parse `name=addr` service entries; a bare `addr` becomes the `default` service. A bare `<name>:`
+    /// scheme resolves to a handler; a `host:port` / `unix:<path>` to a raw
+    /// forward. A scheme may be dotted (`<iface>.<method>:`) for a method on an interface.
     pub fn parse(entries: &[String]) -> eyre::Result<Self> {
         let mut services = HashMap::new();
         for entry in entries {
@@ -144,7 +144,7 @@ impl Services {
         ServiceCatalog(entries)
     }
 
-    /// The handler schemes this exposer names (e.g. `sshd`, `fetch`), so [`Exposer::new`] can check each
+    /// The handler schemes this exposer names (each a bare `<name>:`), so [`Exposer::new`] can check each
     /// against the injected registry: every named handler must be registered, and a handler with no auth of
     /// its own may not sit behind an open gate.
     fn handler_schemes(&self) -> impl Iterator<Item = &str> {
@@ -178,7 +178,7 @@ impl Services {
 /// This is the EFFECTIVE posture a dialer would experience today, read off the node's gate: an [`Gate::Open`]
 /// node serves every service to anyone, so each is [`Open`](Posture::Open); any other gate requires a member
 /// badge, so each is [`Gated`](Posture::Gated). It is not the handler's compile-time open-safety CEILING
-/// (`type Public`): a service that COULD be public (`ping`) still reports `Gated` on a gated node, because
+/// (`type Public`): a service that COULD be public still reports `Gated` on a gated node, because
 /// that is what a caller actually faces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Posture {
@@ -374,8 +374,8 @@ pub trait Handler: Send + Sync + 'static {
 
 /// The object-safe, stored-in-the-`HashMap` view of a [`Handler`]: the associated `Public` marker is erased
 /// here to a `const bool` ([`open_safe`](ErasedHandler::open_safe)) and the RPITIT `serve` future is boxed
-/// ([`BoxFuture`], `Send`-bearing), so heterogeneous handlers (a [`Never`](crate::open_policy::Never) sshd and
-/// an [`OptIn`](crate::open_policy::OptIn) ping) share ONE `Arc<dyn ErasedHandler>` storage type. The marker
+/// ([`BoxFuture`], `Send`-bearing), so heterogeneous handlers (a [`Never`](crate::open_policy::Never) and an
+/// [`OptIn`](crate::open_policy::OptIn) handler) share ONE `Arc<dyn ErasedHandler>` storage type. The marker
 /// never enters these signatures, so it does its job at the impl-site type-check and then vanishes into the
 /// object's frozen `open_safe()` answer (delib-37: this is why the associated type, not a generic, survives
 /// erasure).
@@ -408,7 +408,7 @@ impl<H: Handler> ErasedHandler for H {
 
 /// The scheme -> handler map the [`Exposer`] takes at construction. The caller builds it; the tunnel core
 /// depends on no service crate and ships no handler of its own. Keyed by the `<scheme>:` an exposed service
-/// resolves to (`sshd`, `fetch`, `diag`).
+/// resolves to (a bare `<name>:`).
 #[derive(Default)]
 pub struct Registry(HashMap<String, Arc<dyn ErasedHandler>>);
 
@@ -532,12 +532,11 @@ impl Exposer {
     /// its own readiness banner before calling).
     ///
     /// `cancel` is the node's ONE teardown authority. The exposer is the single owner of that authority: it
-    /// is the only thing that ACTS on the token (stops accepting, drains, returns). Anything else that may
-    /// trigger teardown holds a CLONE of the same token as a node-control CAPABILITY, whether a local timer
-    /// counting down a deadline or an admitted stop caller acting on a remote stop request: it may REQUEST
-    /// teardown by cancelling the token, but it never holds a node handle and never tears anything down
-    /// itself. So "who may stop the node" stays a property of who holds a token clone (a cap-gated question),
-    /// while "how the node stops" lives here, in one place.
+    /// is the only thing that ACTS on the token (stops accepting, drains, returns). A holder of a CLONE of
+    /// the token may REQUEST teardown by firing it, but it never holds a node handle and never tears anything
+    /// down itself. So "who may stop the node" stays a property of who holds a token clone, while "how the
+    /// node stops" lives here, in one place. What may hold a clone, and why, is the caller's policy, not the
+    /// tunnel's concern.
     pub async fn run<T: Transport, D: Discovery>(
         self,
         node: &Node<T, D>,
@@ -561,8 +560,8 @@ impl Exposer {
         let mut sessions = FuturesUnordered::new();
         loop {
             tokio::select! {
-                // Teardown: the cancel token fired (a local deadline timer, or an admitted stop caller
-                // holding a clone). Stop accepting and return gracefully. The in-flight sessions in
+                // Teardown: the cancel token fired (a holder of a clone requested it). Stop accepting and
+                // return gracefully. The in-flight sessions in
                 // `sessions` are dropped with this future; the caller closes the node next (`node.close()`),
                 // which tears their transport down. One owner of teardown, here.
                 () = cancel.cancelled() => return Ok(()),
@@ -834,8 +833,8 @@ fn resolve_single_service(requested: Service, services: &HashMap<String, Target>
 }
 
 /// Resolve an exposed service's address to a [`Target`]: `file:<path>` / `fifo:<path>` are the raw-stream
-/// forward (open an existing OS object, splice its bytes to the peer); a bare scheme (`sshd:`, `fetch:`,
-/// `ping:` -- a word then a colon with nothing after) names a handler; anything else must be a socket forward
+/// forward (open an existing OS object, splice its bytes to the peer); a bare scheme (a `<name>:` -- a word
+/// then a colon with nothing after) names a handler; anything else must be a socket forward
 /// (`host:port` or `unix:<path>`). All validated here so a typo fails at parse with a teaching message, not
 /// at dial time.
 fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
@@ -899,7 +898,7 @@ fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
 
 /// Reject a forward addr that is not a real target, so a bare service name (`expose web`) fails at parse
 /// with a teaching message instead of silently pointing the `default` service at an undialable host. Valid
-/// forwards: `unix:<path>` or a `host:port` (a handler scheme like `sshd:`/`fetch:` is resolved earlier).
+/// forwards: `unix:<path>` or a `host:port` (a bare `<name>:` handler scheme is resolved earlier).
 fn validate_forward(addr: &str, entry: &str) -> eyre::Result<()> {
     let is_host_port = addr
         .rsplit_once(':')
@@ -912,12 +911,12 @@ fn validate_forward(addr: &str, entry: &str) -> eyre::Result<()> {
         eyre::bail!(
             "`{entry}` is not an address to forward to. Did you mean a service pointing at one, e.g. \
              `{entry}=127.0.0.1:8080`? (an address is host:port, unix:<path>, file:<path>, fifo:<path>, \
-             or a handler like sshd:/fetch:)"
+             or a bare `<name>:` handler scheme)"
         );
     }
     eyre::bail!(
         "`{addr}` is not a valid forwarding address (host:port, unix:<path>, file:<path>, fifo:<path>, \
-         or a handler like sshd:/fetch:)"
+         or a bare `<name>:` handler scheme)"
     )
 }
 
@@ -1027,9 +1026,9 @@ impl Connector {
         })
     }
 
-    /// Reach the service over one stream and pipe it against this process's stdin/stdout (piping the service
-    /// to this process's stdout, the ssh `ProxyCommand` shape): ssh speaks its protocol over our stdio and we carry it to the
-    /// peer. The pump finishes when the peer closes, so a `-- <cmd>` invocation exits when its command does.
+    /// Reach the service over one stream and pipe it against this process's stdin/stdout (a
+    /// ProxyCommand-shaped bridge: the peer service is carried to this process's stdout while local stdin is
+    /// pumped to the peer). The pump finishes when the peer closes, so a reached command exits when it does.
     pub async fn pipe_stdio<T: Transport, D: Discovery>(
         self,
         node: &Node<T, D>,
@@ -1040,8 +1039,8 @@ impl Connector {
     }
 
     /// Reach the peer and return a [`ServiceSession`]: a [`Session`] whose every `open_bi` first speaks
-    /// this connector's `Request{service, capability}` / `Response::Ok` handshake, so a protocol that is
-    /// generic over `Session` (diag's ping/speed) rides the gate transparently, one admitted stream at a
+    /// this connector's `Request{service, capability}` / `Response::Ok` handshake, so any caller-injected
+    /// protocol generic over `Session` rides the gate transparently, one admitted stream at a
     /// time. This is the client counterpart to a per-stream [`serve_request`]: the exposer gates each
     /// stream, and the wrapper presents the request on each stream so every one of them is admitted on its
     /// own merits. Plain `async fn`, no spawn, so it honors the non-`Send` structured-concurrency rule.
@@ -1106,8 +1105,8 @@ impl<S: Session> PortForward<S> {
 
 /// A [`Session`] view that gates every stream it opens through a fixed service request. Wraps a live
 /// bifrost session; on `open_bi` it opens a real stream, sends the request, and yields the admitted halves
-/// ONLY on `Response::Ok`, mapping a refusal to [`bifrost::Error::Stream`]. Any `Session`-generic protocol
-/// (diag's `Speedtest`/`Ping`) runs over it unchanged, every one of its streams admitted by the gate.
+/// ONLY on `Response::Ok`, mapping a refusal to [`bifrost::Error::Stream`]. Any caller-injected
+/// `Session`-generic protocol runs over it unchanged, every one of its streams admitted by the gate.
 ///
 /// The associated stream halves are the inner session's own (`type Write = S::Write; type Read =
 /// S::Read`), so the handshake writes/reads on those exact halves and hands them back untouched: zero
@@ -1147,8 +1146,8 @@ impl<S: Session> Session for ServiceSession<S> {
     }
 
     async fn accept_bi(&self) -> Result<(Self::Write, Self::Read), bifrost::Error> {
-        // A service client never accepts peer-opened streams; the diag protocols only ever `open_bi`.
-        // Refusing (rather than `unreachable!`) keeps the wrapper total and panic-free.
+        // A service client never accepts peer-opened streams; such service-scoped protocols only ever
+        // `open_bi`. Refusing (rather than `unreachable!`) keeps the wrapper total and panic-free.
         Err(bifrost::Error::Stream(
             "a service-scoped session does not accept inbound streams".into(),
         ))
@@ -1182,10 +1181,11 @@ where
     Ok(())
 }
 
-/// Open a service and, if the host accepts, pipe it against this process's stdin/stdout (piping the service
-/// to this process's stdout, the ssh-`ProxyCommand` path). Same handshake as [`request_service`], but the local ends are the
-/// process's own std streams, and the pump ([`pipe_stdio_bridge`]) returns when the PEER closes rather than
-/// waiting on a stdin that (at a terminal) never EOFs, so `ssh <peer> -- <cmd>` exits when the command does.
+/// Open a service and, if the host accepts, pipe it against this process's stdin/stdout (a
+/// ProxyCommand-shaped bridge carrying the service to this process's stdout). Same handshake as
+/// [`request_service`], but the local ends are the process's own std streams, and the pump
+/// ([`pipe_stdio_bridge`]) returns when the PEER closes rather than waiting on a stdin that (at a terminal)
+/// never EOFs, so a reached command exits when the command does.
 async fn request_stdio<W, R>(request: Request, mut writer: W, mut reader: R) -> eyre::Result<()>
 where
     W: io::AsyncWrite + Unpin,
@@ -1262,14 +1262,14 @@ mod tests {
     /// round trip byte for byte: the read `control.services` returns and the client decodes are the same value.
     #[test]
     fn a_gated_catalog_reports_gated_and_round_trips() {
-        let services = services(&["web=127.0.0.1:80", "ping=ping:", "ssh=sshd:"]);
+        let services = services(&["c=127.0.0.1:80", "a=handler:", "b=handler:"]);
         let signet = nauthy::Identity::from_secret(&[7u8; 32]).expect("valid secret");
         let denylist = nauthy::Denylist::empty(std::env::temp_dir().join("tb-catalog-gated"));
         let gate = Gate::family(signet.node_id(), denylist);
         let catalog = services.catalog(&gate);
 
         let names: Vec<&str> = catalog.entries().map(|entry| entry.name.as_str()).collect();
-        assert_eq!(names, ["ping", "ssh", "web"], "entries are name-sorted");
+        assert_eq!(names, ["a", "b", "c"], "entries are name-sorted");
         assert!(
             catalog
                 .entries()
@@ -1285,7 +1285,7 @@ mod tests {
     /// public node's catalog says anyone may reach these.
     #[test]
     fn an_open_catalog_reports_open() {
-        let services = services(&["web=127.0.0.1:80", "fetch=fetch:"]);
+        let services = services(&["a=127.0.0.1:80", "b=handler:"]);
         let catalog = services.catalog(&Gate::Open);
         assert!(
             catalog
@@ -1325,7 +1325,7 @@ mod tests {
 
         // A well-formed single entry followed by a stray byte: trailing bytes are rejected.
         let good = ServiceCatalog(vec![ServiceEntry {
-            name: "ping".to_owned(),
+            name: "a".to_owned(),
             posture: Posture::Gated,
         }]);
         let mut trailing = good.encode();
@@ -1333,8 +1333,8 @@ mod tests {
         assert!(ServiceCatalog::decode(&trailing).is_err());
     }
 
-    /// A do-nothing GATED handler (`type Public = Never`): stands in for a keyless shell, so an open gate over
-    /// it must be refused at `Exposer::new`.
+    /// A do-nothing GATED handler (`type Public = Never`): a handler with no public use of its own, so an
+    /// open gate over it must be refused at `Exposer::new`.
     struct GatedNoop;
     impl Handler for GatedNoop {
         type Public = Never;
@@ -1397,13 +1397,13 @@ mod tests {
 
     #[test]
     fn a_single_service_node_needs_no_service_name() {
-        let Services(one) = services(&["web=127.0.0.1:80"]);
+        let Services(one) = services(&["a=127.0.0.1:80"]);
         // A connector defaulting to `default` on a single-service node resolves to that one service.
-        assert_eq!(resolve_single_service(svc("default"), &one).as_str(), "web");
+        assert_eq!(resolve_single_service(svc("default"), &one).as_str(), "a");
         // A request that already names the exposed service is unchanged.
-        assert_eq!(resolve_single_service(svc("web"), &one).as_str(), "web");
+        assert_eq!(resolve_single_service(svc("a"), &one).as_str(), "a");
 
-        let Services(two) = services(&["web=127.0.0.1:80", "ssh=sshd:"]);
+        let Services(two) = services(&["a=127.0.0.1:80", "b=handler:"]);
         // With two services, an unmatched request is left as-is (fails later with the hint, never guesses).
         assert_eq!(
             resolve_single_service(svc("default"), &two).as_str(),
@@ -1427,8 +1427,8 @@ mod tests {
     fn real_targets_parse() {
         for entry in [
             "web=127.0.0.1:8080",
-            "ssh=sshd:",
-            "proxy=fetch:",
+            "a=handler:",
+            "b=handler:",
             "db=unix:/run/db.sock",
             "pipe=file:/tmp/beam",
             "named=fifo:/tmp/beam",
@@ -1488,7 +1488,7 @@ mod tests {
             "doc=file:/etc/hosts+lossy",
             "web=127.0.0.1:8080+lossy",
             "db=unix:/run/db.sock+lossy",
-            "ssh=sshd:+lossy",
+            "a=handler:+lossy",
         ] {
             let Err(err) = Services::parse(&[entry.to_owned()]) else {
                 panic!("`+lossy` on {entry} must be rejected at parse");
@@ -1531,23 +1531,23 @@ mod tests {
     }
 
     #[test]
-    fn an_exposer_refuses_a_public_shell() {
-        // A gated handler standing in for the keyless shell (`type Public = Never`): a shell has no
-        // legitimate public use, so an open gate over it would hand anyone a shell. `Exposer::new` must reject
-        // that pairing, wherever the caller assembles it.
-        let shell = services(&["ssh=sshd:"]);
-        let registry = super::Registry::new().with("sshd", GatedNoop);
+    fn an_exposer_refuses_an_open_gate_over_a_gated_only_handler() {
+        // A gated-only handler (`type Public = Never`): it has no legitimate public use, so an open gate over
+        // it would serve it to anyone. `Exposer::new` must reject that pairing, wherever the caller assembles
+        // it.
+        let gated = services(&["a=handler:"]);
+        let registry = super::Registry::new().with("handler", GatedNoop);
         assert!(
-            super::Exposer::new(shell, registry, Gate::Open).is_err(),
-            "an open gate over a shell service must be refused"
+            super::Exposer::new(gated, registry, Gate::Open).is_err(),
+            "an open gate over a gated-only handler must be refused"
         );
-        // The same shell behind a real gate is fine; only the open-gate pairing is refused. A family gate
-        // needs a signet and denylist, so prove the inverse with a non-shell service (an empty registry
+        // The same handler behind a real gate is fine; only the open-gate pairing is refused. A family gate
+        // needs a signet and denylist, so prove the inverse with a plain forward (an empty registry
         // suffices, since a raw forward needs no handler) under the open gate.
         let web = services(&["web=127.0.0.1:80"]);
         assert!(
             super::Exposer::new(web, super::Registry::new(), Gate::Open).is_ok(),
-            "an open gate over a non-shell service is allowed"
+            "an open gate over a plain forward is allowed"
         );
     }
 
@@ -1648,11 +1648,10 @@ mod tests {
             .await;
     }
 
-    /// The cancel seam (delib-18/S18): `Exposer::run` returns gracefully when its cancel token fires, so a
-    /// local deadline timer or an admitted stop caller (each holding a CLONE of this token as
-    /// the node-control capability) can stop the node. Here the token is cancelled from OUTSIDE the run (the
-    /// shape both the timer and the handler use); the run must finish with `Ok(())` rather than accept
-    /// forever. Uses the mem transport so no real socket is bound.
+    /// The cancel seam (delib-18/S18): `Exposer::run` returns gracefully when its cancel token fires, so any
+    /// holder of a CLONE of this token can stop the node. Here the token is cancelled from OUTSIDE the run
+    /// (the shape any such holder uses); the run must finish with `Ok(())` rather than accept forever. Uses
+    /// the mem transport so no real socket is bound.
     #[tokio::test]
     async fn run_returns_gracefully_when_its_cancel_token_fires() {
         let node = Node::new(MemTransport::bind(), NoDiscovery);
@@ -2000,24 +1999,24 @@ mod tests {
     #[test]
     fn an_exposer_refuses_a_handler_with_no_registration() {
         // A named service with no handler in the registry is a config error caught at construction, not a
-        // dial-time mystery reset. (Here `sshd:` is exposed but nothing registered it.)
-        let shell = services(&["ssh=sshd:"]);
+        // dial-time mystery reset. (Here a `handler:` scheme is exposed but nothing registered it.)
+        let unregistered = services(&["a=handler:"]);
         assert!(
-            super::Exposer::new(shell, super::Registry::new(), Gate::Open).is_err(),
+            super::Exposer::new(unregistered, super::Registry::new(), Gate::Open).is_err(),
             "exposing a handler scheme with no registered handler must be refused at construction"
         );
     }
 
     #[test]
     fn extend_is_add_only_and_refuses_a_collision() {
-        // Adding a NEW scheme (an embedder injecting its own `ping:` beside `fetch:`) is allowed.
-        let base = super::Registry::new().with("fetch", OpenNoop);
-        let added = base.extend(super::Registry::new().with("ping", OpenNoop));
+        // Adding a NEW scheme (an embedder injecting its own scheme beside another) is allowed.
+        let base = super::Registry::new().with("a", OpenNoop);
+        let added = base.extend(super::Registry::new().with("b", OpenNoop));
         assert!(added.is_ok(), "injecting a new scheme must be allowed");
         // Re-injecting a scheme already registered is refused at merge intent, so a second `extend` can
         // never shadow (and silently downgrade the gate of) a handler the caller already registered.
-        let base = super::Registry::new().with("sshd", GatedNoop);
-        let shadowed = base.extend(super::Registry::new().with("sshd", OpenNoop));
+        let base = super::Registry::new().with("c", GatedNoop);
+        let shadowed = base.extend(super::Registry::new().with("c", OpenNoop));
         assert!(
             shadowed.is_err(),
             "re-injecting an already-registered scheme must be refused so it cannot shadow a handler"

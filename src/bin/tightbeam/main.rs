@@ -1,10 +1,10 @@
 //! The `tightbeam` binary: a thin bridge over the tunnel library, not the product.
 //!
-//! The library is [`tightbeam::tunnel`]; the tool built on it is
-//! [swoosh](https://github.com/theia-hq/swoosh), which owns the real CLI. This binary drives the same
-//! core over an EMPTY registry, so it serves only raw forwards (`host:port` / `unix:<path>` /
-//! `file:` / `fifo:` / `stdin:`), never a named handler. Its one real use is as an ssh `ProxyCommand`
-//! (reach an sshd over a stream, `connect --to -`) before swoosh is on a machine.
+//! The library is [`tightbeam::tunnel`]; a full-featured CLI over this library owns the real product
+//! surface. This binary drives the same core over an EMPTY registry, so it serves only raw forwards
+//! (`host:port` / `unix:<path>` / `file:` / `fifo:` / `stdin:`), never a named handler. Its one real use is
+//! as a ProxyCommand-shaped stdio bridge (reach a service over a stream, `connect --to -`) before a
+//! full-featured CLI is on a machine.
 //!
 //! `expose` publishes local services under this machine's key; `connect` reaches an exposed service from
 //! another machine and puts it on a local port, stdout (`-`), or a unix listener. `share` / `attenuate` /
@@ -12,9 +12,10 @@
 //! adapter that loads the identity and denylist, resolves the gate through the shared
 //! [`resolve_gate`](tightbeam::tunnel::resolve_gate) policy, prints its own banner, and drives the core.
 //!
-//! By default a service is gated to the machine's signet (the key it trusts, set by `swoosh adopt`),
-//! admitting the owner's own devices and their delegates; `--public` is the one deliberate opt-out (never
-//! a shell). The identity is always persisted, since it is both the address peers dial and the key a
+//! By default a service is gated to the machine's signet (the key it trusts, provisioned when the machine
+//! adopts an identity), admitting the owner's own devices and their delegates; `--public` is the one
+//! deliberate opt-out (never a handler with no auth of its own). The identity is always persisted, since it
+//! is both the address peers dial and the key a
 //! share-link roots at: `--key` or `TIGHTBEAM_KEY`.
 
 use core::net::SocketAddr;
@@ -108,7 +109,7 @@ async fn main() -> eyre::Result<()> {
             let secret = identity::load(cli.key.as_deref()).await?;
             let signet = load_signet().await?;
             // Load tightbeam's own denylist here in the adapter and pass it as a value; the core takes the
-            // loaded list, never a path (the same seam swoosh drives on its own store).
+            // loaded list, never a path (the same seam any richer consumer drives on its own store).
             let denylist = Denylist::load(revoked_path()?).await?;
             let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
             cmd.run(&node, signet, denylist).await

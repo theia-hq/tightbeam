@@ -2,7 +2,7 @@
 //! local unix-socket listener, by node id or by capability link.
 //!
 //! The `Args` struct, its `Target` parse type, and the driving body ([`ConnectCmd::run`]) live here, a thin
-//! adapter over the library [`Connector`] symmetric with swoosh's. The single `--to` selector ([`To`])
+//! adapter over the library [`Connector`] symmetric with any richer consumer's. The single `--to` selector ([`To`])
 //! replaces the old `--to`/`--stdio` pair, so "which local sink" is one unambiguous,
 //! unrepresentable-when-wrong choice.
 
@@ -107,7 +107,7 @@ impl FromStr for Target {
 impl ConnectCmd {
     /// tightbeam's `connect` adapter: resolve the target into a library [`Connector`], then drive the sink
     /// the single `--to` selector names -- bind a local port and forward each accepted connection, stream the
-    /// service to stdout (`--to -`, the ssh `ProxyCommand` shape), or a reserved unix listener. [`To`] is one
+    /// service to stdout (`--to -`, a ProxyCommand-shaped stdio bridge), or a reserved unix listener. [`To`] is one
     /// closed enum, so the sink is unambiguous with no arg group and no missing-means-stdio inference.
     pub async fn run<T: Transport, D: bifrost::Discovery>(
         self,

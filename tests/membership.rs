@@ -54,7 +54,8 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             let signet = Identity::from_secret(&SIGNET_SECRET).unwrap();
 
             // The owner's device: a consumer node whose PROVEN id the signet binds the badge to. The badge
-            // grants membership (whole-node), bound to this device: the `swoosh mint` shape.
+            // grants membership (whole-node), bound to this device: the shape a signet holder mints for a
+            // device.
             let device = Node::new(MemTransport::bind(), NoDiscovery);
             let device_badge = signet
                 .mint_member(
@@ -66,7 +67,8 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
                 .unwrap();
 
             // The bound device presents its badge and reaches `web`, though the badge names no service:
-            // membership is whole-node admission. This is `swoosh ssh ci` working by MEMBERSHIP.
+            // membership is whole-node admission. This is a member device reaching a gated service by
+            // MEMBERSHIP alone.
             let echoed = connect_and_echo(device, exposer_id, "web", Some(&device_badge)).await;
             assert_eq!(
                 echoed.as_deref(),

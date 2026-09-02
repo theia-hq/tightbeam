@@ -3,7 +3,7 @@ use crate::protocol::{Request, Response};
 #[tokio::test]
 async fn request_roundtrips_without_a_capability() {
     let request = Request {
-        service: "ssh".to_owned(),
+        service: "svc".to_owned(),
         capability: None,
     };
     let mut buf = Vec::new();
@@ -14,7 +14,7 @@ async fn request_roundtrips_without_a_capability() {
 #[tokio::test]
 async fn request_roundtrips_with_a_capability() {
     let request = Request {
-        service: "ssh".to_owned(),
+        service: "svc".to_owned(),
         capability: Some("sheer:bf01abc.def".to_owned()),
     };
     let mut buf = Vec::new();
