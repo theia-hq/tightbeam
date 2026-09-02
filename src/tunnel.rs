@@ -527,14 +527,14 @@ pub fn resolve_gate(signet: Option<NodeId>, denylist: Denylist) -> eyre::Result<
     let root = signet.ok_or_else(|| {
         eyre::eyre!(
             "this node has no signet to gate on: provision it (adopt a signet), or open individual services \
-             with --public to serve anyone"
+             to anyone"
         )
     })?;
     Ok(Gate::family(root.verify_key(), denylist))
 }
 
-/// The raw, UNVALIDATED set of service names an operator asked to open to strangers (the value of swoosh's
-/// `--public`, or any embedder's equivalent), before [`Exposer::with_public`] proves each one exposed and
+/// The raw, UNVALIDATED set of service names an operator asked to open to strangers (however an embedder
+/// surfaces that request), before [`Exposer::with_public`] proves each one exposed and
 /// open-safe. Kept DISTINCT from [`PublicServices`] (the proven set the gate consults) so an unvalidated set
 /// can never reach admission: the only way to a [`PublicServices`] is through the proof, so "opened a name
 /// the node does not serve / a keyless shell" is a build-time bail, not a silently-open service.
@@ -548,7 +548,7 @@ impl PublicRequest {
         Self(Vec::new())
     }
 
-    /// Build a request from the operator's raw `--public` names, verbatim (no validation here: this is the
+    /// Build a request from the operator's raw public-request names, verbatim (no validation here: this is the
     /// UNPROVEN side of parse-don't-validate; [`Exposer::with_public`] is the wall).
     pub fn new(names: impl IntoIterator<Item = String>) -> Self {
         Self(names.into_iter().collect())
@@ -653,7 +653,7 @@ impl Exposer {
     /// serve bails, never silently opening nothing), and (2) resolve THROUGH its [`Target`] to an
     /// [`open_safe`](Target::open_safe) posture (a `Never` handler, an aliased shell, or a raw stream bails
     /// with a teaching message). Resolving through the target, matched by served name, is what stops an alias
-    /// (`foo=sshd:` named in `--public`) or a raw stream from being opened by naming it: the target's posture
+    /// (`foo=sshd:` named in the public set) or a raw stream from being opened by naming it: the target's posture
     /// decides, never the name. A survivor set freezes into the overlay [`admit`] consults.
     ///
     /// This REPLACES a node-wide open value with a per-service one: a caller opens `speed` and `fetch` by
@@ -2583,7 +2583,7 @@ mod tests {
     #[test]
     fn a_synthetic_underscore_scheme_is_unspellable_but_constructible_directly() {
         // Spelled as an operator entry, `fetch_0:` is not a handler scheme (the grammar rejects `_`), so it
-        // falls through to the forward grammar and is refused. The pivot `x=fetch_0: --public x` cannot open.
+        // falls through to the forward grammar and is refused. The pivot `x=fetch_0:` named public cannot open.
         assert!(
             Services::parse(&["x=fetch_0:".to_owned()]).is_err(),
             "`fetch_0:` must not be a spellable handler scheme"
@@ -2620,7 +2620,7 @@ mod tests {
             assert_eq!(
                 entry.posture,
                 expected,
-                "`{}` should read {:?} under `--public speed`",
+                "`{}` should read {:?} with speed in the public set",
                 entry.name,
                 expected.label()
             );
