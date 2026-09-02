@@ -3769,7 +3769,6 @@ dependencies = [
  "bifrost-iroh",
  "bifrost-mdns",
  "bifrost-mem",
- "blake3",
  "clap",
  "eyre",
  "futures",

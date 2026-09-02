@@ -12,7 +12,6 @@ bifrost-iroh = { git = "https://github.com/theia-hq/bifrost" }
 bifrost-mdns = { git = "https://github.com/theia-hq/bifrost" }
 nauthy = { git = "https://github.com/theia-hq/nauthy" }
 
-blake3 = "1"
 clap = { version = "4", features = ["derive", "env"] }
 eyre = "0.6"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }

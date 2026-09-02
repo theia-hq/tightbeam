@@ -75,23 +75,6 @@ impl Secret {
         self.0.zeroize();
         bytes
     }
-
-    /// A stable seed for this node's SSH host key, derived from the identity secret by a domain-separated
-    /// KDF (BLAKE3 `derive_key`), so the ssh host key is DISTINCT from the node key (no cross-protocol
-    /// reuse) yet STABLE across runs, letting a client's `known_hosts` pin this node. The raw secret never
-    /// leaves the wrapper; only this derived seed does.
-    pub fn ssh_host_seed(&self) -> [u8; 32] {
-        ssh_host_seed(&self.0)
-    }
-}
-
-/// The ssh host-key seed for a raw node secret, the KDF shared by every exposer.
-///
-/// The one place the `sshd:` host-key derivation lives, so any node exposing over its own persisted
-/// secret computes the SAME host key tightbeam would for the same key. Domain-separated (BLAKE3
-/// `derive_key`), so the ssh host key is distinct from the node key yet stable across runs.
-pub fn ssh_host_seed(secret: &[u8; 32]) -> [u8; 32] {
-    blake3::derive_key("theia sshh host key v1", secret)
 }
 
 /// Write a provided secret as this node's persisted identity: how a machine ADOPTS a minted device seed
