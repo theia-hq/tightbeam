@@ -8,7 +8,9 @@ Two facts hold for every example:
 
 - `connect` binds a plain `127.0.0.1:<port>` on your machine. You point any local client at that port.
 - A service is reachable only by a peer that holds the host's key and passes its gate (its signet by
-  default, or a `sheer:` link). `--public` opens it to anyone; that is the only opt-out.
+  default, or a `sheer:` link). `--public` opens a FORWARD (`host:port`/`unix:`) to anyone, the one gate
+  opt-out; a raw-stream source (`file:`/`fifo:`/`stdin:`) can not be made public, it has no auth of its own,
+  so it stays gated. So the file and live-feed examples below reach only a peer that holds your key.
 
 `<peer>` is the host's node id, printed in the `expose` readiness banner, or a `sheer:` link from
 `tightbeam share`.
