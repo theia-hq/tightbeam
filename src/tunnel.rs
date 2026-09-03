@@ -115,6 +115,33 @@ impl Target {
             Target::RawStream(_) => false,
         }
     }
+
+    /// Which [`TargetKind`] this target is, so a caller's banner RENDERS what tightbeam resolved (a raw
+    /// stream splits into the loudest posture group) instead of re-parsing an address string of its own.
+    fn kind(&self) -> TargetKind {
+        match self {
+            Target::Handler(_) => TargetKind::Handler,
+            Target::Forward(_) => TargetKind::Forward,
+            Target::RawStream(_) => TargetKind::RawStream,
+        }
+    }
+}
+
+/// What KIND of thing a served service forwards to, as a caller's readiness banner needs to reason about it
+/// WITHOUT re-parsing an address string in the consumer: a caller-injected handler, a raw socket forward, or
+/// a raw-stream source. Declared by the resolved [`Target`], so a consumer RENDERS what tightbeam resolved
+/// (splitting a public raw stream into its own louder posture group) rather than string-matching a `file:`
+/// prefix of its own. An enum, not a bool, so a future target kind forces a decision at every match site
+/// rather than silently reading as one of these three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    /// A caller-injected handler (a bare `<scheme>:`): a diagnostic responder, a shell, a fetch, ...
+    Handler,
+    /// A raw socket forward (`host:port` / `unix:<path>`) the operator deliberately stood up.
+    Forward,
+    /// A raw-stream source (`file:`/`fifo:`/`stdin:`): bytes with no auth of their own, so an OPEN one is the
+    /// loudest reach posture a banner can show (a stranger reading a chosen path or the piped stdin).
+    RawStream,
 }
 
 /// The local services an exposer publishes: a map of service name to its [`Target`], validated once at
@@ -282,6 +309,27 @@ pub struct ServiceEntry {
     pub posture: Posture,
 }
 
+/// One served service as a caller's READINESS BANNER needs it: its name, the [`Posture`] a dialer faces, the
+/// [`TargetKind`] it forwards to, and whether it is an unmetered [`amplifier`](Handler::AMPLIFIER) when open.
+///
+/// A LOCAL render view an embedder draws its OWN banner from, DISTINCT from the on-wire [`ServiceEntry`] the
+/// member-only `control.services` read returns: the banner is printed by a node to its own operator, so it
+/// carries the extra render tells (kind, amplifier) that never cross the wire, and it stays off the
+/// anti-oracle surface (delib-18) the wire catalog guards. Built by [`Exposer::manifest`] from the resolved
+/// services + injected registry, so a consumer RENDERS declared facts (posture from the proven overlay, kind
+/// from the target, the amplifier caveat from the handler) rather than re-deriving them from address strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestEntry {
+    /// The service name the exposer published it under (the name a connector requests).
+    pub name: String,
+    /// The posture a dialer faces reaching it (gated behind a member badge, or open to anyone).
+    pub posture: Posture,
+    /// What kind of target it forwards to, so the banner can split a public raw stream into its own group.
+    pub kind: TargetKind,
+    /// Whether its handler declared itself an unmetered amplifier (a caveat the banner narrates when open).
+    pub amplifier: bool,
+}
+
 /// The services a node SERVES, each with its reach posture: the answer the gated `control.services` read
 /// returns. A pure snapshot read from what the exposer was built with (its [`Services`] + gate), no mutable
 /// state. Entries are sorted by name, so the wire is canonical and a rendered table reads in a stable order.
@@ -420,6 +468,16 @@ pub trait Handler: Send + Sync + 'static {
     /// a [`Never`](crate::open_policy::Never) handler.
     type Public: PublicUse;
 
+    /// Whether serving this handler answers any caller with NO responder-side rate limit, so an OPEN (public)
+    /// one lets an anonymous stranger drain the node's uplink: an unmetered AMPLIFIER. A property the handler
+    /// DECLARES so a caller's banner RENDERS the caveat where the danger is (delib-40/41), instead of the
+    /// consumer hardcoding a scheme list of its own. This is a caveat a UI narrates, NOT a security gate (the
+    /// gate is [`type Public`](Handler::Public)), so it is a plain `const bool` with a safe `false` default: a
+    /// handler that IS an amplifier (a reach-diagnostic responder) overrides it to `true`, and every other
+    /// handler inherits `false` with no annotation. Erased to [`ErasedHandler::amplifier`] and read when the
+    /// exposer builds its readiness [`manifest`](Exposer::manifest).
+    const AMPLIFIER: bool = false;
+
     /// Serve ONE admitted stream: the gate's single-use [`Admitted`] witness by value, and the stream halves.
     fn serve(
         &self,
@@ -439,6 +497,8 @@ pub trait Handler: Send + Sync + 'static {
 trait ErasedHandler: Send + Sync {
     /// The erased open-safety ceiling: `<H::Public as PublicUse>::OPEN_SAFE`, read once at [`Exposer::new`].
     fn open_safe(&self) -> bool;
+    /// The erased amplifier caveat: `H::AMPLIFIER`, read when the exposer builds its readiness manifest.
+    fn amplifier(&self) -> bool;
     /// The boxed serve future, tied to `&'a self` (`'a`, not `'static`: it borrows the handler's fields).
     fn serve_erased<'a>(
         &'a self,
@@ -451,6 +511,10 @@ trait ErasedHandler: Send + Sync {
 impl<H: Handler> ErasedHandler for H {
     fn open_safe(&self) -> bool {
         <H::Public as PublicUse>::OPEN_SAFE
+    }
+
+    fn amplifier(&self) -> bool {
+        H::AMPLIFIER
     }
 
     fn serve_erased<'a>(
@@ -686,6 +750,49 @@ impl Exposer {
         Ok(self)
     }
 
+    /// The served services as a caller's readiness banner needs them: each name with the [`Posture`] a dialer
+    /// faces, its [`TargetKind`], and its handler-declared [`amplifier`](Handler::AMPLIFIER) caveat,
+    /// name-sorted. A pure read over the exposer's OWN resolved state (the proven public overlay decides
+    /// posture, the target decides kind, the injected handler declares the amplifier), so an embedder draws
+    /// its banner from declared facts rather than by re-parsing an address string. DISTINCT from
+    /// [`Services::catalog`]: that is the on-wire snapshot the member-only `control.services` read serves;
+    /// this is the local banner view (kind + amplifier never cross the wire).
+    pub fn manifest(&self) -> Vec<ManifestEntry> {
+        let node_open = matches!(self.gate, Gate::Open);
+        let Services(services) = &self.services;
+        let mut entries: Vec<ManifestEntry> = services
+            .iter()
+            .map(|(name, target)| {
+                // The PROVEN overlay is the posture source (what a dialer actually faces), the same rule the
+                // wire catalog reads off the raw request: a name is open iff the node gate is open OR it was
+                // proven into the public overlay, else it is gated behind a member badge.
+                let posture = if node_open || self.public.contains(name) {
+                    Posture::Open
+                } else {
+                    Posture::Gated
+                };
+                // The amplifier caveat is handler-declared, so it is resolved THROUGH the target's handler,
+                // never a name match: only a registered handler can be an amplifier; a forward or a raw
+                // stream never is (they carry no responder the handler owns).
+                let amplifier = match target {
+                    Target::Handler(scheme) => self
+                        .registry
+                        .get(scheme)
+                        .is_some_and(|handler| handler.amplifier()),
+                    Target::Forward(_) | Target::RawStream(_) => false,
+                };
+                ManifestEntry {
+                    name: name.clone(),
+                    posture,
+                    kind: target.kind(),
+                    amplifier,
+                }
+            })
+            .collect();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        entries
+    }
+
     /// Accept overlay sessions from permitted peers and forward each inbound stream to its service. Runs
     /// until `cancel` fires, then stops accepting and returns gracefully; prints nothing (the caller printed
     /// its own readiness banner before calling).
@@ -854,7 +961,14 @@ where
     // BEFORE the gate so a delegated slip for that service still matches (the gate checks the RESOLVED service).
     let service = resolve_single_service(service, services);
 
-    let admitted = match admit(gate, public, peer, request.capability.as_deref(), &service) {
+    let admitted = match admit(
+        gate,
+        public,
+        peer,
+        request.capability.as_deref(),
+        request.membership.as_deref(),
+        &service,
+    ) {
         Ok(admitted) => admitted,
         Err(refusal) => {
             // The real reason (missing / not-granted / revoked / malformed) is a LOCAL log line for the
@@ -969,6 +1083,7 @@ fn admit(
     public: &PublicServices,
     peer: NodeId,
     capability: Option<&str>,
+    membership: Option<&str>,
     service: &Service,
 ) -> Result<Admitted, String> {
     // The ONLY branch admission takes on the service NAME is this public-set membership test, and it runs
@@ -978,7 +1093,8 @@ fn admit(
     // WHICH nauthy primitive per service; it never mints authority itself). A public member is by
     // construction an exposed served name, so the later dispatch always resolves it.
     if public.contains(service.as_str()) {
-        return mint(Gate::Open.admit_witnessed(peer.verify_key(), None, service));
+        // An open service needs no badge, so the signet-bound membership slot is irrelevant on this path.
+        return mint(Gate::Open.admit_witnessed(peer.verify_key(), None, None, service));
     }
     // A MISS is EITHER a gated-present name OR a name the node does not serve at all: both take this
     // identical family path (the same cap parse, the same two ed25519 verifies, the same refusal), so a
@@ -992,7 +1108,24 @@ fn admit(
         Ok(cap) => cap,
         Err(_) => return Err("malformed capability".to_owned()),
     };
-    mint(base.admit_witnessed(peer.verify_key(), cap.as_ref(), service))
+    // Parse the SECOND slot ONLY when the first is a signet-bound slip: that is the sole path that ANDs a
+    // fleet badge, so a plain/bearer/device slip (or none) never triggers the extra `Cap::parse`. The server
+    // guards this independently of the dialer (a hostile client ignores the dialer's attach logic), which
+    // bounds the second slot's parse work behind the cheap, root-free `is_signet_bound` check. A malformed
+    // badge on the signet path is a refusal, not a hard error; both slots inherit `Cap::parse`'s bounds.
+    let membership = match cap.as_ref() {
+        Some(slip) if slip.is_signet_bound() => match membership.map(Cap::parse).transpose() {
+            Ok(membership) => membership,
+            Err(_) => return Err("malformed capability".to_owned()),
+        },
+        _ => None,
+    };
+    mint(base.admit_witnessed(
+        peer.verify_key(),
+        cap.as_ref(),
+        membership.as_ref(),
+        service,
+    ))
 }
 
 /// Map a nauthy admission result to the [`admit`] contract: the witness on success, or a DISTINGUISHING
@@ -1171,6 +1304,7 @@ pub struct Connector {
     dial: NodeId,
     service: String,
     capability: Option<String>,
+    membership: Option<String>,
 }
 
 impl Connector {
@@ -1181,6 +1315,7 @@ impl Connector {
             dial,
             service,
             capability: present,
+            membership: None,
         }
     }
 
@@ -1191,7 +1326,18 @@ impl Connector {
             dial: Cap::parse(link)?.root().node_id(),
             service,
             capability: Some(link.to_owned()),
+            membership: None,
         })
+    }
+
+    /// Also present `badge` in the SECOND slot: a membership badge under the foreign fleet a signet-bound
+    /// slip in `capability` (slot 1) names. The host ANDs the two (the slip valid at its own root, the badge
+    /// valid under the fleet the slip names) before admitting. A no-op for every plain dial, whose slot 1
+    /// admits alone and whose host never consults slot 2.
+    #[must_use]
+    pub fn with_membership(mut self, badge: String) -> Self {
+        self.membership = Some(badge);
+        self
     }
 
     /// The node this connector dials.
@@ -1209,6 +1355,7 @@ impl Connector {
         Request {
             service: String::clone(&self.service),
             capability: self.capability.clone(),
+            membership: self.membership.clone(),
         }
     }
 
@@ -1431,6 +1578,42 @@ pub fn mint_link(
     Ok(cap.link()?)
 }
 
+/// Mint a device-bound `sheer:` capability link granting `service` to the proven device `bound_to`, valid
+/// for `lifetime`.
+///
+/// The standing per-service grant for one device (see [`nauthy::Identity::mint_bound`]): the link is inert
+/// unless presented by `bound_to`, so a copy observed in flight or at rest grants no one. Always sealed:
+/// a bound slip is non-delegable by construction (it cannot be narrowed and handed onward, which is the
+/// point of binding it), so unlike [`mint_link`] there is no `delegable` option. Offline: needs the signing
+/// `identity` but no network.
+pub fn mint_bound_link(
+    identity: &Identity,
+    service: &Service,
+    bound_to: nauthy::VerifyKey,
+    lifetime: Duration,
+) -> eyre::Result<String> {
+    let cap = identity.mint_bound(service, bound_to, nauthy::expires_in(lifetime))?;
+    Ok(cap.seal()?.link()?)
+}
+
+/// Mint a signet-bound `sheer:` link granting `service` to any device of the fleet `foreign_root`, valid
+/// for `lifetime`.
+///
+/// The work-sim primitive: issue ONCE to a person's signet `foreign_root`, and every device that signet
+/// vouches for may use it (see [`nauthy::Identity::mint_signet_slip`]). Inert alone: the far gate admits it
+/// only when the presenter ALSO proves membership under `foreign_root`. Always sealed: a fleet-bound slip is
+/// theft-resistant and non-delegable by construction (like [`mint_bound_link`]). Offline: needs the signing
+/// `identity` but no network.
+pub fn mint_signet_link(
+    identity: &Identity,
+    service: &Service,
+    foreign_root: nauthy::VerifyKey,
+    lifetime: Duration,
+) -> eyre::Result<String> {
+    let cap = identity.mint_signet_slip(service, foreign_root, nauthy::expires_in(lifetime))?;
+    Ok(cap.seal()?.link()?)
+}
+
 /// Narrow a `sheer:` link offline: tighten its service and/or shorten its expiry, returning the tighter
 /// link. Only ever adds constraints, so the result is never broader than the input. At least one of
 /// `service` or `shorten` must be given.
@@ -1579,6 +1762,57 @@ mod tests {
         ) -> eyre::Result<()> {
             Ok(())
         }
+    }
+
+    /// A legitimately-public responder that also DECLARES itself an unmetered amplifier (`const AMPLIFIER =
+    /// true`): the shape of `ping`/`speed`, so a manifest reads the caveat off the handler, not a name list.
+    struct AmplifierNoop;
+    impl Handler for AmplifierNoop {
+        type Public = OptIn;
+        const AMPLIFIER: bool = true;
+        async fn serve(
+            &self,
+            _admitted: nauthy::Admitted,
+            _writer: BoxWrite,
+            _reader: BoxRead,
+        ) -> eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The readiness manifest reads posture off the PROVEN overlay, kind off the target, and the amplifier
+    /// caveat off the handler's declaration, name-sorted: an opened amplifier reads `Open + amplifier`, a
+    /// gated one `Gated + amplifier` (the caveat is the handler's, independent of posture), and a plain
+    /// forward is neither open nor an amplifier. This is what feeds a caller's grouped serve banner.
+    #[test]
+    fn the_manifest_declares_posture_kind_and_amplifier() {
+        let services = services(&["fast=amp:", "quiet=amp:", "web=127.0.0.1:80"]);
+        let registry = Registry::new().with("amp", AmplifierNoop);
+        let exposer = Exposer::new(services, registry, family_gate("manifest"))
+            .expect("assembles")
+            .with_public(PublicRequest::new(["fast".to_owned()]))
+            .expect("`fast` is an OptIn amplifier, so it opens");
+
+        let manifest = exposer.manifest();
+        let names: Vec<&str> = manifest.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["fast", "quiet", "web"], "manifest is name-sorted");
+
+        let fast = &manifest[0];
+        assert_eq!(fast.posture, Posture::Open, "`fast` was opened per-service");
+        assert_eq!(fast.kind, super::TargetKind::Handler);
+        assert!(fast.amplifier, "the opened amplifier declares its caveat");
+
+        let quiet = &manifest[1];
+        assert_eq!(quiet.posture, Posture::Gated, "`quiet` stays gated");
+        assert!(
+            quiet.amplifier,
+            "the caveat is the handler's, shown independent of posture"
+        );
+
+        let web = &manifest[2];
+        assert_eq!(web.kind, super::TargetKind::Forward);
+        assert!(!web.amplifier, "a plain forward is not an amplifier");
+        assert_eq!(web.posture, Posture::Gated);
     }
 
     fn svc(name: &str) -> Service {
@@ -2018,6 +2252,7 @@ mod tests {
             crate::protocol::Request {
                 service: service.clone(),
                 capability: None,
+                membership: None,
             }
             .write(&mut client_write)
             .await
@@ -2185,10 +2420,25 @@ mod tests {
         where
             S: bifrost::Session<Write = W, Read = R>,
         {
+            Self::open_with_slots(session, service, capability, None).await
+        }
+
+        /// Like [`open_with`](Self::open_with) but also presents a second `membership` slot: a badge under
+        /// the foreign fleet a signet-bound slip names, so a test can drive the two-token AND at the gate.
+        async fn open_with_slots<S>(
+            session: &S,
+            service: &str,
+            capability: Option<String>,
+            membership: Option<String>,
+        ) -> Result<Self, String>
+        where
+            S: bifrost::Session<Write = W, Read = R>,
+        {
             let (mut writer, mut reader) = session.open_bi().await.map_err(|e| e.to_string())?;
             crate::protocol::Request {
                 service: service.to_owned(),
                 capability,
+                membership,
             }
             .write(&mut writer)
             .await
@@ -2421,7 +2671,7 @@ mod tests {
 
         // HIT: the opened `speed` admits a tokenless stranger, and the witness is a Slip (an opened service
         // proves nothing about the peer), never a whole-node member.
-        let admitted = super::admit(&gate, &public, stranger, None, &svc("speed"))
+        let admitted = super::admit(&gate, &public, stranger, None, None, &svc("speed"))
             .expect("an opened service admits a stranger");
         assert!(
             !admitted.is_member(),
@@ -2431,12 +2681,47 @@ mod tests {
         // MISS (gated-present): `control.stop` is served but NOT public, so a stranger takes the family path
         // and is refused. MISS (absent): a name the node does not serve takes the SAME path and is refused.
         assert!(
-            super::admit(&gate, &public, stranger, None, &svc("control.stop")).is_err(),
+            super::admit(&gate, &public, stranger, None, None, &svc("control.stop")).is_err(),
             "a served-but-gated service is refused for a stranger (family path)"
         );
         assert!(
-            super::admit(&gate, &public, stranger, None, &svc("nope")).is_err(),
+            super::admit(&gate, &public, stranger, None, None, &svc("nope")).is_err(),
             "an absent service is refused for a stranger, on the same family path"
+        );
+    }
+
+    /// Server-side slot-2 guard (Adversary): the second slot is parsed ONLY when slot 1 is a signet-bound
+    /// slip. A plain member badge admits on slot 1 alone, so a hostile client's garbage in slot 2 is never
+    /// parsed and cannot turn a valid member dial into a refusal. The server guards this itself, never
+    /// trusting the dialer's attach logic.
+    #[test]
+    fn a_member_dial_ignores_a_second_slot_when_slot_one_is_not_signet_bound() {
+        use crate::identity::AsVerifyKey as _;
+
+        let signet = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
+        let gate = family_gate("guard");
+        let public = super::PublicServices::default();
+        let peer = bifrost::NodeId::from_ed25519_secret(&[5u8; 32]);
+        let badge = signet
+            .mint_member(
+                peer.verify_key(),
+                nauthy::expires_in(core::time::Duration::from_secs(3600)),
+            )
+            .expect("mint member badge")
+            .link()
+            .expect("link");
+        let admitted = super::admit(
+            &gate,
+            &public,
+            peer,
+            Some(badge.as_str()),
+            Some("not a sheer link"),
+            &svc("web"),
+        )
+        .expect("a member badge admits on slot 1 alone; garbage in slot 2 is ignored");
+        assert!(
+            admitted.is_member(),
+            "a whole-node member badge admits as Member regardless of slot 2"
         );
     }
 

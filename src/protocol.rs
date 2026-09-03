@@ -4,19 +4,24 @@
 
 use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
 
-/// Magic + version prefixing a request; a foreign or mismatched-version stream is rejected. `TB02` adds
-/// an optional capability field after the service; a `TB01` peer that omitted it is no longer wire
-/// compatible, which is correct: the two ends of one tunnel are one release.
-const MAGIC: [u8; 4] = *b"TB02";
+/// Magic + version prefixing a request; a foreign or mismatched-version stream is rejected. `TB03` adds an
+/// optional `membership` field after `capability`, for a signet-bound slip that ANDs a foreign-fleet badge;
+/// a `TB02` peer that omitted it is no longer wire compatible, which is correct: the two ends of one tunnel
+/// are one release.
+const MAGIC: [u8; 4] = *b"TB03";
 
-/// A connector's opening frame: reach the named service, optionally presenting a capability.
+/// A connector's opening frame: reach the named service, optionally presenting a capability and, for a
+/// signet-bound slip, a membership badge under the foreign fleet the slip names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     /// The service to reach, as named in `expose`.
     pub service: String,
-    /// A presented capability link (`sheer:…`), when the host gates on capabilities. Absent when the
-    /// host gates on identity (open/strict/paired), where the proven `NodeId` is the whole story.
+    /// Slot 1: a presented capability link (`sheer:…`), when the host gates on capabilities. Absent when
+    /// the host gates on identity (open/strict/paired), where the proven `NodeId` is the whole story.
     pub capability: Option<String>,
+    /// Slot 2: a membership badge under the FOREIGN fleet a signet-bound slip in `capability` names. The
+    /// host ANDs it against the slip (the two-token signet-bound admission); absent on every other path.
+    pub membership: Option<String>,
 }
 
 /// The host's reply, sent before any bytes are piped.
@@ -33,7 +38,8 @@ impl Request {
     pub async fn write<W: io::AsyncWrite + Unpin>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(&MAGIC).await?;
         write_str(writer, &self.service).await?;
-        write_opt(writer, self.capability.as_deref()).await
+        write_opt(writer, self.capability.as_deref()).await?;
+        write_opt(writer, self.membership.as_deref()).await
     }
 
     /// Read a request from the stream.
@@ -46,6 +52,7 @@ impl Request {
         Ok(Request {
             service: read_str(reader).await?,
             capability: read_opt(reader).await?,
+            membership: read_opt(reader).await?,
         })
     }
 }
