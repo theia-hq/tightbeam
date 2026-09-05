@@ -335,8 +335,11 @@ async fn open_path(path: PathBuf, kind: Kind) -> eyre::Result<BoxRead> {
     // `spawn_blocking`, so nothing can leak past the timeout (that leak was the bug in issue #25).
     let opened = open_guarded(&path, kind)?;
     match opened {
-        // A regular file needs no writer: read it straight away.
-        Opened::Regular(fd) => Ok(Box::new(NonblockingReader::new(fd)?)),
+        // A regular file needs no writer AND has no readiness to wait on: read it straight away, INLINE, with
+        // no reactor registration. It must NOT go through `NonblockingReader`/`AsyncFd`: Linux `epoll` refuses a
+        // regular fd with `EPERM` at registration (a regular file is always ready), which broke every regular
+        // `file:` open on Linux while passing on macOS's kqueue.
+        Opened::Regular(fd) => Ok(Box::new(RegularFileReader(fd))),
         // A FIFO reads as instant EOF with no writer, so wait for one (readable readiness) up to the timeout
         // before calling the stream open. On elapse, drop the fd (cheap, no parked thread) and refuse.
         Opened::Fifo(fd) => {
@@ -459,13 +462,13 @@ fn open_guarded(path: &Path, kind: Kind) -> eyre::Result<Opened> {
         let err = std::io::Error::last_os_error();
         return Err(eyre::Error::from(err).wrap_err(format!("cannot stat {}", path.display())));
     }
-    // Mask in `mode_t` space (`st_mode` and the `S_IF*` constants share that type, `u16` on macOS / `u32` on
-    // linux), then widen the masked result ONCE to `u32` for the platform-independent `describe_type` and the
-    // comparisons below. Masking first keeps this free of a per-platform `u32::from` that would be an identity
-    // conversion (clippy `useless_conversion`) where `mode_t` is already `u32`.
-    let file_type = u32::from(st.st_mode & libc::S_IFMT);
-    let is_reg = file_type == u32::from(libc::S_IFREG);
-    let is_fifo = file_type == u32::from(libc::S_IFIFO);
+    // Compare entirely in `mode_t` space (`st_mode` and the `S_IF*` constants share that type: `u16` on macOS,
+    // `u32` on linux), with NO widening cast. A `u32::from` here would be an IDENTITY conversion where `mode_t`
+    // is already `u32` (clippy `useless_conversion`, which fails the linux gate), while an `as u32` would be an
+    // `unnecessary_cast` there; staying in `mode_t` avoids BOTH and is correct on either width.
+    let file_type = st.st_mode & libc::S_IFMT;
+    let is_reg = file_type == libc::S_IFREG;
+    let is_fifo = file_type == libc::S_IFIFO;
     match kind {
         Kind::File if !(is_reg || is_fifo) => eyre::bail!(
             "{} is not a regular file or a FIFO ({}); a `file:` target refuses devices, directories, and \
@@ -488,11 +491,12 @@ fn open_guarded(path: &Path, kind: Kind) -> eyre::Result<Opened> {
     })
 }
 
-/// An [`AsyncRead`](tokio::io::AsyncRead) over a nonblocking fd (guard 2's `O_NONBLOCK` open), so the guarded
-/// FIFO/file open never needs a blocking thread. Registers the fd with the tokio reactor via [`AsyncFd`]:
+/// An [`AsyncRead`](tokio::io::AsyncRead) over a nonblocking FIFO fd (guard 2's `O_NONBLOCK` open), so the
+/// guarded FIFO open never needs a blocking thread. Registers the fd with the tokio reactor via [`AsyncFd`]:
 /// `EAGAIN` (would-block) yields readable readiness rather than a parked syscall, so a slow or writer-less FIFO
-/// costs a poll registration, never a leaked blocking-pool thread. A regular file is always readiness-ready, so
-/// this reads it inline with no wait.
+/// costs a poll registration, never a leaked blocking-pool thread. FIFO-ONLY: a regular file must NOT come here
+/// because Linux `epoll` (which [`AsyncFd`] uses) refuses a regular fd with `EPERM` at registration; see
+/// [`RegularFileReader`] for the regular-file path.
 struct NonblockingReader(AsyncFd<OwnedFd>);
 
 impl NonblockingReader {
@@ -551,6 +555,44 @@ impl tokio::io::AsyncRead for NonblockingReader {
     }
 }
 
+/// An [`AsyncRead`](tokio::io::AsyncRead) over a REGULAR-file fd that reads INLINE, with NO reactor
+/// registration. A regular file cannot go through [`NonblockingReader`]/[`AsyncFd`]: Linux `epoll` (mio's
+/// backend) refuses a regular fd with `EPERM` at `epoll_ctl` registration, because a regular file has no
+/// readiness to wait on: it is ALWAYS ready to read. (macOS `kqueue` accepts a regular fd, which is why that
+/// break only surfaced on the Linux CI.) A regular-file `read(2)` never returns `EAGAIN` on local media
+/// (`O_NONBLOCK`, guard 2, is a no-op on a regular file), so each poll reads straight through and returns
+/// `Ready`. This keeps the regular-file path INLINE with no `spawn_blocking`, matching the guarded open above
+/// (issue #25's no-leak stance). The one caveat is the SAME one the guarded open already documents: a read from
+/// a hung mount (wedged NFS) can block the calling task; pool isolation for that is out of scope (TODO(#25-followup)).
+struct RegularFileReader(OwnedFd);
+
+impl tokio::io::AsyncRead for RegularFileReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // SAFETY: a `read(2)` writes at most `len` bytes into the fd's readable region of `buf` and never reads
+        // the uninitialized tail, so the count it returns is exactly how many were initialized.
+        let unfilled = unsafe { buf.unfilled_mut() };
+        let rc = unsafe {
+            libc::read(
+                std::os::fd::AsRawFd::as_raw_fd(&self.0),
+                unfilled.as_mut_ptr().cast::<libc::c_void>(),
+                unfilled.len(),
+            )
+        };
+        if rc < 0 {
+            return Poll::Ready(Err(io::Error::last_os_error()));
+        }
+        let n = rc as usize;
+        // SAFETY: `read` initialized exactly `n` bytes of the unfilled region (checked `rc >= 0` above).
+        unsafe { buf.assume_init(n) };
+        buf.advance(n);
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// Whether fd 0 is a terminal. A `stdin:` expose with no pipe would consume the operator's keystrokes, so it
 /// is refused at parse (guard 7). Uses `libc::isatty`, portable across unix; the non-unix stand-in uses the
 /// platform's own check. Not a guard on the byte source (there is no path), just a misuse refusal.
@@ -561,21 +603,22 @@ fn is_stdin_a_tty() -> bool {
 
 /// A human name for an `S_IFMT`-masked `st_mode` file type, for the "not a regular file or a FIFO (...)"
 /// refusal so the operator sees WHAT they pointed at (a device, a directory) rather than only that it was
-/// rejected. `file_type` is already masked with `S_IFMT`; the libc constants are widened to `u32` to match.
-fn describe_type(file_type: u32) -> &'static str {
-    if file_type == u32::from(libc::S_IFBLK) {
+/// rejected. `file_type` is already masked with `S_IFMT` and kept in `mode_t` space (`u16` on macOS, `u32` on
+/// linux) so the comparisons below need no per-platform cast (see the note at the call site in `open_guarded`).
+fn describe_type(file_type: libc::mode_t) -> &'static str {
+    if file_type == libc::S_IFBLK {
         "a block device"
-    } else if file_type == u32::from(libc::S_IFCHR) {
+    } else if file_type == libc::S_IFCHR {
         "a character device"
-    } else if file_type == u32::from(libc::S_IFDIR) {
+    } else if file_type == libc::S_IFDIR {
         "a directory"
-    } else if file_type == u32::from(libc::S_IFLNK) {
+    } else if file_type == libc::S_IFLNK {
         "a symlink"
-    } else if file_type == u32::from(libc::S_IFSOCK) {
+    } else if file_type == libc::S_IFSOCK {
         "a socket"
-    } else if file_type == u32::from(libc::S_IFIFO) {
+    } else if file_type == libc::S_IFIFO {
         "a FIFO"
-    } else if file_type == u32::from(libc::S_IFREG) {
+    } else if file_type == libc::S_IFREG {
         "a regular file"
     } else {
         "an unknown type"
