@@ -4,16 +4,75 @@ A forward carries bytes. Anything that speaks over a TCP port or a Unix socket r
 the program on each end does not know the overlay is there. Below are worked examples. Each shows the
 host's one line, the other machine's one line, and what happens.
 
-Two rules hold for every example:
+## Get the binary
+
+Not published yet, so build it from a checkout:
+
+```sh
+git clone https://github.com/theia-hq/tightbeam
+cd tightbeam
+cargo build --release
+```
+
+The binary lands at `target/release/tightbeam`. Put it on your `PATH`, or run it by that path. The
+examples below write it as `tightbeam`.
+
+## Try it on one machine
+
+Before you have a second machine, you can run both ends on the one you are on and watch bytes cross.
+Open two terminals in the same directory.
+
+Terminal 1, the host. Make a file to serve, then expose it:
+
+```sh
+echo 'hello over the tunnel' > hello.txt
+tightbeam expose demo=file:./hello.txt --public --public-unsafe demo \
+  --key ./host.key --bind-addr 127.0.0.1:9000
+```
+
+The readiness banner prints the host's node id, a `bf01...` string. That id is `<peer>` in the next
+command. Leave this terminal running.
+
+Terminal 2, the client. Paste the host's id in place of `<peer>`:
+
+```sh
+tightbeam connect <peer> --service demo --to - \
+  --key ./client.key --offline --peer <peer>=127.0.0.1:9000
+```
+
+It prints `hello over the tunnel` and exits. The bytes crossed the tunnel from one process to the other.
+
+What each flag does:
+
+- `--key ./host.key` and `--key ./client.key` give each side its **own** identity file (tightbeam
+  creates it on first use). This is the one part a single machine forces on you: without separate keys
+  both processes are the same identity, and `connect` refuses with `Connecting to ourself is not
+  supported`. On two real machines each already has its own identity, so you drop `--key` entirely.
+- `--bind-addr 127.0.0.1:9000` on the host pins a fixed local address so the client can point straight
+  at it. It implies `--offline`.
+- `--offline` with `--peer <peer>=127.0.0.1:9000` on the client skips global discovery and dials the
+  host at that exact address. This is what makes the loopback (or a LAN, or Docker) work with no network
+  in the path.
+
+This local demo serves to **anyone** (`--public-unsafe`) on purpose: two separate identities on one
+machine are strangers to each other, so the client cannot pass the host's private gate. On offline
+loopback "anyone" is just you, so it is harmless here. Reaching a real machine uses a key instead, which
+is every section from here on.
+
+## Reaching a real machine
+
+To reach another machine over the internet, drop `--offline`, `--peer`, and `--bind-addr`: global
+discovery finds the peer by its key, across NAT, with no public IP. `<peer>` is the host's node id from
+the `expose` banner, or a `sheer:` link from `tightbeam share`.
+
+Two things hold for every example below:
 
 - `connect` gives you a local endpoint on your machine: a plain `127.0.0.1:<port>`, or this process's
   own stdout with `--to -`. You point any local client at it.
-- Who may reach a service is the host's choice, made when it runs `expose`. By default only the host's own
-  devices and anyone the host hands a key can reach it. The two sections below are the two ways in: **Give
-  someone a key** (the normal, safe way) and **Serve to anyone** (the deliberate, dangerous opt-out).
-
-`<peer>` is the host's node id, printed in the `expose` readiness banner, or a `sheer:` link from
-`tightbeam share`.
+- Who may reach a service is the host's choice, made when it runs `expose`. By default only the host's
+  own devices and anyone the host hands a key can reach it. The sections split into the two ways in:
+  **give someone a key** (the normal, safe way) and, at the end, **serve to anyone** (the deliberate,
+  dangerous opt-out).
 
 ## Give someone a key (the safe default)
 
@@ -54,40 +113,47 @@ tightbeam connect <peer> --service movie --to - | mpv -    # on your machine
 ```
 
 `file:<path>` streams the file's raw bytes toward the peer, so there is no port to bind, no `cat`, and
-no background process. It is a read-only source: it refuses block/char devices (`/dev/zero`,
-`/dev/urandom`), directories, and a symlink at the named path. It reaches only a peer that holds your key;
-to hand the file to anyone with no key, see the last section.
+no background process. It serves a regular file or a FIFO only: a device, a directory, or a socket at the
+named path is refused at startup, before anyone connects. It reaches only a peer that holds your key; to
+hand the file to anyone with no key, see the last section.
 
 ## A live feed to a player on the other side
 
 The host has a camera or a screen you want to watch live elsewhere. Pipe the producer straight into
-`expose` and read it on the far side:
+`expose` and read it into a player on the far side. Use low-latency flags on both ends, or the picture
+lags seconds behind reality: by default ffmpeg and the player each buffer several frames.
 
 ```sh
-# on the host: capture the camera and pipe it into expose
-# (device name varies by OS: /dev/video0 on Linux, "0" with -f avfoundation on macOS)
-ffmpeg -i /dev/video0 -f mpegts - | tightbeam expose cam=stdin:
+# on the host (macOS): capture the webcam as zero-latency h264 and pipe it into expose.
+# pick the camera index from: ffmpeg -f avfoundation -list_devices true -i ""
+ffmpeg -f avfoundation -framerate 30 -video_size 640x480 -i "0:none" \
+  -c:v libx264 -preset ultrafast -tune zerolatency -g 15 -bf 0 -pix_fmt yuv420p \
+  -f mpegts -flush_packets 1 pipe:1 \
+| tightbeam expose cam=stdin: --public --public-unsafe cam
 ```
 
 ```sh
-# on your machine: read the stream straight into a player
-tightbeam connect <peer> --service cam --to - | mpv -    # or: vlc -
+# on your machine: read the stream into a player with its buffering turned off
+tightbeam connect <peer> --service cam --to - \
+| ffplay -fflags nobuffer -flags low_delay -framedrop -probesize 32 -analyzeduration 0 -i pipe:
+
+# or mpv:
+tightbeam connect <peer> --service cam --to - \
+| mpv --profile=low-latency --no-cache --untimed -
 ```
 
-`stdin:` serves whatever a producer pipes into `expose`, so the whole live case is one pipe: no `mkfifo`,
-no background job, no temp path to clean up. It works the same on Linux, macOS, and Windows (it reads this
-process's own standard input). It is **single-consumer**: standard input is one stream, so the first peer
-to reach it takes it, and a second concurrent connection is refused cleanly rather than corrupting the
-feed with a racing second read.
+The encoder flags emit each frame the moment it is captured (`-tune zerolatency`, no B-frames, a small
+GOP, flush every packet); the player flags show frames as they arrive instead of building a queue. On
+Linux the producer reads `/dev/video0` instead of the avfoundation input and pipes it in the same way.
 
-The live feed reaches you addressed by the host's key and gated to your signet, with no port-forward and
-no camera vendor in the path.
+A live capture goes through a **pipe** into `stdin:`, not `file:` a device node: `file:` is for a file on
+disk, and a running camera is a producer you pipe in. `stdin:` serves whatever a producer pipes into
+`expose`, so the whole live case is one pipe: no `mkfifo`, no background job, no temp path. It is
+**single-consumer**: standard input is one stream, so the first peer to reach it takes it, and a second
+concurrent connection is refused cleanly rather than corrupting the feed with a racing second read.
 
-> `fifo:<path>` is the alternative when you want several producers or several serially-reconnecting readers
-> over one named pipe on disk; `stdin:` is the one-shot pipe. Streaming a *command's* own stdout with the
-> host doing the spawning (`expose cam=exec:'ffmpeg ...'`) would need an `exec:` scheme, but with `stdin:`
-> the caller already spawns the command and pipes it in, so `exec:` stays parked: spawning a process on the
-> host is a materially bigger blast radius, and the pipe covers the case.
+> `fifo:<path>` is the alternative when you want several serially-reconnecting readers over one named pipe
+> on disk; `stdin:` is the one-shot pipe.
 
 ## Watch a whole media server over your key
 
@@ -157,13 +223,12 @@ opened by accident. Plain `--public` refuses it and points you here:
 ```sh
 tightbeam expose movie=file:/srv/films/big.mkv --public
 # error: `movie` is a raw byte source (file:/fifo:/stdin:) with no auth of its own, so a public gate
-#        will not serve it. to serve its raw bytes to anyone, name it in `--public-unsafe`; otherwise
-#        gate it or drop it from the public set
+#        will not serve it. to serve its raw bytes to anyone, name it in the unsafe raw-stream set;
+#        otherwise gate it or drop it from the public set
 ```
 
-Opening it is a separate, deliberate step. `--public-unsafe` takes the exact service names you mean to
-open. On this binary `--public` opens the whole node to anyone, and `--public-unsafe` names which raw
-streams that open node may serve, so you pass both:
+Opening it is a separate, deliberate step. `--public` opens the whole node to anyone, and `--public-unsafe`
+names which raw streams that open node may serve, so you pass both:
 
 ```sh
 tightbeam expose movie=file:/srv/films/big.mkv --public --public-unsafe movie
