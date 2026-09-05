@@ -1,9 +1,9 @@
 # Builds checksummed linux + macOS binaries and attaches them to a GitHub Release on a `v*` tag.
-# tightbeam depends on its theia siblings (bifrost, nauthy, sshh, ...) by git URL, so cargo fetches
-# them during the build: no sibling checkouts needed. Built with `--features ssh` so the released
-# binary can `expose ssh=sshd:` out of the box.
-# NOTE: those git deps are unpinned (default-branch HEAD), so a tag is not yet fully reproducible; pin a
-# rev per release to fix (see the release-reproducibility entry in notes/02-DECISIONS.md).
+# tightbeam pins its theia siblings (bifrost, nauthy) by exact git rev (see tightbeam/Cargo.toml), so a
+# tag reproduces the pinned dep graph; cargo fetches them at build time, no sibling checkout needed.
+# NOT --locked (decision (A), notes/02-DECISIONS.md): reproducibility comes from the Cargo.toml rev pins,
+# not from enforcing the committed lock. The build is plain: tightbeam defines no `ssh` feature (ssh lives
+# in swoosh's crate), so nothing extra is enabled here.
 name: release
 on:
   push:
@@ -35,7 +35,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - name: build
-        run: cargo build --release -p tightbeam --features ssh --target ${{ matrix.target }}
+        run: cargo build --release -p tightbeam --target ${{ matrix.target }}
       - name: package + checksum
         run: |
           cp "target/${{ matrix.target }}/release/tightbeam" "${{ matrix.asset }}"
