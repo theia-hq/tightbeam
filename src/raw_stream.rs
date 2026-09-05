@@ -462,13 +462,13 @@ fn open_guarded(path: &Path, kind: Kind) -> eyre::Result<Opened> {
         let err = std::io::Error::last_os_error();
         return Err(eyre::Error::from(err).wrap_err(format!("cannot stat {}", path.display())));
     }
-    // Mask in `mode_t` space (`st_mode` and the `S_IF*` constants share that type, `u16` on macOS / `u32` on
-    // linux), then widen the masked result ONCE to `u32` for the platform-independent `describe_type` and the
-    // comparisons below. Masking first keeps this free of a per-platform `u32::from` that would be an identity
-    // conversion (clippy `useless_conversion`) where `mode_t` is already `u32`.
-    let file_type = u32::from(st.st_mode & libc::S_IFMT);
-    let is_reg = file_type == u32::from(libc::S_IFREG);
-    let is_fifo = file_type == u32::from(libc::S_IFIFO);
+    // Compare entirely in `mode_t` space (`st_mode` and the `S_IF*` constants share that type: `u16` on macOS,
+    // `u32` on linux), with NO widening cast. A `u32::from` here would be an IDENTITY conversion where `mode_t`
+    // is already `u32` (clippy `useless_conversion`, which fails the linux gate), while an `as u32` would be an
+    // `unnecessary_cast` there; staying in `mode_t` avoids BOTH and is correct on either width.
+    let file_type = st.st_mode & libc::S_IFMT;
+    let is_reg = file_type == libc::S_IFREG;
+    let is_fifo = file_type == libc::S_IFIFO;
     match kind {
         Kind::File if !(is_reg || is_fifo) => eyre::bail!(
             "{} is not a regular file or a FIFO ({}); a `file:` target refuses devices, directories, and \
@@ -603,21 +603,22 @@ fn is_stdin_a_tty() -> bool {
 
 /// A human name for an `S_IFMT`-masked `st_mode` file type, for the "not a regular file or a FIFO (...)"
 /// refusal so the operator sees WHAT they pointed at (a device, a directory) rather than only that it was
-/// rejected. `file_type` is already masked with `S_IFMT`; the libc constants are widened to `u32` to match.
-fn describe_type(file_type: u32) -> &'static str {
-    if file_type == u32::from(libc::S_IFBLK) {
+/// rejected. `file_type` is already masked with `S_IFMT` and kept in `mode_t` space (`u16` on macOS, `u32` on
+/// linux) so the comparisons below need no per-platform cast (see the note at the call site in `open_guarded`).
+fn describe_type(file_type: libc::mode_t) -> &'static str {
+    if file_type == libc::S_IFBLK {
         "a block device"
-    } else if file_type == u32::from(libc::S_IFCHR) {
+    } else if file_type == libc::S_IFCHR {
         "a character device"
-    } else if file_type == u32::from(libc::S_IFDIR) {
+    } else if file_type == libc::S_IFDIR {
         "a directory"
-    } else if file_type == u32::from(libc::S_IFLNK) {
+    } else if file_type == libc::S_IFLNK {
         "a symlink"
-    } else if file_type == u32::from(libc::S_IFSOCK) {
+    } else if file_type == libc::S_IFSOCK {
         "a socket"
-    } else if file_type == u32::from(libc::S_IFIFO) {
+    } else if file_type == libc::S_IFIFO {
         "a FIFO"
-    } else if file_type == u32::from(libc::S_IFREG) {
+    } else if file_type == libc::S_IFREG {
         "a regular file"
     } else {
         "an unknown type"
