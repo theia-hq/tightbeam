@@ -90,6 +90,13 @@ enum Target {
     RawStream(RawStream),
     /// A named service handler (a bare `<name>:` scheme) dispatched through the injected registry.
     Handler(String),
+    /// tightbeam's own built-in loopback reflector (`echo:`): reflect the caller's OWN bytes straight back to
+    /// it. Unlike a [`RawStream`](Target::RawStream) or a caller [`Handler`](Target::Handler), it opens NO host
+    /// resource (no file, no socket, no backend) and holds no secret: a reaching peer only ever reads back what
+    /// it itself sent. So it has a legitimately-safe public form ([`open_safe`](Target::open_safe) is `true`)
+    /// and needs no injected registry, which is what makes it a zero-setup public demo a newcomer can serve
+    /// under a plain public gate without the louder raw-stream opt-in.
+    Echo,
 }
 
 impl Target {
@@ -104,8 +111,10 @@ impl Target {
     /// handler `true`, and an unregistered scheme fails closed (`false`). The EXHAUSTIVE-MATCH guarantee
     /// covers the other two arms: a [`Forward`](Target::Forward) is a socket the operator deliberately stood
     /// up, so it is openable (`true`, today's rule); a [`RawStream`](Target::RawStream) (`file:`/`fifo:`/
-    /// `stdin:`) has no auth of its own and is one keystroke from a secret, so it is NOT (`false`). A future
-    /// `Target` variant forces a decision here rather than defaulting into either answer.
+    /// `stdin:`) has no auth of its own and is one keystroke from a secret, so it is NOT (`false`); an
+    /// [`Echo`](Target::Echo) reflects only the caller's OWN bytes and opens no host resource, so it IS safe
+    /// public (`true`) with no secret to leak. A future `Target` variant forces a decision here rather than
+    /// defaulting into either answer.
     fn open_safe(&self, registry: &Registry) -> bool {
         match self {
             Target::Handler(scheme) => registry
@@ -113,6 +122,7 @@ impl Target {
                 .is_some_and(|handler| handler.open_safe()),
             Target::Forward(_) => true,
             Target::RawStream(_) => false,
+            Target::Echo => true,
         }
     }
 
@@ -123,6 +133,7 @@ impl Target {
             Target::Handler(_) => TargetKind::Handler,
             Target::Forward(_) => TargetKind::Forward,
             Target::RawStream(_) => TargetKind::RawStream,
+            Target::Echo => TargetKind::Echo,
         }
     }
 }
@@ -142,6 +153,10 @@ pub enum TargetKind {
     /// A raw-stream source (`file:`/`fifo:`/`stdin:`): bytes with no auth of their own, so an OPEN one is the
     /// loudest reach posture a banner can show (a stranger reading a chosen path or the piped stdin).
     RawStream,
+    /// tightbeam's built-in loopback reflector (`echo:`): opens no host resource and reflects only the caller's
+    /// OWN bytes, so an OPEN one is a SAFE public posture (nothing local is exposed), NOT the loud raw-stream
+    /// tier. A banner renders it as an ordinary open service, never behind the raw-stream unsafe warning.
+    Echo,
 }
 
 /// The local services an exposer publishes: a map of service name to its [`Target`], validated once at
@@ -151,8 +166,8 @@ pub struct Services(HashMap<String, Target>);
 
 impl Services {
     /// Parse `name=addr` service entries; a bare `addr` becomes the `default` service. A bare `<name>:`
-    /// scheme resolves to a handler; a `host:port` / `unix:<path>` to a raw
-    /// forward. A scheme may be dotted (`<iface>.<method>:`) for a method on an interface.
+    /// scheme resolves to a handler; `echo:` to the built-in loopback reflector; a `host:port` / `unix:<path>`
+    /// to a raw forward. A scheme may be dotted (`<iface>.<method>:`) for a method on an interface.
     pub fn parse(entries: &[String]) -> eyre::Result<Self> {
         let mut services = HashMap::new();
         for entry in entries {
@@ -242,7 +257,7 @@ impl Services {
         let Self(services) = self;
         services.values().filter_map(|target| match target {
             Target::Handler(scheme) => Some(scheme.as_str()),
-            Target::Forward(_) | Target::RawStream(_) => None,
+            Target::Forward(_) | Target::RawStream(_) | Target::Echo => None,
         })
     }
 
@@ -257,7 +272,7 @@ impl Services {
         let Self(services) = self;
         services.iter().filter_map(|(name, target)| match target {
             Target::RawStream(_) => Some(name.as_str()),
-            Target::Handler(_) | Target::Forward(_) => None,
+            Target::Handler(_) | Target::Forward(_) | Target::Echo => None,
         })
     }
 
@@ -292,10 +307,15 @@ impl Services {
                 // gate forbids a library naming a consumer flag, so this speaks the concept (the public
                 // overlay) and each consumer bin's --help names the exact flag. See the report FLAG to
                 // CLI-Architect/Style-Warden on the flag-named-vs-conceptual branch.
-                Some(Target::Handler(_)) | Some(Target::Forward(_)) => eyre::bail!(
-                    "`{name}` is not a raw byte source, so the unsafe raw-stream set will not open it; a handler \
+                // An `echo:` reflector is not a raw byte source either (it exposes no host resource), so it
+                // joins the handler/forward redirect: its safe public form is the SAFE public set, never this
+                // louder raw-stream opt-in.
+                Some(Target::Handler(_)) | Some(Target::Forward(_)) | Some(Target::Echo) => {
+                    eyre::bail!(
+                        "`{name}` is not a raw byte source, so the unsafe raw-stream set will not open it; a handler \
                      or a forward is opened to anyone through the public set instead"
-                ),
+                    )
+                }
                 Some(Target::RawStream(stream)) => {
                     // Serve-time source guard: a name proven into the unsafe overlay is advertised in the
                     // readiness banner as "serving the raw bytes of <path> to anyone". The connect-time open
@@ -962,14 +982,19 @@ impl Exposer {
                         .registry
                         .get(scheme)
                         .is_some_and(|handler| handler.amplifier()),
-                    Target::Forward(_) | Target::RawStream(_) => false,
+                    // An `echo:` reflector is not an amplifier: a caller reads back only what it itself sent, so
+                    // it must SEND N bytes to receive N (symmetric), never turning a small request into a large
+                    // response the way an uncapped responder would.
+                    Target::Forward(_) | Target::RawStream(_) | Target::Echo => false,
                 };
                 // The raw source a banner names in its unsafe warning is tightbeam's to declare (it owns
                 // raw-stream resolution): a raw stream carries its resolved absolute path / stdin marker, a
                 // handler or a forward has no raw source to warn about.
                 let raw_source = match target {
                     Target::RawStream(stream) => Some(stream.raw_source()),
-                    Target::Handler(_) | Target::Forward(_) => None,
+                    // An `echo:` reflector has no raw source to warn about: it exposes no path and no piped
+                    // stdin, only the caller's own returned bytes.
+                    Target::Handler(_) | Target::Forward(_) | Target::Echo => None,
                 };
                 ManifestEntry {
                     name: name.clone(),
@@ -1223,6 +1248,18 @@ where
                 }
             }
         }
+        // tightbeam's own built-in reflector: reflect the peer's OWN bytes straight back to it. Nothing local
+        // is opened (no file, no socket, no backend, no secret), so `Response::Ok` is unconditional and the
+        // reflect cannot fail on a resource that is not there. `reader` carries the peer's bytes and `writer`
+        // returns to the peer, so copying `reader -> writer` is the loopback; on the peer's half-close the copy
+        // hits EOF and the write half is shut down so the peer sees a clean close. This is what a stranger
+        // reaches under a plain public gate: a safe echo of its own input, never a host resource.
+        Some(Target::Echo) => {
+            use tokio::io::AsyncWriteExt as _;
+            Response::Ok.write(&mut writer).await?;
+            io::copy(&mut reader, &mut writer).await?;
+            writer.shutdown().await?;
+        }
         // A named service: hand the admitted stream to the caller-injected handler. The `Admitted` witness
         // proves the gate ruled on THIS stream and is moved into the handler by value (single-use), so a
         // handler can never run for an unauthorized peer; the guarantee holds only because the admit
@@ -1420,10 +1457,10 @@ fn resolve_single_service(requested: Service, services: &HashMap<String, Target>
 }
 
 /// Resolve an exposed service's address to a [`Target`]: `file:<path>` / `fifo:<path>` are the raw-stream
-/// forward (open an existing OS object, splice its bytes to the peer); a bare scheme (a `<name>:` -- a word
-/// then a colon with nothing after) names a handler; anything else must be a socket forward
-/// (`host:port` or `unix:<path>`). All validated here so a typo fails at parse with a teaching message, not
-/// at dial time.
+/// forward (open an existing OS object, splice its bytes to the peer); `echo:` is the built-in loopback
+/// reflector (no argument, no host resource); a bare scheme (a `<name>:` -- a word then a colon with nothing
+/// after) names a handler; anything else must be a socket forward (`host:port` or `unix:<path>`). All
+/// validated here so a typo fails at parse with a teaching message, not at dial time.
 fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
     // A trailing `+lossy` is the operator's opt-in to raw-stream FAN-OUT (delib-20 SYNTHESIS + delib-24): the
     // source may be reached by MANY consumers at once, and a consumer that falls behind has its bytes DROPPED
@@ -1451,6 +1488,13 @@ fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
     // path). Anything after the colon is a typo: `stdin:` takes no argument.
     if addr == "stdin:" {
         return Ok(Target::RawStream(RawStream::stdin(lossy)?));
+    }
+    // `echo:` is tightbeam's built-in loopback reflector: a zero-arg target (no path, no host resource) routed
+    // FIRST, before the bare-scheme handler arm would read `echo` as a handler no registry holds. It tolerates
+    // no `+lossy` (it is not a raw-stream source) and no tail (`echo:` takes no argument), so both are refused.
+    if addr == "echo:" {
+        reject_lossy("echo:")?;
+        return Ok(Target::Echo);
     }
     // A raw-stream forward carries a PATH tail (`file:/tmp/x`, `fifo:/tmp/beam`), so it is a Forward, not a
     // bare-scheme Handler. Route it FIRST: the direction (a read-only source toward the peer) is fixed here
@@ -2174,6 +2218,24 @@ mod tests {
     }
 
     #[test]
+    fn echo_scheme_resolves_to_the_builtin_reflector() {
+        // `echo:` is the zero-arg built-in reflector, NEVER a `Target::Handler("echo")` (which no registry
+        // holds) nor a forward. Pin the routing so it stays a first-class built-in.
+        let Services(parsed) = services(&["demo=echo:"]);
+        let target = parsed.values().next().expect("one service parsed");
+        assert!(
+            matches!(target, super::Target::Echo),
+            "`echo:` must resolve to Target::Echo, got {target:?}"
+        );
+        // `echo:` takes no argument and tolerates no `+lossy` (it is not a raw-stream source): both are refused
+        // at parse, loudly at expose.
+        assert!(
+            Services::parse(&["demo=echo:+lossy".to_owned()]).is_err(),
+            "`echo:+lossy` must be rejected: echo is not a fan-out raw-stream source"
+        );
+    }
+
+    #[test]
     fn lossy_is_accepted_only_on_stdin_and_fifo_and_rejected_elsewhere() {
         // `+lossy` opts a live single-writer source into fan-out; it is legal ONLY on `stdin:`/`fifo:`.
         for entry in ["cam=stdin:+lossy", "cam=fifo:/tmp/cam+lossy"] {
@@ -2331,6 +2393,52 @@ mod tests {
         assert!(
             std::path::Path::new(absolute).is_absolute(),
             "the banner source is an absolute path (std::path::absolute), got {absolute:?}"
+        );
+    }
+
+    #[test]
+    fn echo_is_admitted_under_plain_public_with_no_unsafe_opt_in() {
+        // The whole point of the built-in reflector: it is the ONE thing a newcomer can open to strangers
+        // under a PLAIN public gate, with no louder raw-stream opt-in. Prove both public doors admit it:
+        // (1) the per-service SAFE overlay (`with_public`) opens it, and it reads Open + Echo in the manifest
+        //     with no raw-source warning; and
+        // (2) a node-wide open BASE gate (`Exposer::new` over `Gate::Open` with an EMPTY unsafe set) BUILDS,
+        //     where a raw stream would have been refused and redirected to the unsafe raw-stream set.
+        let per_service = super::Exposer::new(
+            services(&["demo=echo:"]),
+            super::Registry::new(),
+            family_gate("echo-public"),
+            PublicUnsafeRequest::none(),
+        )
+        .expect("assembles")
+        .with_public(PublicRequest::new(["demo".to_owned()]))
+        .expect("echo is safe public, so a plain public gate opens it with no unsafe opt-in");
+
+        let manifest = per_service.manifest();
+        let demo = manifest
+            .iter()
+            .find(|entry| entry.name == "demo")
+            .expect("`demo` is in the manifest");
+        assert_eq!(demo.posture, Posture::Open, "the opened echo reads Open");
+        assert_eq!(demo.kind, TargetKind::Echo, "it is the built-in reflector");
+        assert!(
+            demo.raw_source.is_none(),
+            "echo exposes no raw source, so there is nothing to warn about: {demo:?}"
+        );
+        assert!(
+            !demo.amplifier,
+            "echo reflects the caller's own bytes; it is not an amplifier"
+        );
+
+        assert!(
+            super::Exposer::new(
+                services(&["demo=echo:"]),
+                super::Registry::new(),
+                Gate::Open,
+                PublicUnsafeRequest::none(),
+            )
+            .is_ok(),
+            "a node-wide open gate over an echo reflector builds with no unsafe opt-in (unlike a raw stream)"
         );
     }
 
@@ -2538,6 +2646,61 @@ mod tests {
                     err.contains("single-consumer source, already in use"),
                     "the refusal must name the single-consumer contract: {err}"
                 );
+            })
+            .await;
+    }
+
+    /// The full served path for the built-in reflector: an exposer over an `echo:` target, a connector
+    /// reaching it over the in-process transport, and the peer receiving its OWN bytes back verbatim. Drives
+    /// the exact `Target::Echo` loopback the binary serves. The open BASE gate keeps the peer admitted with no
+    /// token, isolating the reflect path (the safe-public admission is covered by
+    /// `echo_is_admitted_under_plain_public_with_no_unsafe_opt_in`).
+    #[tokio::test]
+    async fn an_echo_service_reflects_the_clients_own_bytes() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
+                let exposer_id = exposer_node.node_id();
+                let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+
+                let exposer = Exposer::new(
+                    services(&["demo=echo:"]),
+                    Registry::new(),
+                    Gate::Open,
+                    PublicUnsafeRequest::none(),
+                )
+                .expect("echo builds under an open gate with no unsafe opt-in (it is safe public)");
+                tokio::task::spawn_local(async move {
+                    exposer
+                        .run(&exposer_node, super::CancellationToken::new())
+                        .await
+                        .expect("exposer runs");
+                });
+
+                let session = consumer.connect(exposer_id).await.expect("connect");
+                let mut stream = ServiceStream::open(&session, "demo")
+                    .await
+                    .expect("echo admits the reaching peer under the open gate");
+
+                // Send our bytes, then half-close so the reflector's copy hits EOF, closes, and we can read to
+                // EOF. The peer gets back EXACTLY what it sent: a loopback of its own input, no host resource.
+                let body = b"reflect these bytes back to me";
+                stream.writer.write_all(body).await.expect("write the body");
+                stream
+                    .writer
+                    .shutdown()
+                    .await
+                    .expect("half-close toward the host");
+                let mut got = Vec::new();
+                stream
+                    .reader
+                    .read_to_end(&mut got)
+                    .await
+                    .expect("read the echo");
+                assert_eq!(got, body, "echo returns the client's own bytes verbatim");
             })
             .await;
     }
@@ -3380,6 +3543,7 @@ mod tests {
             .with("locked", GatedNoop);
         let forward = Target::Forward("127.0.0.1:80".to_owned());
         let raw = Target::RawStream(RawStream::from_reader(Box::new(&b"x"[..])));
+        let echo = Target::Echo;
         let opt_in = Target::Handler("open".to_owned());
         let never = Target::Handler("locked".to_owned());
         let missing = Target::Handler("unregistered".to_owned());
@@ -3391,6 +3555,10 @@ mod tests {
         assert!(
             !raw.open_safe(&registry),
             "a raw stream has no auth of its own"
+        );
+        assert!(
+            echo.open_safe(&registry),
+            "an echo reflector exposes no host resource, so it is safe public"
         );
         assert!(opt_in.open_safe(&registry), "an OptIn handler is openable");
         assert!(
