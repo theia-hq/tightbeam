@@ -3,7 +3,7 @@
 All notable changes to tightbeam, newest first. This first entry reaches back over the arc since v0.3.0,
 so nothing user-facing is lost.
 
-## Unreleased
+## v0.4.0 - 2026-09-05
 
 ### New
 - **The `Handler` trait.** A named service is any type that consumes one admitted stream, injected through
@@ -26,6 +26,13 @@ so nothing user-facing is lost.
   so any protocol generic over a bifrost session runs over the tunnel unchanged.
 - **More raw-stream sources.** A `stdin:` source streams whatever a producer pipes in; guarded `file:` and
   `fifo:` sources stream a path's bytes to the peer. Single-consumer by default.
+- **An `echo:` source.** A zero-argument symmetric reflector that sends back whatever a peer sends. It is
+  safe to open to strangers as-is, so it is the one raw stream a plain `--public` may serve, with no
+  `--public-unsafe`: the ideal first thing to try on one machine.
+- **`--public` and `--public-unsafe` in the binary.** `--public` opens the node's handlers and forwards
+  (and `echo:`) to strangers. Serving a raw `file:`/`fifo:`/`stdin:` source to strangers additionally
+  requires naming it under `--public-unsafe`, since those hand out bytes with no responder to gate them; a
+  keyless shell is refused outright.
 - **`+lossy` raw-stream fan-out.** One source serves many consumers over unreliable datagrams, dropping
   bytes for a consumer that falls behind. A live feed, never exact bytes, so it is refused on any other
   scheme and under an open gate.
@@ -47,3 +54,8 @@ so nothing user-facing is lost.
 ### Fixed
 - **No leaked threads on `fifo:`/`stdin:` sources.** Those sources open nonblocking, and concurrent
   raw-stream opens are capped, so a stalled or flooded source cannot exhaust threads.
+- **A `file:` source now serves on Linux.** A regular file cannot register with epoll (it returns `EPERM`),
+  which had made `file:` sources fail to start on Linux while working on macOS. Regular files now read
+  through a blocking path instead of the readiness poller.
+- **Graceful shutdown.** On a termination signal the binary closes the node before exiting, so the iroh
+  endpoint tears down cleanly rather than leaving a peer to time out a dropped connection.

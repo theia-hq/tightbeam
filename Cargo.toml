@@ -1,6 +1,6 @@
 [package]
 name = "tightbeam"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -14,7 +14,7 @@ license = "MIT OR Apache-2.0"
 bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "26e8272d890b0b424bc6960b9d38e09b40cc428d" }
 bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "26e8272d890b0b424bc6960b9d38e09b40cc428d" }
 bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "26e8272d890b0b424bc6960b9d38e09b40cc428d" }
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "d00f41366201f583c8e7a7431b15254719de1f93" }
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "6470a4619b89f69c6259f8c46a6f7afc0ccd3d34" }
 
 clap = { version = "4", features = ["derive", "env"] }
 eyre = "0.6"
