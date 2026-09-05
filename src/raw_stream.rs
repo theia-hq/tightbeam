@@ -335,8 +335,11 @@ async fn open_path(path: PathBuf, kind: Kind) -> eyre::Result<BoxRead> {
     // `spawn_blocking`, so nothing can leak past the timeout (that leak was the bug in issue #25).
     let opened = open_guarded(&path, kind)?;
     match opened {
-        // A regular file needs no writer: read it straight away.
-        Opened::Regular(fd) => Ok(Box::new(NonblockingReader::new(fd)?)),
+        // A regular file needs no writer AND has no readiness to wait on: read it straight away, INLINE, with
+        // no reactor registration. It must NOT go through `NonblockingReader`/`AsyncFd`: Linux `epoll` refuses a
+        // regular fd with `EPERM` at registration (a regular file is always ready), which broke every regular
+        // `file:` open on Linux while passing on macOS's kqueue.
+        Opened::Regular(fd) => Ok(Box::new(RegularFileReader(fd))),
         // A FIFO reads as instant EOF with no writer, so wait for one (readable readiness) up to the timeout
         // before calling the stream open. On elapse, drop the fd (cheap, no parked thread) and refuse.
         Opened::Fifo(fd) => {
@@ -488,11 +491,12 @@ fn open_guarded(path: &Path, kind: Kind) -> eyre::Result<Opened> {
     })
 }
 
-/// An [`AsyncRead`](tokio::io::AsyncRead) over a nonblocking fd (guard 2's `O_NONBLOCK` open), so the guarded
-/// FIFO/file open never needs a blocking thread. Registers the fd with the tokio reactor via [`AsyncFd`]:
+/// An [`AsyncRead`](tokio::io::AsyncRead) over a nonblocking FIFO fd (guard 2's `O_NONBLOCK` open), so the
+/// guarded FIFO open never needs a blocking thread. Registers the fd with the tokio reactor via [`AsyncFd`]:
 /// `EAGAIN` (would-block) yields readable readiness rather than a parked syscall, so a slow or writer-less FIFO
-/// costs a poll registration, never a leaked blocking-pool thread. A regular file is always readiness-ready, so
-/// this reads it inline with no wait.
+/// costs a poll registration, never a leaked blocking-pool thread. FIFO-ONLY: a regular file must NOT come here
+/// because Linux `epoll` (which [`AsyncFd`] uses) refuses a regular fd with `EPERM` at registration; see
+/// [`RegularFileReader`] for the regular-file path.
 struct NonblockingReader(AsyncFd<OwnedFd>);
 
 impl NonblockingReader {
@@ -548,6 +552,44 @@ impl tokio::io::AsyncRead for NonblockingReader {
             buf.advance(n);
             return Poll::Ready(Ok(()));
         }
+    }
+}
+
+/// An [`AsyncRead`](tokio::io::AsyncRead) over a REGULAR-file fd that reads INLINE, with NO reactor
+/// registration. A regular file cannot go through [`NonblockingReader`]/[`AsyncFd`]: Linux `epoll` (mio's
+/// backend) refuses a regular fd with `EPERM` at `epoll_ctl` registration, because a regular file has no
+/// readiness to wait on: it is ALWAYS ready to read. (macOS `kqueue` accepts a regular fd, which is why that
+/// break only surfaced on the Linux CI.) A regular-file `read(2)` never returns `EAGAIN` on local media
+/// (`O_NONBLOCK`, guard 2, is a no-op on a regular file), so each poll reads straight through and returns
+/// `Ready`. This keeps the regular-file path INLINE with no `spawn_blocking`, matching the guarded open above
+/// (issue #25's no-leak stance). The one caveat is the SAME one the guarded open already documents: a read from
+/// a hung mount (wedged NFS) can block the calling task; pool isolation for that is out of scope (TODO(#25-followup)).
+struct RegularFileReader(OwnedFd);
+
+impl tokio::io::AsyncRead for RegularFileReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // SAFETY: a `read(2)` writes at most `len` bytes into the fd's readable region of `buf` and never reads
+        // the uninitialized tail, so the count it returns is exactly how many were initialized.
+        let unfilled = unsafe { buf.unfilled_mut() };
+        let rc = unsafe {
+            libc::read(
+                std::os::fd::AsRawFd::as_raw_fd(&self.0),
+                unfilled.as_mut_ptr().cast::<libc::c_void>(),
+                unfilled.len(),
+            )
+        };
+        if rc < 0 {
+            return Poll::Ready(Err(io::Error::last_os_error()));
+        }
+        let n = rc as usize;
+        // SAFETY: `read` initialized exactly `n` bytes of the unfilled region (checked `rc >= 0` above).
+        unsafe { buf.assume_init(n) };
+        buf.advance(n);
+        Poll::Ready(Ok(()))
     }
 }
 
