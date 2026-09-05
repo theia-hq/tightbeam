@@ -6,7 +6,7 @@
 
 use bifrost::{Node, NodeId, Session, Transport};
 use clap::Args;
-use nauthy::Denylist;
+use nauthy::FileDenylist;
 use tightbeam::tunnel::{
     self, CancellationToken, Exposer, ManifestEntry, Posture, PublicUnsafeRequest, RawSource,
     Registry, Services, TargetKind,
@@ -72,7 +72,7 @@ impl ExposeCmd {
         self,
         node: &Node<T, D>,
         signet: Option<NodeId>,
-        denylist: Denylist,
+        denylist: FileDenylist,
     ) -> eyre::Result<()>
     where
         <T::Session as Session>::Write: Send + 'static,

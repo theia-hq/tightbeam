@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use bifrost::Node;
 use bifrost_iroh::Endpoint;
 use clap::{CommandFactory, Parser, Subcommand};
-use nauthy::Denylist;
+use nauthy::FileDenylist;
 use tightbeam::config::{load_signet, revoked_path};
 use tightbeam::identity::{self, Secret};
 use tightbeam::peer::{Discovery, Peer};
@@ -110,7 +110,7 @@ async fn main() -> eyre::Result<()> {
             let signet = load_signet().await?;
             // Load tightbeam's own denylist here in the adapter and pass it as a value; the core takes the
             // loaded list, never a path (the same seam any richer consumer drives on its own store).
-            let denylist = Denylist::load(revoked_path()?).await?;
+            let denylist = FileDenylist::load(revoked_path()?).await?;
             let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
             cmd.run(&node, signet, denylist).await
         }

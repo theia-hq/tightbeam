@@ -14,7 +14,7 @@ use core::time::Duration;
 
 use bifrost::{NoDiscovery, Node, NodeId};
 use bifrost_mem::MemTransport;
-use nauthy::{Denylist, Identity, Service};
+use nauthy::{FileDenylist, Identity, Service};
 use tightbeam::tunnel::{self, CancellationToken, Connector, Exposer, Services};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -54,7 +54,7 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
             let minter = Identity::from_secret(&EXPOSER_SECRET).unwrap();
             let ssh = "ssh".parse::<Service>().unwrap();
             let valid = minter
-                .mint(&ssh, nauthy::expires_in(Duration::from_secs(3600)))
+                .mint(&ssh, nauthy::Request::expires_in(Duration::from_secs(3600)))
                 .unwrap()
                 .link()
                 .unwrap();
@@ -71,7 +71,7 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
             let wrong = minter
                 .mint(
                     &"web".parse::<Service>().unwrap(),
-                    nauthy::expires_in(Duration::from_secs(3600)),
+                    nauthy::Request::expires_in(Duration::from_secs(3600)),
                 )
                 .unwrap()
                 .link()
@@ -155,8 +155,8 @@ async fn free_port() -> u16 {
 
 /// An empty revocation denylist: these tests exercise the grant path, not revocation, so the gate loads
 /// from a path that does not exist (an absent file is an empty set).
-async fn empty_denylist() -> Denylist {
+async fn empty_denylist() -> FileDenylist {
     let path = std::env::temp_dir().join(format!("tightbeam-cap-denylist-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    Denylist::load(path).await.unwrap()
+    FileDenylist::load(path).await.unwrap()
 }

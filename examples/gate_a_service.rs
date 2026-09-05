@@ -25,7 +25,7 @@ use std::path::PathBuf;
 
 use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
-use nauthy::{Denylist, Identity, Service};
+use nauthy::{FileDenylist, Identity, Service};
 use tightbeam::identity::AsNodeId as _;
 use tightbeam::tunnel::{self, CancellationToken, Connector, Exposer, Registry, Services};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -70,12 +70,12 @@ async fn run() -> eyre::Result<()> {
     //    empty denylist admits everything not yet revoked.
     let services = Services::parse(&[format!("ssh={echo_addr}")])?;
     // Nothing is revoked yet, so an empty denylist. A real node loads this from where it persists
-    // revocations (`Denylist::load`); the empty set admits everything not yet revoked.
-    // `identity.node_id()` is nauthy's `VerifyKey`; `.node_id()` again is the `AsNodeId` bridge to bifrost's
+    // revocations (`FileDenylist::load`); the empty set admits everything not yet revoked.
+    // `identity.verifying_key()` is nauthy's `VerifyKey`; `.node_id()` is the `AsNodeId` bridge to bifrost's
     // `NodeId` (two names for the same ed25519 key on either side of the cap/transport boundary). A real
     // exposer loads this signet from config as a `NodeId` already and never crosses the bridge by hand.
-    let signet = identity.node_id().node_id();
-    let gate = tunnel::resolve_gate(Some(signet), Denylist::empty(PathBuf::new()))?;
+    let signet = identity.verifying_key().node_id();
+    let gate = tunnel::resolve_gate(Some(signet), FileDenylist::empty(PathBuf::new()))?;
     tokio::task::spawn_local(async move {
         if let Err(e) = Exposer::new(
             services,

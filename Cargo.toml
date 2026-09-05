@@ -14,7 +14,7 @@ license = "MIT OR Apache-2.0"
 bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "26e8272d890b0b424bc6960b9d38e09b40cc428d" }
 bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "26e8272d890b0b424bc6960b9d38e09b40cc428d" }
 bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "26e8272d890b0b424bc6960b9d38e09b40cc428d" }
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "0e9e357db137c74522d188e9147b3c62071e75bb" }
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "d00f41366201f583c8e7a7431b15254719de1f93" }
 
 clap = { version = "4", features = ["derive", "env"] }
 eyre = "0.6"

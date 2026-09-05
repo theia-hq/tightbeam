@@ -16,7 +16,7 @@ use bifrost::{ConnInfo, Discovery, Node, NodeId, Session, Transport};
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use nauthy::{Admitted, Cap, Denylist, Gate, Identity, Refusal, Service};
+use nauthy::{Admitted, Cap, FileDenylist, Gate, Identity, ProvenPeer, Refusal, Service};
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -657,14 +657,14 @@ impl Registry {
 /// [`Gate::Open`] base is a caller's own deliberate choice (nauthy's [`Gate::Open`]), not something a
 /// gate-resolution policy hands back from a flag: that node-wide-open flag was exactly the whole-node blast
 /// radius per-service exposure removes (delib-39).
-pub fn resolve_gate(signet: Option<NodeId>, denylist: Denylist) -> eyre::Result<Gate> {
+pub fn resolve_gate(signet: Option<NodeId>, denylist: FileDenylist) -> eyre::Result<Gate> {
     let root = signet.ok_or_else(|| {
         eyre::eyre!(
             "this node has no signet to gate on: provision it (adopt a signet), or open individual services \
              to anyone"
         )
     })?;
-    Ok(Gate::family(root.verify_key(), denylist))
+    Ok(Gate::rooted(root.verify_key(), denylist))
 }
 
 /// The raw, UNVALIDATED set of service names an operator asked to open to strangers (however an embedder
@@ -1289,7 +1289,11 @@ fn admit(
     // the identical family path below.
     if public.contains(service.as_str()) || public_unsafe.contains(service.as_str()) {
         // An open service needs no badge, so the signet-bound membership slot is irrelevant on this path.
-        return mint(Gate::Open.admit_witnessed(peer.verify_key(), None, None, service));
+        return mint(Gate::Open.admit_witnessed(
+            ProvenPeer::from_handshake(peer.verify_key()),
+            None,
+            service,
+        ));
     }
     // A MISS is EITHER a gated-present name OR a name the node does not serve at all: both take this
     // identical family path (the same cap parse, the same two ed25519 verifies, the same refusal), so a
@@ -1306,21 +1310,28 @@ fn admit(
     // Parse the SECOND slot ONLY when the first is a signet-bound slip: that is the sole path that ANDs a
     // fleet badge, so a plain/bearer/device slip (or none) never triggers the extra `Cap::parse`. The server
     // guards this independently of the dialer (a hostile client ignores the dialer's attach logic), which
-    // bounds the second slot's parse work behind the cheap, root-free `is_signet_bound` check. A malformed
+    // bounds the second slot's parse work behind the cheap, root-free `is_authority_bound` check. A malformed
     // badge on the signet path is a refusal, not a hard error; both slots inherit `Cap::parse`'s bounds.
     let membership = match cap.as_ref() {
-        Some(slip) if slip.is_signet_bound() => match membership.map(Cap::parse).transpose() {
+        Some(slip) if slip.is_authority_bound() => match membership.map(Cap::parse).transpose() {
             Ok(membership) => membership,
             Err(_) => return Err("malformed capability".to_owned()),
         },
         _ => None,
     };
-    mint(base.admit_witnessed(
-        peer.verify_key(),
-        cap.as_ref(),
-        membership.as_ref(),
-        service,
-    ))
+    // Mint the transport-proven peer at this admission seam: the `peer` NodeId reached here only via a
+    // completed bifrost handshake (`serve_session` reads it from `Session::peer`), which proves the dialer
+    // holds the secret behind it, exactly the precondition `ProvenPeer::from_handshake` marks.
+    let peer = ProvenPeer::from_handshake(peer.verify_key());
+    // Route the two-cap authority-bound path (a foreign slip AND the membership badge that vouches for the
+    // dialer under the slip's foreign authority) through `admit_foreign_witnessed`; every other shape (a
+    // membership badge, a plain/bearer/device slip, or no token) is the single-cap path. A `membership` is
+    // `Some` only when slot 1 is an authority-bound slip and a badge parsed, so that pairing is the only
+    // caller of the foreign twin.
+    match (cap.as_ref(), membership.as_ref()) {
+        (Some(slip), Some(badge)) => mint(base.admit_foreign_witnessed(peer, slip, badge, service)),
+        (presented, _) => mint(base.admit_witnessed(peer, presented, service)),
+    }
 }
 
 /// Map a nauthy admission result to the [`admit`] contract: the witness on success, or a DISTINGUISHING
@@ -1768,7 +1779,7 @@ pub fn mint_link(
     lifetime: Duration,
     delegable: bool,
 ) -> eyre::Result<String> {
-    let cap = identity.mint(service, nauthy::expires_in(lifetime))?;
+    let cap = identity.mint(service, nauthy::Request::expires_in(lifetime))?;
     let cap = if delegable { cap } else { cap.seal()? };
     Ok(cap.link()?)
 }
@@ -1787,7 +1798,7 @@ pub fn mint_bound_link(
     bound_to: nauthy::VerifyKey,
     lifetime: Duration,
 ) -> eyre::Result<String> {
-    let cap = identity.mint_bound(service, bound_to, nauthy::expires_in(lifetime))?;
+    let cap = identity.mint_bound(service, bound_to, nauthy::Request::expires_in(lifetime))?;
     Ok(cap.seal()?.link()?)
 }
 
@@ -1795,7 +1806,7 @@ pub fn mint_bound_link(
 /// for `lifetime`.
 ///
 /// The work-sim primitive: issue ONCE to a person's signet `foreign_root`, and every device that signet
-/// vouches for may use it (see [`nauthy::Identity::mint_signet_slip`]). Inert alone: the far gate admits it
+/// vouches for may use it (see [`nauthy::Identity::mint_authority_slip`]). Inert alone: the far gate admits it
 /// only when the presenter ALSO proves membership under `foreign_root`. Always sealed: a fleet-bound slip is
 /// theft-resistant and non-delegable by construction (like [`mint_bound_link`]). Offline: needs the signing
 /// `identity` but no network.
@@ -1805,7 +1816,11 @@ pub fn mint_signet_link(
     foreign_root: nauthy::VerifyKey,
     lifetime: Duration,
 ) -> eyre::Result<String> {
-    let cap = identity.mint_signet_slip(service, foreign_root, nauthy::expires_in(lifetime))?;
+    let cap = identity.mint_authority_slip(
+        service,
+        foreign_root,
+        nauthy::Request::expires_in(lifetime),
+    )?;
     Ok(cap.seal()?.link()?)
 }
 
@@ -1821,7 +1836,7 @@ pub fn narrow_link(
         eyre::bail!("narrow it by service and/or a shorter expiry");
     }
     let cap = Cap::parse(link)?;
-    let shorten = shorten.map(nauthy::expires_in);
+    let shorten = shorten.map(nauthy::Request::expires_in);
     let narrowed = cap.attenuate(service, shorten)?;
     Ok(narrowed.link()?)
 }
@@ -1831,7 +1846,7 @@ pub fn narrow_link(
 /// The caller opens the denylist (from wherever it persists revocations) and passes it BY REF; the core
 /// never reads a config path. It records EXACTLY the link's id and every narrower cap delegated from it,
 /// NOT the wider grant it was attenuated from.
-pub async fn revoke_into(denylist: &mut Denylist, link: &str) -> eyre::Result<()> {
+pub async fn revoke_into(denylist: &mut FileDenylist, link: &str) -> eyre::Result<()> {
     let cap = Cap::parse(link)?;
     denylist.revoke(&cap).await?;
     Ok(())
@@ -1861,8 +1876,8 @@ mod tests {
     fn a_gated_catalog_reports_gated_and_round_trips() {
         let services = services(&["c=127.0.0.1:80", "a=handler:", "b=handler:"]);
         let signet = nauthy::Identity::from_secret(&[7u8; 32]).expect("valid secret");
-        let denylist = nauthy::Denylist::empty(std::env::temp_dir().join("tb-catalog-gated"));
-        let gate = Gate::family(signet.node_id(), denylist);
+        let denylist = nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-catalog-gated"));
+        let gate = Gate::rooted(signet.verifying_key(), denylist);
         let catalog = services.catalog(&gate, &PublicRequest::none(), &PublicUnsafeRequest::none());
 
         let names: Vec<&str> = catalog.entries().map(|entry| entry.name.as_str()).collect();
@@ -2864,7 +2879,7 @@ mod tests {
     /// existence, shape, and verdict are revealed only AFTER admission.
     #[tokio::test]
     async fn an_unadmitted_dialer_gets_one_uniform_refusal_no_reason_no_menu() {
-        use nauthy::{Denylist, Identity};
+        use nauthy::{FileDenylist, Identity};
 
         let local = tokio::task::LocalSet::new();
         local
@@ -2873,7 +2888,7 @@ mod tests {
                 // (`web`) so the node has a genuine menu that MUST NOT leak. The bodies are irrelevant: every
                 // dial here is refused at the gate or at the unknown-service arm, never served.
                 let signet = Identity::from_secret(&[7u8; 32]).expect("valid secret");
-                let hour = nauthy::expires_in(core::time::Duration::from_secs(3600));
+                let hour = nauthy::Request::expires_in(core::time::Duration::from_secs(3600));
 
                 let mut map = HashMap::new();
                 map.insert(
@@ -2891,13 +2906,13 @@ mod tests {
                 let path = std::env::temp_dir()
                     .join(format!("tb-uniform-refusal-{}", std::process::id()));
                 let _ = std::fs::remove_file(&path);
-                let mut denylist = Denylist::load(path.clone()).await.expect("load denylist");
+                let mut denylist = FileDenylist::load(path.clone()).await.expect("load denylist");
                 denylist.revoke(&revoked_slip).await.expect("revoke the slip");
 
                 let exposer = Exposer {
                     services,
                     registry: std::sync::Arc::new(Registry::new()),
-                    gate: Gate::family(signet.node_id(), denylist),
+                    gate: Gate::rooted(signet.verifying_key(), denylist),
                     public: PublicServices::default(),
                     public_unsafe: PublicServices::default(),
                 };
@@ -3020,9 +3035,9 @@ mod tests {
     /// A family gate + a `speed` service; a helper to build the two postures the per-service tests need.
     fn family_gate(tag: &str) -> Gate {
         let signet = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
-        Gate::family(
-            signet.node_id(),
-            nauthy::Denylist::empty(std::env::temp_dir().join(format!("tb-per-service-{tag}"))),
+        Gate::rooted(
+            signet.verifying_key(),
+            nauthy::FileDenylist::empty(std::env::temp_dir().join(format!("tb-per-service-{tag}"))),
         )
     }
 
@@ -3120,7 +3135,7 @@ mod tests {
         let badge = signet
             .mint_member(
                 peer.verify_key(),
-                nauthy::expires_in(core::time::Duration::from_secs(3600)),
+                nauthy::Request::expires_in(core::time::Duration::from_secs(3600)),
             )
             .expect("mint member badge")
             .link()

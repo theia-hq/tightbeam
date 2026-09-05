@@ -16,7 +16,7 @@ use core::time::Duration;
 
 use bifrost::{NoDiscovery, Node, NodeId};
 use bifrost_mem::MemTransport;
-use nauthy::{Denylist, Identity, Service};
+use nauthy::{FileDenylist, Identity, Service};
 use tightbeam::identity::AsVerifyKey as _;
 use tightbeam::tunnel::{self, CancellationToken, Connector, Exposer, Services};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -68,7 +68,7 @@ async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership()
             let slip = tunnel::mint_signet_link(
                 &work,
                 &web,
-                Identity::from_secret(&HIRE_SECRET).unwrap().node_id(),
+                Identity::from_secret(&HIRE_SECRET).unwrap().verifying_key(),
                 Duration::from_secs(3600),
             )
             .unwrap();
@@ -79,7 +79,7 @@ async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership()
             let fleet_badge = hire
                 .mint_member(
                     device.node_id().verify_key(),
-                    nauthy::expires_in(Duration::from_secs(3600)),
+                    nauthy::Request::expires_in(Duration::from_secs(3600)),
                 )
                 .unwrap()
                 .link()
@@ -105,7 +105,7 @@ async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership()
             let wrong_badge = other
                 .mint_member(
                     stray.node_id().verify_key(),
-                    nauthy::expires_in(Duration::from_secs(3600)),
+                    nauthy::Request::expires_in(Duration::from_secs(3600)),
                 )
                 .unwrap()
                 .link()
@@ -193,9 +193,9 @@ async fn free_port() -> u16 {
 
 /// An empty revocation denylist (an absent file is an empty set); this test exercises admission, not
 /// revocation.
-async fn empty_denylist() -> Denylist {
+async fn empty_denylist() -> FileDenylist {
     let path =
         std::env::temp_dir().join(format!("tightbeam-signet-denylist-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    Denylist::load(path).await.unwrap()
+    FileDenylist::load(path).await.unwrap()
 }
