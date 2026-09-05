@@ -21,7 +21,7 @@ eyre = "0.6"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 rand = "0.8"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 

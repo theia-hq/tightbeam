@@ -43,6 +43,7 @@ use core::task::{Context, Poll};
 use std::io;
 use std::os::fd::{FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::FileTypeExt as _;
 use std::path::{Path, PathBuf};
 
 use tokio::io::unix::AsyncFd;
@@ -309,6 +310,94 @@ impl RawStream {
             Source::Stdin(_) => RawSource::Stdin,
             Source::Lossy(lossy) => RawSource::clone(&lossy.source),
         }
+    }
+
+    /// Validate a PATH source at SERVE time, before the readiness banner advertises it as open to strangers
+    /// (the unsafe raw-stream opt-in set). The connect-time guards ([`open_guarded`]) refuse a device, a
+    /// directory, a socket, and a symlink at the final component, so a banner naming one as "serving the raw
+    /// bytes of ..." over-claims bytes the node will ALWAYS refuse at dial. This is the serve-time twin of that
+    /// type guard: `lstat` the path and refuse the STABLE always-refused types loudly HERE, word-for-word the
+    /// same refusals [`open_guarded`] gives, so the banner and the guard agree.
+    ///
+    /// A path that does not exist yet is ALLOWED (a `fifo:`/`file:` source may be created before a dial,
+    /// matching the lexical, no-FS rendering in [`raw_source`](Self::raw_source)); the nonblocking open at dial
+    /// is the definitive guard for the missing-path case. `stdin:` (no path) is always servable.
+    pub fn check_open_source(&self) -> eyre::Result<()> {
+        let Self(source) = self;
+        match source {
+            Source::Path { path, kind } => check_open_path(path, *kind),
+            Source::Stdin(_) => Ok(()),
+            // A `+lossy` source is `fifo:`/`stdin:` only (`file:` is rejected upstream), so a lossy PATH is a
+            // FIFO; validate its recorded absolute path the same way. A `stdin:+lossy` has no path to check.
+            Source::Lossy(lossy) => match &lossy.source {
+                RawSource::Path(path) => check_open_path(Path::new(path), Kind::Fifo),
+                RawSource::Stdin => Ok(()),
+            },
+        }
+    }
+}
+
+/// Serve-time type check for a raw-stream path (the twin of [`open_guarded`]'s guard 1), run before the
+/// banner advertises the source as open. `lstat` (no symlink follow) the final component and refuse the
+/// stable always-refused types with the SAME wording the connect-time open gives; a not-yet-existing path is
+/// ALLOWED (the dial-time open is the definitive guard there, so a source created between serve and dial still
+/// works). `symlink_metadata`, not `metadata`, so a symlink at the final component is seen AS a symlink and
+/// refused, exactly as the `O_NOFOLLOW` open does.
+fn check_open_path(path: &Path, kind: Kind) -> eyre::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(eyre::Error::from(err).wrap_err(format!("cannot stat {}", path.display())));
+        }
+    };
+    let file_type = metadata.file_type();
+    // A symlink at the final component is refused at dial by `O_NOFOLLOW`, so it would over-claim here too.
+    if file_type.is_symlink() {
+        eyre::bail!(
+            "{} is a symlink; a `file:`/`fifo:` target is opened with O_NOFOLLOW and will not follow a \
+             symlink at the final component",
+            path.display()
+        );
+    }
+    let is_reg = file_type.is_file();
+    let is_fifo = file_type.is_fifo();
+    match kind {
+        Kind::File if !(is_reg || is_fifo) => eyre::bail!(
+            "{} is not a regular file or a FIFO ({}); a `file:` target refuses devices, directories, and \
+             sockets",
+            path.display(),
+            describe_metadata_type(&file_type)
+        ),
+        Kind::Fifo if !is_fifo => eyre::bail!(
+            "{} is not a FIFO ({}); a `fifo:` target opens a named pipe (make one with `mkfifo`)",
+            path.display(),
+            describe_metadata_type(&file_type)
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// A human name for a [`std::fs::FileType`], for the serve-time [`check_open_path`] refusal so the operator
+/// sees WHAT they pointed at. Matches [`describe_type`]'s wording for the connect-time `fstat` path, but over
+/// a `FileType` (not a masked `st_mode`), so the serve-time check needs no `mode_t`-width cast.
+fn describe_metadata_type(file_type: &std::fs::FileType) -> &'static str {
+    if file_type.is_block_device() {
+        "a block device"
+    } else if file_type.is_char_device() {
+        "a character device"
+    } else if file_type.is_dir() {
+        "a directory"
+    } else if file_type.is_symlink() {
+        "a symlink"
+    } else if file_type.is_socket() {
+        "a socket"
+    } else if file_type.is_fifo() {
+        "a FIFO"
+    } else if file_type.is_file() {
+        "a regular file"
+    } else {
+        "an unknown type"
     }
 }
 

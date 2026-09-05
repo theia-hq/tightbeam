@@ -296,7 +296,14 @@ impl Services {
                     "`{name}` is not a raw byte source, so the unsafe raw-stream set will not open it; a handler \
                      or a forward is opened to anyone through the public set instead"
                 ),
-                Some(Target::RawStream(_)) => {
+                Some(Target::RawStream(stream)) => {
+                    // Serve-time source guard: a name proven into the unsafe overlay is advertised in the
+                    // readiness banner as "serving the raw bytes of <path> to anyone". The connect-time open
+                    // refuses a device, a directory, a socket, or a symlink, so validate the source HERE too and
+                    // refuse it loudly at serve, rather than let the banner over-claim bytes a dial will always
+                    // reject. A not-yet-created path is still allowed (the dial-time open guards that case). This
+                    // aligns the banner with the guard.
+                    stream.check_open_source()?;
                     proven.insert(name);
                 }
             }
@@ -1364,6 +1371,30 @@ pub fn refusal_reason(message: &str) -> String {
     }
 }
 
+/// The prefix this layer stamps on a host gate refusal when it surfaces the reason through a
+/// [`bifrost::Error::Stream`] (see [`ServiceSession::open_bi`], [`request_service`], [`request_stdio`]). The
+/// top-level `Stream` error renders as just "stream", so the reason travels in the boxed SOURCE behind this
+/// prefix; [`gate_refusal_reason`] is the client twin that reads it back. One constant, so the write sites and
+/// the recognizer never drift.
+const GATE_REFUSAL_PREFIX: &str = "service refused: ";
+
+/// The refusal reason if `error` is a gate refusal this layer surfaced, else `None`. A [`ServiceSession`] (and
+/// the forward/stdio paths) map a host gate refusal to a [`bifrost::Error::Stream`] whose SOURCE reads
+/// `"service refused: <reason>"`; the top-level `Stream` renders as just "stream", so the reason lives in the
+/// boxed source. This walks the source chain for [`GATE_REFUSAL_PREFIX`] so a dialer-side renderer can tell
+/// "the gate refused you" (recover the `<reason>` and pass it through [`refusal_reason`]) from a genuine i/o
+/// failure (which renders as the bare transport word). The client twin of the phrasing this layer writes.
+pub fn gate_refusal_reason(error: &bifrost::Error) -> Option<String> {
+    let mut source: Option<&(dyn core::error::Error + 'static)> = Some(error);
+    while let Some(cause) = source {
+        if let Some(reason) = cause.to_string().strip_prefix(GATE_REFUSAL_PREFIX) {
+            return Some(reason.to_owned());
+        }
+        source = cause.source();
+    }
+    None
+}
+
 /// A one-line dialer-side refusal for a REACHED host: `reached <node>, but refused: <reason>`. Used where a
 /// probe reached the peer and its gate refused (e.g. [`Connector::preflight`]); it names the peer, states it
 /// was reached (not unreachable), and renders the reason through [`refusal_reason`] so a bare gate refusal
@@ -1710,7 +1741,7 @@ impl<S: Session> Session for ServiceSession<S> {
             // Surface the host's refusal reason through the stream error, using the same phrasing
             // `request_service` gives the forward path, so a caller's error chain reads one way.
             Response::Error(message) => Err(bifrost::Error::Stream(
-                format!("service refused: {message}").into(),
+                format!("{GATE_REFUSAL_PREFIX}{message}").into(),
             )),
         }
     }
@@ -1746,7 +1777,7 @@ where
     request.write(&mut writer).await?;
     match Response::read(&mut reader).await? {
         Response::Ok => splice(tcp, writer, reader).await?,
-        Response::Error(message) => eyre::bail!("service refused: {message}"),
+        Response::Error(message) => eyre::bail!("{GATE_REFUSAL_PREFIX}{message}"),
     }
     Ok(())
 }
@@ -1764,7 +1795,7 @@ where
     request.write(&mut writer).await?;
     match Response::read(&mut reader).await? {
         Response::Ok => pipe_stdio_bridge(writer, reader).await?,
-        Response::Error(message) => eyre::bail!("service refused: {message}"),
+        Response::Error(message) => eyre::bail!("{GATE_REFUSAL_PREFIX}{message}"),
     }
     Ok(())
 }
@@ -2300,6 +2331,45 @@ mod tests {
         assert!(
             std::path::Path::new(absolute).is_absolute(),
             "the banner source is an absolute path (std::path::absolute), got {absolute:?}"
+        );
+    }
+
+    #[test]
+    fn public_unsafe_over_a_device_or_directory_is_refused_at_serve() {
+        // The banner must never advertise bytes the dial will refuse: a `file:` source that is a DEVICE or a
+        // DIRECTORY is refused at connect, so naming it in the unsafe set is refused loudly at SERVE (in
+        // `Exposer::new`, before any banner), rather than printed as "serving the raw bytes of ..." and then
+        // refused mid-dial. Both `/dev/null` (a char device) and the temp dir (a directory) EXIST, so the
+        // serve-time `lstat` sees the always-refused type.
+        let device = services(&["drain=file:/dev/null"]);
+        let Err(via_device) = super::Exposer::new(
+            device,
+            super::Registry::new(),
+            Gate::Open,
+            PublicUnsafeRequest::new(["drain".to_owned()]),
+        ) else {
+            panic!(
+                "a device named in the unsafe set must be refused at serve, not advertised then refused"
+            );
+        };
+        assert!(
+            via_device.to_string().contains("character device"),
+            "the serve-time refusal names the device type: {via_device}"
+        );
+
+        let dir_entry = format!("logs=file:{}", std::env::temp_dir().display());
+        let directory = services(&[&dir_entry]);
+        let Err(via_dir) = super::Exposer::new(
+            directory,
+            super::Registry::new(),
+            Gate::Open,
+            PublicUnsafeRequest::new(["logs".to_owned()]),
+        ) else {
+            panic!("a directory named in the unsafe set must be refused at serve");
+        };
+        assert!(
+            via_dir.to_string().contains("directory"),
+            "the serve-time refusal names the directory type: {via_dir}"
         );
     }
 

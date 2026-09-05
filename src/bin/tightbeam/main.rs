@@ -18,6 +18,7 @@
 //! is both the address peers dial and the key a
 //! share-link roots at: `--key` or `TIGHTBEAM_KEY`.
 
+use core::future::Future;
 use core::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -85,7 +86,24 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> eyre::Result<()> {
+async fn main() -> std::process::ExitCode {
+    // Print the error's message chain, not eyre's `Debug` form: returning `eyre::Result` from `main` trails
+    // a source `Location:` (and a spantrace) that is noise to a user and reads as "go read our source". A
+    // handled error a user hits (a teaching refusal, a bad path) is a report about their input, not a crash.
+    // `{:#}` renders the full `cause: cause` chain with no location; the backtrace stays behind
+    // `RUST_BACKTRACE` for anyone debugging. See STYLE.md, Error handling.
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(report) => {
+            eprintln!("Error: {report:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// The real entry point, split from `main` so a failure prints its clean message chain rather than eyre's
+/// `Debug` form (see the note in `main`).
+async fn run() -> eyre::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -112,13 +130,30 @@ async fn main() -> eyre::Result<()> {
             // loaded list, never a path (the same seam any richer consumer drives on its own store).
             let denylist = FileDenylist::load(revoked_path()?).await?;
             let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
-            cmd.run(&node, signet, denylist).await
+            let outcome = run_until_signalled(cmd.run(&node, signet, denylist)).await;
+            node.close().await;
+            outcome
         }
         Command::Connect(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
             let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
-            cmd.run(&node).await
+            let outcome = run_until_signalled(cmd.run(&node)).await;
+            node.close().await;
+            outcome
         }
+    }
+}
+
+/// Drive a bound-node verb (`expose`, `connect`) to completion, returning EARLY on Ctrl-C so the caller can
+/// close the node gracefully afterward. iroh's `Endpoint` logs a red "Aborting ungracefully" if it drops
+/// without an awaited close (see [`bind_node`]), and `expose` otherwise runs until signalled with no return
+/// point of its own, so the verb's future is raced against SIGINT here and the single `node.close()` follows
+/// at the call site on BOTH paths (a clean end and a Ctrl-C). A Ctrl-C is a clean stop, not a failure, so it
+/// returns `Ok`; only a failure INSTALLING the signal handler is an error.
+async fn run_until_signalled(verb: impl Future<Output = eyre::Result<()>>) -> eyre::Result<()> {
+    tokio::select! {
+        result = verb => result,
+        signal = tokio::signal::ctrl_c() => signal.map_err(eyre::Report::from),
     }
 }
 
