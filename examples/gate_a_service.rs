@@ -77,9 +77,14 @@ async fn run() -> eyre::Result<()> {
     let signet = identity.node_id().node_id();
     let gate = tunnel::resolve_gate(Some(signet), Denylist::empty(PathBuf::new()))?;
     tokio::task::spawn_local(async move {
-        if let Err(e) = Exposer::new(services, Registry::new(), gate)?
-            .run(&exposer, CancellationToken::new())
-            .await
+        if let Err(e) = Exposer::new(
+            services,
+            Registry::new(),
+            gate,
+            tightbeam::tunnel::PublicUnsafeRequest::none(),
+        )?
+        .run(&exposer, CancellationToken::new())
+        .await
         {
             eprintln!("exposer stopped: {e}");
         }

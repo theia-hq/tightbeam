@@ -7,7 +7,10 @@
 use bifrost::{Node, NodeId, Session, Transport};
 use clap::Args;
 use nauthy::Denylist;
-use tightbeam::tunnel::{self, CancellationToken, Exposer, Registry, Services};
+use tightbeam::tunnel::{
+    self, CancellationToken, Exposer, ManifestEntry, Posture, PublicUnsafeRequest, RawSource,
+    Registry, Services, TargetKind,
+};
 
 /// Expose a local service to peers.
 ///
@@ -26,9 +29,29 @@ pub struct ExposeCmd {
     /// expose local services as `name=addr` (bare `addr` = `default`)
     #[arg(required = true, value_name = "name=addr")]
     pub services: Vec<String>,
-    /// Expose to ANYONE, unauthenticated: the one deliberate opt-out from the signet.
+    /// open the WHOLE node to anyone, unauthenticated (the one opt-out from the signet)
+    // CLI-Architect round-3 (Ruling 2): tightbeam's `--public` stays a whole-node BOOLEAN (the library
+    // primitive, a `Gate::Open` BASE), NOT per-service like swoosh; the help states the whole-node scope so
+    // the layer difference is on the surface. The bang-suffix (`--public svc!`) was REJECTED.
     #[arg(long)]
     pub public: bool,
+    /// serve these raw-stream services (file:/fifo:/stdin:) to ANYONE, unauthenticated (comma-list)
+    // CLI-Architect round-3 (Rulings 1 & 2): KEEP the separate `--public-unsafe <names>` name list on both
+    // bins; `requires = "public"` is RULED for tightbeam ONLY (its `--public` is whole-node, so the unsafe set
+    // is inert without it, a silent "I thought I opened it" footgun that this turns into a parse error).
+    #[arg(
+        long,
+        value_name = "name",
+        value_delimiter = ',',
+        requires = "public",
+        long_help = "Serve these raw-stream services (file:/fifo:/stdin:) to ANYONE, unauthenticated: the \
+                     DISTINCT, louder opt-in for a source that has no auth of its own. Only meaningful with \
+                     --public (it names which raw streams the open gate may serve). --public alone refuses a \
+                     raw stream and points you here. The readiness banner names each resolved absolute path, \
+                     because `--public-unsafe logs` where `logs=file:~/.ssh/id_rsa` would hand that file's \
+                     bytes to anyone who reaches this node."
+    )]
+    pub public_unsafe: Vec<String>,
     /// Suppress the readiness banner (the node id, services, and gate). For unattended/CI use where the
     /// key must never land in a log; the tunnel still runs.
     #[arg(long)]
@@ -66,14 +89,25 @@ impl ExposeCmd {
             tunnel::resolve_gate(signet, denylist)?
         };
         // The core assembles the exposer over an empty registry (tightbeam ships no handler of its own), so a
-        // named-service scheme is refused at construction, and only raw forwards are served.
-        let exposer = Exposer::new(services.clone(), Registry::new(), gate)?;
+        // named-service scheme is refused at construction, and only raw forwards are served. The unsafe
+        // raw-stream opt-in set is proven here: a raw stream under the whole-node open gate is refused unless
+        // named in --public-unsafe. The bin is the ONLY place the flag string becomes the name set.
+        let exposer = Exposer::new(
+            services.clone(),
+            Registry::new(),
+            gate,
+            PublicUnsafeRequest::new(self.public_unsafe.clone()),
+        )?;
         if !self.quiet {
             expose_banner(
                 node.node_id(),
                 services.names(),
                 &gate_description(&self, signet),
             );
+            // The manifest declares which raw streams read Open (proven unsafe) and their resolved absolute
+            // source, so the loud warning names the exact bytes a stranger can read, not the operator's typed
+            // string. Empty for a run with no --public-unsafe.
+            expose_unsafe_warning(&exposer.manifest());
         }
         // This thin demo binary has no scheduled or remote teardown surface, so it holds no teardown
         // authority to hand out: it runs until the process is signalled (SIGINT), passing a token that is
@@ -102,6 +136,35 @@ fn expose_banner<'a>(node_id: NodeId, names: impl Iterator<Item = &'a str>, gate
         names.join(", "),
         gate
     );
+}
+
+/// Print the loud UNSAFE warning for every raw-stream service the open gate serves to anyone: one line per
+/// opened raw stream naming the exact bytes at risk (a resolved absolute path, or the piped stdin), sourced
+/// from the manifest's declared [`RawSource`] so it names what tightbeam resolved, never the operator's typed
+/// string. Nothing is printed when no raw stream is open (the common case). On STDERR with the rest of the
+/// banner, never stdout (the data path).
+// The per-stream gloss wording is CLI-Architect round-3 (Ratified-in-passing): `serving the raw bytes of
+// {abs} to anyone, no auth` / `serving this process's piped stdin to anyone, no auth`, and the absolute path
+// is NEVER truncated (the operator must SEE the exact bytes at risk). The `UNSAFE:` line prefix and one-line-
+// per-stream shape are this thin bin's presentation default (the round-3 banner ruling detailed swoosh's
+// grouped banner; the thin bin has no group table).
+fn expose_unsafe_warning(manifest: &[ManifestEntry]) {
+    for entry in manifest {
+        if entry.posture != Posture::Open || entry.kind != TargetKind::RawStream {
+            continue;
+        }
+        let risk = match &entry.raw_source {
+            Some(RawSource::Path(absolute)) => {
+                format!("serving the raw bytes of {absolute} to anyone, no auth")
+            }
+            Some(RawSource::Stdin) => {
+                "serving this process's piped stdin to anyone, no auth".to_owned()
+            }
+            // A raw stream always declares a raw source; guard defensively rather than panic.
+            None => "serving raw bytes to anyone, no auth".to_owned(),
+        };
+        eprintln!("UNSAFE: `{}` is {}", entry.name, risk);
+    }
 }
 
 /// A one-line description of the effective gate, for the readiness banner: trust made visible.

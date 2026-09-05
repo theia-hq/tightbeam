@@ -47,11 +47,16 @@ async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership()
             tokio::task::spawn_local(async move {
                 let services = Services::parse(&[format!("web={echo_addr}")]).unwrap();
                 let gate = tunnel::resolve_gate(Some(work_signet), empty_denylist().await).unwrap();
-                Exposer::new(services, tightbeam::tunnel::Registry::new(), gate)
-                    .unwrap()
-                    .run(&exposer, CancellationToken::new())
-                    .await
-                    .unwrap();
+                Exposer::new(
+                    services,
+                    tightbeam::tunnel::Registry::new(),
+                    gate,
+                    tightbeam::tunnel::PublicUnsafeRequest::none(),
+                )
+                .unwrap()
+                .run(&exposer, CancellationToken::new())
+                .await
+                .unwrap();
             });
 
             let work = Identity::from_secret(&WORK_SECRET).unwrap();

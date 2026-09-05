@@ -44,7 +44,7 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             tokio::task::spawn_local(async move {
                 let services = Services::parse(&[format!("web={echo_addr}")]).unwrap();
                 let gate = tunnel::resolve_gate(Some(signet), empty_denylist().await).unwrap();
-                Exposer::new(services, tightbeam::tunnel::Registry::new(), gate)
+                Exposer::new(services, tightbeam::tunnel::Registry::new(), gate, tightbeam::tunnel::PublicUnsafeRequest::none())
                     .unwrap()
                     .run(&exposer, CancellationToken::new())
                     .await
@@ -114,7 +114,7 @@ async fn a_refused_forward_fails_at_preflight_with_the_reason() {
             tokio::task::spawn_local(async move {
                 let services = Services::parse(&[format!("web={echo_addr}")]).unwrap();
                 let gate = tunnel::resolve_gate(Some(signet), empty_denylist().await).unwrap();
-                Exposer::new(services, tightbeam::tunnel::Registry::new(), gate)
+                Exposer::new(services, tightbeam::tunnel::Registry::new(), gate, tightbeam::tunnel::PublicUnsafeRequest::none())
                     .unwrap()
                     .run(&exposer, CancellationToken::new())
                     .await

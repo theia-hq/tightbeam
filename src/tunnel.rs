@@ -206,15 +206,22 @@ impl Services {
     /// [`Gated`](Posture::Gated) behind a member badge. Not the handler's compile-time ceiling. A pure read
     /// over the parsed services, no mutable state.
     ///
-    /// `public` is the raw operator request (the display side reads what was ASKED); the security wall is
-    /// [`Exposer::with_public`], which proves every requested name open-safe before the node serves. So a
-    /// catalog naming a service `open` is only ever served once that proof passed for the same request.
-    pub fn catalog(&self, gate: &Gate, public: &PublicRequest) -> ServiceCatalog {
+    /// `public` and `public_unsafe` are the raw operator requests (the display side reads what was ASKED);
+    /// the security walls are [`Exposer::with_public`] (safe) and [`Exposer::new`]/[`Services::prove_unsafe`]
+    /// (unsafe raw streams), which prove every requested name before the node serves. So a catalog naming a
+    /// service `open` is only ever served once the matching proof passed for the same request. An unsafe-open
+    /// raw stream IS open to anyone, so it reads `Open` on the wire too.
+    pub fn catalog(
+        &self,
+        gate: &Gate,
+        public: &PublicRequest,
+        public_unsafe: &PublicUnsafeRequest,
+    ) -> ServiceCatalog {
         let node_open = matches!(gate, Gate::Open);
         let mut entries: Vec<ServiceEntry> = self
             .names()
             .map(|name| ServiceEntry {
-                posture: if node_open || public.contains(name) {
+                posture: if node_open || public.contains(name) || public_unsafe.contains(name) {
                     Posture::Open
                 } else {
                     Posture::Gated
@@ -252,6 +259,49 @@ impl Services {
             Target::RawStream(_) => Some(name.as_str()),
             Target::Handler(_) | Target::Forward(_) => None,
         })
+    }
+
+    /// Prove an UNSAFE raw-stream opt-in set: this is the wall that turns a raw [`PublicUnsafeRequest`] into
+    /// the exposer's proven [`PublicServices`] overlay for [`Exposer::new`]. Every requested name must (1) be
+    /// an EXACT served name (a typo or a name the node does not serve bails with the served list) AND (2)
+    /// resolve to a [`Target::RawStream`] (a `file:`/`fifo:`/`stdin:` source with no auth of its own).
+    ///
+    /// A name that resolves to a handler or a forward is a TEACHING REDIRECT, never silently opened: the
+    /// unsafe overlay is ONLY for raw byte sources, so a legitimate service named here is refused with a
+    /// message pointing at the safe public overlay ([`with_public`](Exposer::with_public)). This is the
+    /// disjoint-token partition (delib-39): the two overlays never fold, so crossing them teaches rather than
+    /// opens. A survivor set freezes into the overlay [`admit`] consults. The proof reads THROUGH each
+    /// target, matched by served name, so an alias can never open a raw stream by naming it.
+    fn prove_unsafe(&self, requested: PublicUnsafeRequest) -> eyre::Result<PublicServices> {
+        let PublicUnsafeRequest(names) = requested;
+        let Self(services) = self;
+        let mut proven = HashSet::with_capacity(names.len());
+        for name in names {
+            match services.get(&name) {
+                None => {
+                    let mut served: Vec<&str> = services.keys().map(String::as_str).collect();
+                    served.sort_unstable();
+                    eyre::bail!(
+                        "no service named `{name}` to open; this node serves: {}",
+                        served.join(", ")
+                    );
+                }
+                // Crossing the token: the unsafe overlay is ONLY for raw byte sources. A handler or a forward
+                // named here is redirected to the SAFE public overlay, never silently opened, never leaking a
+                // marker type name. STRING B, CLI-Architect round-3, in its library-PURE form: the layering
+                // gate forbids a library naming a consumer flag, so this speaks the concept (the public
+                // overlay) and each consumer bin's --help names the exact flag. See the report FLAG to
+                // CLI-Architect/Style-Warden on the flag-named-vs-conceptual branch.
+                Some(Target::Handler(_)) | Some(Target::Forward(_)) => eyre::bail!(
+                    "`{name}` is not a raw byte source, so the unsafe raw-stream set will not open it; a handler \
+                     or a forward is opened to anyone through the public set instead"
+                ),
+                Some(Target::RawStream(_)) => {
+                    proven.insert(name);
+                }
+            }
+        }
+        Ok(PublicServices(proven))
     }
 }
 
@@ -328,6 +378,26 @@ pub struct ManifestEntry {
     pub kind: TargetKind,
     /// Whether its handler declared itself an unmetered amplifier (a caveat the banner narrates when open).
     pub amplifier: bool,
+    /// For a raw-stream service, the source a banner names in its unsafe warning: the operator's path made
+    /// ABSOLUTE (lexically, via [`std::path::absolute`] -- no FS access, no symlink follow, no existence
+    /// requirement, so a not-yet-created `fifo:` still renders), or the piped-stdin marker. [`None`] for a
+    /// handler or a forward (no raw source to warn about). Declared by tightbeam so the banner renders a
+    /// resolved fact, never re-derives a path from the operator's typed string.
+    pub raw_source: Option<RawSource>,
+}
+
+/// The resolved source of a raw-stream service, as a caller's banner names it in the loud unsafe warning
+/// (which exact bytes reach a stranger when this stream is open). Declared by tightbeam, which OWNS raw-stream
+/// resolution, so a consumer renders a resolved fact rather than re-deriving a path from the operator's typed
+/// string. An enum, not a bare string, so `stdin:` (no path, the risk is this process's piped input) and a
+/// path source are distinct cases a renderer must handle, never conflated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawSource {
+    /// A `file:`/`fifo:` source: the operator's path made absolute lexically ([`std::path::absolute`], no FS
+    /// access, no symlink follow), so the warning names exactly which path's bytes are at risk.
+    Path(String),
+    /// A `stdin:` source: no path, so the exfil risk is this process's own piped standard input.
+    Stdin,
 }
 
 /// The services a node SERVES, each with its reach posture: the answer the gated `control.services` read
@@ -632,6 +702,46 @@ impl PublicRequest {
     }
 }
 
+/// The raw, UNVALIDATED set of raw-stream service names an operator asked to serve to strangers
+/// unauthenticated (however an embedder surfaces that request), before [`Exposer::new`] proves each one an
+/// exposed [`Target::RawStream`]. Sibling of [`PublicRequest`], kept DISTINCT from the proven
+/// [`PublicServices`] so an unproven name can never reach admission: the only way to a [`PublicServices`] is
+/// through [`Services::prove_unsafe`], so "opened a name the node does not serve / a handler / a forward as an
+/// unsafe raw stream" is a build-time bail, not a silently-open service.
+///
+/// DISJOINT from [`PublicRequest`] on purpose: a safe public overlay opens a legitimate service (a handler or
+/// a forward the operator stood up), an UNSAFE overlay opens a raw byte source with no auth of its own. The
+/// two never fold, so the louder opt-in stays a distinct, deliberate thing the operator cannot type by
+/// accident.
+#[derive(Debug, Clone, Default)]
+pub struct PublicUnsafeRequest(Vec<String>);
+
+impl PublicUnsafeRequest {
+    /// An empty request: no raw stream is served to strangers (every raw stream stays gated).
+    pub fn none() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Build a request from the operator's raw unsafe-open names, verbatim (no validation here: this is the
+    /// UNPROVEN side of parse-don't-validate; [`Services::prove_unsafe`], run by [`Exposer::new`], is the wall).
+    pub fn new(names: impl IntoIterator<Item = String>) -> Self {
+        Self(names.into_iter().collect())
+    }
+
+    /// Whether the operator requested no raw stream served to strangers.
+    pub fn is_empty(&self) -> bool {
+        let Self(names) = self;
+        names.is_empty()
+    }
+
+    /// Whether `name` was requested unsafe-open, for a display read (the `control.services` catalog). This
+    /// reads the raw request, never the proof, so it is a DISPLAY predicate only, never an admission decision.
+    pub fn contains(&self, name: &str) -> bool {
+        let Self(names) = self;
+        names.iter().any(|requested| requested == name)
+    }
+}
+
 /// The PROVEN-open set of served service names an [`Exposer`] admits any reaching peer to: every member was
 /// validated at [`Exposer::with_public`] against the served set AND its target's [`open_safe`](Target::open_safe)
 /// posture, so a member is, by construction, an exposed, open-safe service. Membership is the ONLY fast/open
@@ -658,21 +768,46 @@ pub struct Exposer {
     services: Services,
     registry: Arc<Registry>,
     gate: Gate,
+    /// The safe public overlay, proven by [`with_public`](Exposer::with_public): legitimate services (a
+    /// handler or a forward) opened to any reaching peer.
     public: PublicServices,
+    /// The UNSAFE raw-stream overlay, proven by [`new`](Exposer::new): raw byte sources (`file:`/`fifo:`/
+    /// `stdin:`) with no auth of their own, knowingly served to any reaching peer. Kept DISJOINT from
+    /// `public` so the two proof walls write disjoint state (no clobber), the toggle interlock (delib-34) can
+    /// read `!public_unsafe.is_empty()` trivially, and the on-thesis reading stays legible: `public` =
+    /// "opened a legitimate service", `public_unsafe` = "knowingly serves raw bytes with no auth".
+    public_unsafe: PublicServices,
 }
 
 impl Exposer {
-    /// Assemble an exposer from the parsed services, the caller-injected handler registry, and the node BASE
-    /// gate, enforcing two invariants at the door: every named handler is actually registered (a typo or an
-    /// unbuilt feature fails HERE, not at dial time), and a handler with no auth of its own (a keyless shell)
-    /// may not sit behind a node-wide [`Gate::Open`] BASE, which would hand it to anyone who reaches the node.
+    /// Assemble an exposer from the parsed services, the caller-injected handler registry, the node BASE
+    /// gate, and the operator's UNSAFE raw-stream opt-in set, enforcing the door interlocks: every named
+    /// handler is actually registered (a typo or an unbuilt feature fails HERE, not at dial time); a handler
+    /// with no auth of its own (a keyless shell) may not sit behind a node-wide [`Gate::Open`] BASE; and a
+    /// raw-stream source under an open BASE is refused UNLESS the operator knowingly opted it into
+    /// `public_unsafe` (proven here into the disjoint unsafe overlay).
     ///
-    /// No service is opened per-service by this constructor: the exposer starts with an EMPTY public overlay
-    /// (every service faces the base gate). A caller opens individual services with [`with_public`](Self::with_public),
-    /// which proves each requested name exposed and open-safe. So `Exposer::new(..)` alone is a fully-gated
-    /// node (or, over a [`Gate::Open`] base, a fully-open one), and the per-service overlay is a deliberate
-    /// second step.
-    pub fn new(services: Services, registry: Registry, gate: Gate) -> eyre::Result<Self> {
+    /// The two raw-stream interlocks stay DISJOINT (delib-37): the keyless-handler refusal reads a compile-time
+    /// marker (`type Public`), while the raw-stream-unsafe refusal is a RUNTIME opt-in guard (the danger
+    /// depends on a runtime path value no type can see), so the two are never folded onto one mechanism. The
+    /// unsafe set enters HERE, at [`new`](Self::new), rather than a `with_public`-style builder, because the
+    /// whole-node-open door lives here and a builder chained after `new` could not un-fire a bail `new` already
+    /// raised; co-locating the interlocks at one door is what keeps them legible.
+    ///
+    /// No SAFE service is opened per-service by this constructor: the exposer starts with an EMPTY safe
+    /// overlay (every handler/forward faces the base gate). A caller opens individual legitimate services with
+    /// [`with_public`](Self::with_public), which proves each requested name exposed and open-safe. So
+    /// `Exposer::new(services, registry, gate, PublicUnsafeRequest::none())` alone is a fully-gated node (or,
+    /// over a [`Gate::Open`] base, a fully-open one), and the safe per-service overlay is a deliberate second
+    /// step.
+    pub fn new(
+        services: Services,
+        registry: Registry,
+        gate: Gate,
+        public_unsafe: PublicUnsafeRequest,
+    ) -> eyre::Result<Self> {
+        // Interlock 1: every named handler is registered, and a keyless handler (`type Public = Never`) may
+        // not sit behind an open BASE. Reads the erased compile-time `OPEN_SAFE` marker.
         for scheme in services.handler_schemes() {
             let Some(handler) = registry.get(scheme) else {
                 eyre::bail!(
@@ -681,33 +816,56 @@ impl Exposer {
                 );
             };
             if matches!(gate, Gate::Open) && !handler.open_safe() {
+                // STRING C (CLI-Architect round-3), `{scheme}` variant: a keyless shell has NO safe way to be
+                // opened, so it hard-refuses with no redirect (unlike a raw stream, which STRING A points at
+                // the unsafe raw-stream set).
                 eyre::bail!(
-                    "gate the `{scheme}:` service instead of opening it: it has no legitimate public use, \
-                     so a public gate would hand it to anyone who reaches this node"
+                    "`{scheme}` has no legitimate public use: a keyless shell (or an alias of one) would hand a \
+                     shell to anyone who reaches this node. keep it family-gated; drop it from the public set"
                 );
             }
         }
-        // A raw-stream source (`file:`/`fifo:`/`stdin:`) also has no auth of its own: under an open gate it
-        // would serve a chosen path's bytes (or the piped stdin) to anyone, so a public gate over a
-        // `file:<secret>` or a `stdin:` source would exfil it. Refuse it at the same door that refuses a
-        // public shell. A raw forward (`host:port`/`unix:`) stays open-able: it is a service the operator
-        // deliberately stood up, not a bare file path or a piped stream one keystroke from a key.
-        //
-        // These two bails guard the node-wide-open BASE gate (a tightbeam primitive any consumer may pass).
-        // The per-service public OVERLAY takes the SAME wall, per service, in [`with_public`].
+        // PROVE the unsafe set (parse-don't-validate): every named opt-in must be an EXACT served
+        // `Target::RawStream`; a name the node does not serve, or a handler/forward, is a teaching redirect,
+        // never a silently-open service. The survivors freeze into the disjoint `public_unsafe` overlay.
+        let proven_unsafe = services.prove_unsafe(public_unsafe)?;
+        // Interlock 2 (raw-stream door, RELAXED per-name): a raw-stream source (`file:`/`fifo:`/`stdin:`) has
+        // no auth of its own, so under a node-wide open BASE it would serve a chosen path's bytes (or the
+        // piped stdin) to anyone; a `file:<secret>` or `stdin:` source would exfil it. Refuse it at the same
+        // door that refuses a keyless shell, UNLESS the operator knowingly opted this exact name into the
+        // unsafe overlay. A raw forward (`host:port`/`unix:`) is not refused: it is a service the operator
+        // deliberately stood up, not a bare file path one keystroke from a key. This guards the node-wide-open
+        // BASE gate; the per-service SAFE overlay takes its own wall in [`with_public`].
         if matches!(gate, Gate::Open)
-            && let Some(name) = services.raw_stream_names().next()
+            && let Some(name) = services
+                .raw_stream_names()
+                .find(|name| !proven_unsafe.contains(name))
         {
+            // STRING A (CLI-Architect round-3), library-PURE form: the ONE unified raw-stream-under-a-public-
+            // gate refusal, shared byte-for-byte with the per-service `with_public` door below (differing only
+            // in `{name}`). It REDIRECTS to the unsafe raw-stream set (a raw stream is now deliberately
+            // openable), not a flat refusal; the exact flag token is named by each consumer bin's --help
+            // (the layering gate forbids a library naming a consumer flag).
             eyre::bail!(
-                "a raw-stream service (`{name}`, a file:/fifo:/stdin: source) has no auth of its own and \
-                 must be gated; a public gate would serve its bytes to anyone who reaches this node"
+                "`{name}` is a raw byte source (file:/fifo:/stdin:) with no auth of its own, so a public gate \
+                 will not serve it. to serve its raw bytes to anyone, name it in the unsafe raw-stream set; \
+                 otherwise gate it or drop it from the public set"
             );
         }
+        // Interlock 3 (toggle mutual-exclusion): a DESIGN-LOCK with no operand today. delib-34's live-toggle
+        // set (`ActiveSet`/`--toggleable`) is UNBUILT, so there is no second set to refuse; inventing a toggle
+        // field now purely to refuse it would be machinery for a case that cannot occur yet. When the toggle
+        // allowlist lands it enters THIS constructor beside `public_unsafe` and adds ONE bail here:
+        //   `if !proven_unsafe.is_empty() && !toggleable.is_empty() { eyre::bail!(...) }`
+        // refusing their co-presence by construction (an unauthenticated toggle must never re-arm a raw-byte
+        // exfil remotely). Recorded as a binding acceptance criterion for the delib-34 build; do NOT add a
+        // toggle field in this change.
         Ok(Self {
             services,
             registry: Arc::new(registry),
             gate,
             public: PublicServices::default(),
+            public_unsafe: proven_unsafe,
         })
     }
 
@@ -737,14 +895,28 @@ impl Exposer {
                     served.join(", ")
                 );
             };
-            if !target.open_safe(&self.registry) {
-                eyre::bail!(
-                    "keep `{name}` gated, not public: it has no legitimate public use (a keyless shell, or \
-                     a raw file/fifo/stdin source with no auth of its own), so opening it would hand it to \
-                     anyone who reaches this node"
-                );
+            match target {
+                // A raw stream named in the SAFE overlay is a teaching REDIRECT, not a flat refusal: the safe
+                // overlay never opens a raw byte source (`open_safe` stays `false` for it), but the operator
+                // CAN serve its bytes knowingly through the DISTINCT unsafe overlay. STRING A (CLI-Architect
+                // round-3), byte-for-byte the SAME string as the whole-node door above: one condition, one
+                // string, both bins.
+                Target::RawStream(_) => eyre::bail!(
+                    "`{name}` is a raw byte source (file:/fifo:/stdin:) with no auth of its own, so a public \
+                     gate will not serve it. to serve its raw bytes to anyone, name it in the unsafe raw-stream \
+                     set; otherwise gate it or drop it from the public set"
+                ),
+                // A keyless shell or an aliased shell is a HARD no: it has no legitimate public use and no
+                // redirect exists (unlike a raw stream). STRING C (CLI-Architect round-3), `{name}` variant.
+                // Never leaks a marker type name.
+                _ if !target.open_safe(&self.registry) => eyre::bail!(
+                    "`{name}` has no legitimate public use: a keyless shell (or an alias of one) would hand a \
+                     shell to anyone who reaches this node. keep it family-gated; drop it from the public set"
+                ),
+                _ => {
+                    proven.insert(name);
+                }
             }
-            proven.insert(name);
         }
         self.public = PublicServices(proven);
         Ok(self)
@@ -763,14 +935,18 @@ impl Exposer {
         let mut entries: Vec<ManifestEntry> = services
             .iter()
             .map(|(name, target)| {
-                // The PROVEN overlay is the posture source (what a dialer actually faces), the same rule the
+                // The PROVEN overlays are the posture source (what a dialer actually faces), the same rule the
                 // wire catalog reads off the raw request: a name is open iff the node gate is open OR it was
-                // proven into the public overlay, else it is gated behind a member badge.
-                let posture = if node_open || self.public.contains(name) {
-                    Posture::Open
-                } else {
-                    Posture::Gated
-                };
+                // proven into the SAFE public overlay OR into the UNSAFE raw-stream overlay, else it is gated
+                // behind a member badge. Unioning `public_unsafe` here is what finally lets an opened raw
+                // stream read `Open` and reach a consumer's loudest banner tier.
+                let posture =
+                    if node_open || self.public.contains(name) || self.public_unsafe.contains(name)
+                    {
+                        Posture::Open
+                    } else {
+                        Posture::Gated
+                    };
                 // The amplifier caveat is handler-declared, so it is resolved THROUGH the target's handler,
                 // never a name match: only a registered handler can be an amplifier; a forward or a raw
                 // stream never is (they carry no responder the handler owns).
@@ -781,11 +957,19 @@ impl Exposer {
                         .is_some_and(|handler| handler.amplifier()),
                     Target::Forward(_) | Target::RawStream(_) => false,
                 };
+                // The raw source a banner names in its unsafe warning is tightbeam's to declare (it owns
+                // raw-stream resolution): a raw stream carries its resolved absolute path / stdin marker, a
+                // handler or a forward has no raw source to warn about.
+                let raw_source = match target {
+                    Target::RawStream(stream) => Some(stream.raw_source()),
+                    Target::Handler(_) | Target::Forward(_) => None,
+                };
                 ManifestEntry {
                     name: name.clone(),
                     posture,
                     kind: target.kind(),
                     amplifier,
+                    raw_source,
                 }
             })
             .collect();
@@ -817,6 +1001,7 @@ impl Exposer {
             registry,
             gate,
             public,
+            public_unsafe,
         } = self;
         // Cap concurrent raw-stream opens across the whole node (all sessions share this one semaphore) as
         // cheap defense-in-depth: the nonblocking open cannot park a thread, so this bounds the fds held
@@ -828,6 +1013,7 @@ impl Exposer {
         let serving = Arc::new(Serving {
             gate,
             public,
+            public_unsafe,
             services,
             registry,
             raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
@@ -865,12 +1051,14 @@ impl Exposer {
 }
 
 /// The per-node shared state every accepted session and inbound stream is served under: the node BASE
-/// [`Gate`], the per-service [`PublicServices`] overlay it composes with, the parsed [`Services`], the
-/// injected handler [`Registry`], and the raw-stream open permit pool. Assembled once in [`Exposer::run`]
-/// and shared by one `Arc` across every session/stream, so a serving future carries a single handle.
+/// [`Gate`], the two disjoint [`PublicServices`] overlays it composes with (the SAFE `public` and the UNSAFE
+/// raw-stream `public_unsafe`), the parsed [`Services`], the injected handler [`Registry`], and the raw-stream
+/// open permit pool. Assembled once in [`Exposer::run`] and shared by one `Arc` across every session/stream,
+/// so a serving future carries a single handle.
 struct Serving {
     gate: Gate,
     public: PublicServices,
+    public_unsafe: PublicServices,
     services: Services,
     registry: Arc<Registry>,
     raw_stream_opens: Semaphore,
@@ -933,6 +1121,7 @@ where
     let Serving {
         gate,
         public,
+        public_unsafe,
         services,
         registry,
         raw_stream_opens,
@@ -964,6 +1153,7 @@ where
     let admitted = match admit(
         gate,
         public,
+        public_unsafe,
         peer,
         request.capability.as_deref(),
         request.membership.as_deref(),
@@ -1070,10 +1260,11 @@ where
     Ok(())
 }
 
-/// Rule on a request under the node's per-service admission: the `public` overlay composed with the `base`
-/// family gate, returning the [`Admitted`] witness on success or a DISTINGUISHING refusal string for the
-/// node's OWN logs. A service the operator opened (a `public` member) admits any reaching peer; every other
-/// service faces the `base` gate. The witness is required to reach a service handler, so "authorize before
+/// Rule on a request under the node's per-service admission: the two disjoint open overlays (`public`, the
+/// safe one, and `public_unsafe`, the unsafe raw-stream one) composed with the `base` family gate, returning
+/// the [`Admitted`] witness on success or a DISTINGUISHING refusal string for the node's OWN logs. A service
+/// the operator opened (a member of EITHER overlay) admits any reaching peer; every other service faces the
+/// `base` gate. The witness is required to reach a service handler, so "authorize before
 /// serve" is a compile-time precondition (see [`nauthy::Admitted`]). The reason returned here NEVER crosses
 /// the wire (the caller sends [`UNIFORM_REFUSAL`] to a not-admitted dialer); it exists only so the operator
 /// can see WHY on their own `tracing` output. Distinguishing missing/not-granted/revoked to the wire would
@@ -1081,18 +1272,22 @@ where
 fn admit(
     base: &Gate,
     public: &PublicServices,
+    public_unsafe: &PublicServices,
     peer: NodeId,
     capability: Option<&str>,
     membership: Option<&str>,
     service: &Service,
 ) -> Result<Admitted, String> {
-    // The ONLY branch admission takes on the service NAME is this public-set membership test, and it runs
-    // BEFORE any dispatch (the `services.get` in `serve_request` is reached only past this admit). A HIT is
-    // the sole fast/open path: the service was proven open at `with_public`, so this admits with no cap
-    // parse and no crypto, minting the witness through nauthy's OWN `Gate::Open` primitive (tightbeam picks
-    // WHICH nauthy primitive per service; it never mints authority itself). A public member is by
-    // construction an exposed served name, so the later dispatch always resolves it.
-    if public.contains(service.as_str()) {
+    // The ONLY branch admission takes on the service NAME is this open-set membership test, and it runs
+    // BEFORE any dispatch (the `services.get` in `serve_request` is reached only past this admit). A HIT on
+    // EITHER overlay is the sole fast/open path: the service was proven open at `with_public` (safe) or at
+    // `Exposer::new` (an unsafe raw stream), so this admits with no cap parse and no crypto, minting the
+    // witness through nauthy's OWN `Gate::Open` primitive (tightbeam picks WHICH nauthy primitive per
+    // service; it never mints authority itself). Both overlays hold, by construction, exposed served names,
+    // so the later dispatch always resolves the name. Testing a second already-public set adds no oracle: a
+    // hit on either reveals only the already-public fact that the service admits anyone; a miss on both takes
+    // the identical family path below.
+    if public.contains(service.as_str()) || public_unsafe.contains(service.as_str()) {
         // An open service needs no badge, so the signet-bound membership slot is irrelevant on this path.
         return mint(Gate::Open.admit_witnessed(peer.verify_key(), None, None, service));
     }
@@ -1653,8 +1848,9 @@ mod tests {
 
     use super::{
         BoxRead, BoxWrite, Exposer, Handler, Posture, PublicRequest, PublicServices,
-        RAW_STREAM_OPEN_PERMITS, Registry, Semaphore, ServiceCatalog, ServiceEntry, Services,
-        Target, resolve_single_service, serve_request,
+        PublicUnsafeRequest, RAW_STREAM_OPEN_PERMITS, RawSource, Registry, Semaphore,
+        ServiceCatalog, ServiceEntry, Services, Target, TargetKind, resolve_single_service,
+        serve_request,
     };
     use crate::open_policy::{Never, OptIn};
     use crate::raw_stream::RawStream;
@@ -1667,7 +1863,7 @@ mod tests {
         let signet = nauthy::Identity::from_secret(&[7u8; 32]).expect("valid secret");
         let denylist = nauthy::Denylist::empty(std::env::temp_dir().join("tb-catalog-gated"));
         let gate = Gate::family(signet.node_id(), denylist);
-        let catalog = services.catalog(&gate, &PublicRequest::none());
+        let catalog = services.catalog(&gate, &PublicRequest::none(), &PublicUnsafeRequest::none());
 
         let names: Vec<&str> = catalog.entries().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, ["a", "b", "c"], "entries are name-sorted");
@@ -1687,7 +1883,11 @@ mod tests {
     #[test]
     fn an_open_catalog_reports_open() {
         let services = services(&["a=127.0.0.1:80", "b=handler:"]);
-        let catalog = services.catalog(&Gate::Open, &PublicRequest::none());
+        let catalog = services.catalog(
+            &Gate::Open,
+            &PublicRequest::none(),
+            &PublicUnsafeRequest::none(),
+        );
         assert!(
             catalog
                 .entries()
@@ -1788,10 +1988,15 @@ mod tests {
     fn the_manifest_declares_posture_kind_and_amplifier() {
         let services = services(&["fast=amp:", "quiet=amp:", "web=127.0.0.1:80"]);
         let registry = Registry::new().with("amp", AmplifierNoop);
-        let exposer = Exposer::new(services, registry, family_gate("manifest"))
-            .expect("assembles")
-            .with_public(PublicRequest::new(["fast".to_owned()]))
-            .expect("`fast` is an OptIn amplifier, so it opens");
+        let exposer = Exposer::new(
+            services,
+            registry,
+            family_gate("manifest"),
+            PublicUnsafeRequest::none(),
+        )
+        .expect("assembles")
+        .with_public(PublicRequest::new(["fast".to_owned()]))
+        .expect("`fast` is an OptIn amplifier, so it opens");
 
         let manifest = exposer.manifest();
         let names: Vec<&str> = manifest.iter().map(|e| e.name.as_str()).collect();
@@ -1959,7 +2164,13 @@ mod tests {
         // `+lossy` cannot reopen the delib-05/11 exfil gate.
         let lossy = services(&["cam=stdin:+lossy"]);
         assert!(
-            super::Exposer::new(lossy, super::Registry::new(), Gate::Open).is_err(),
+            super::Exposer::new(
+                lossy,
+                super::Registry::new(),
+                Gate::Open,
+                PublicUnsafeRequest::none()
+            )
+            .is_err(),
             "an open gate over a `+lossy` raw-stream source must be refused"
         );
     }
@@ -1990,7 +2201,7 @@ mod tests {
         let gated = services(&["a=handler:"]);
         let registry = super::Registry::new().with("handler", GatedNoop);
         assert!(
-            super::Exposer::new(gated, registry, Gate::Open).is_err(),
+            super::Exposer::new(gated, registry, Gate::Open, PublicUnsafeRequest::none()).is_err(),
             "an open gate over a gated-only handler must be refused"
         );
         // The same handler behind a real gate is fine; only the open-gate pairing is refused. A family gate
@@ -1998,7 +2209,13 @@ mod tests {
         // suffices, since a raw forward needs no handler) under the open gate.
         let web = services(&["web=127.0.0.1:80"]);
         assert!(
-            super::Exposer::new(web, super::Registry::new(), Gate::Open).is_ok(),
+            super::Exposer::new(
+                web,
+                super::Registry::new(),
+                Gate::Open,
+                PublicUnsafeRequest::none()
+            )
+            .is_ok(),
             "an open gate over a plain forward is allowed"
         );
     }
@@ -2006,19 +2223,151 @@ mod tests {
     #[test]
     fn an_exposer_refuses_a_public_raw_stream() {
         // A raw-stream source (`file:`/`fifo:`) has no auth of its own: under an open gate it would serve a
-        // chosen path's bytes to anyone, so a public gate over `file:<secret>` would exfil it. Refused at the same door
-        // as a public shell.
+        // chosen path's bytes to anyone, so a public gate over `file:<secret>` would exfil it. Refused at the
+        // same door as a public shell UNLESS the operator knowingly names it unsafe (that path is covered by
+        // `an_exposer_admits_a_public_raw_stream_named_in_public_unsafe`). With an EMPTY unsafe set it bails.
         let secret = services(&["leak=file:/etc/hosts"]);
         assert!(
-            super::Exposer::new(secret, super::Registry::new(), Gate::Open).is_err(),
-            "an open gate over a file:/fifo: source must be refused"
+            super::Exposer::new(
+                secret,
+                super::Registry::new(),
+                Gate::Open,
+                PublicUnsafeRequest::none()
+            )
+            .is_err(),
+            "an open gate over a file:/fifo: source with no unsafe opt-in must be refused"
         );
         // A raw forward the operator deliberately stood up (host:port) stays open-able; only the no-auth
         // raw-stream source is refused under the open gate.
         let web = services(&["web=127.0.0.1:80"]);
         assert!(
-            super::Exposer::new(web, super::Registry::new(), Gate::Open).is_ok(),
+            super::Exposer::new(
+                web,
+                super::Registry::new(),
+                Gate::Open,
+                PublicUnsafeRequest::none()
+            )
+            .is_ok(),
             "an open gate over a host:port forward is still allowed"
+        );
+    }
+
+    #[test]
+    fn an_exposer_admits_a_public_raw_stream_named_in_public_unsafe() {
+        // The escape hatch: an open BASE gate over a `file:` source that the operator KNOWINGLY named in the
+        // unsafe opt-in set BUILDS (the door is relaxed per-name), and the manifest reports that name Open, a
+        // RawStream, carrying its resolved absolute source for the banner warning.
+        let path = std::env::temp_dir().join("tb-public-unsafe-admits");
+        let entry = format!("logs=file:{}", path.display());
+        let services = services(&[&entry]);
+        let exposer = super::Exposer::new(
+            services,
+            super::Registry::new(),
+            Gate::Open,
+            PublicUnsafeRequest::new(["logs".to_owned()]),
+        )
+        .expect("a raw stream named in the unsafe set builds under an open gate");
+
+        let manifest = exposer.manifest();
+        let logs = manifest
+            .iter()
+            .find(|entry| entry.name == "logs")
+            .expect("`logs` is in the manifest");
+        assert_eq!(
+            logs.posture,
+            Posture::Open,
+            "the unsafe-open raw stream reads Open"
+        );
+        assert_eq!(logs.kind, TargetKind::RawStream, "it is a raw stream");
+        let Some(RawSource::Path(absolute)) = &logs.raw_source else {
+            panic!("a file: raw stream declares a resolved absolute Path source: {logs:?}");
+        };
+        assert!(
+            std::path::Path::new(absolute).is_absolute(),
+            "the banner source is an absolute path (std::path::absolute), got {absolute:?}"
+        );
+    }
+
+    #[test]
+    fn public_unsafe_naming_a_handler_or_forward_is_redirected() {
+        // The disjoint-token partition: the unsafe overlay is ONLY for raw streams. A handler or a forward
+        // named in it is a teaching redirect to the public overlay (STRING B, CLI-Architect round-3), never silently
+        // opened.
+        let handler = services(&["ping=ping:"]);
+        let registry = super::Registry::new().with("ping", OpenNoop);
+        let Err(via_handler) = super::Exposer::new(
+            handler,
+            registry,
+            family_gate("unsafe-handler"),
+            PublicUnsafeRequest::new(["ping".to_owned()]),
+        ) else {
+            panic!("a handler named unsafe must be redirected, not opened");
+        };
+        assert!(
+            via_handler.to_string().contains("not a raw byte source")
+                && via_handler.to_string().contains("public set"),
+            "a handler named unsafe is redirected to the public overlay: {via_handler}"
+        );
+
+        let forward = services(&["web=127.0.0.1:80"]);
+        let Err(via_forward) = super::Exposer::new(
+            forward,
+            super::Registry::new(),
+            family_gate("unsafe-forward"),
+            PublicUnsafeRequest::new(["web".to_owned()]),
+        ) else {
+            panic!("a forward named unsafe must be redirected, not opened");
+        };
+        assert!(
+            via_forward.to_string().contains("not a raw byte source")
+                && via_forward.to_string().contains("public set"),
+            "a forward named unsafe is redirected to the public overlay: {via_forward}"
+        );
+    }
+
+    #[test]
+    fn public_unsafe_naming_an_unserved_name_is_a_parse_error() {
+        // A name the node does not serve, named unsafe, bails with the served list (parse-don't-validate at
+        // the door), never silently opening nothing.
+        let services = services(&["cam=stdin:"]);
+        let Err(error) = super::Exposer::new(
+            services,
+            super::Registry::new(),
+            family_gate("unsafe-unserved"),
+            PublicUnsafeRequest::new(["nope".to_owned()]),
+        ) else {
+            panic!("an unserved name in the unsafe set must bail");
+        };
+        assert!(
+            error.to_string().contains("no service named"),
+            "an unserved unsafe name is refused with the served list: {error}"
+        );
+    }
+
+    /// DESIGN-LOCK marker (delib-34, no operand today): the toggle mutual-exclusion interlock is OWED but not
+    /// yet buildable. delib-34's live-toggle set (`ActiveSet`/`--toggleable`) is unbuilt, so there is no
+    /// second set for `Exposer::new` to refuse against a `public_unsafe` set; inventing a toggle field now
+    /// purely to refuse it would be machinery for a case that cannot occur yet. This test records the
+    /// acceptance criterion for the delib-34 build: when the toggle allowlist lands it enters `Exposer::new`
+    /// beside `public_unsafe` and adds ONE bail refusing their co-presence
+    /// (`!proven_unsafe.is_empty() && !toggleable.is_empty()`), so an unauthenticated toggle can never re-arm
+    /// a raw-byte exfil remotely. TODO(delib-34): replace this marker with the live construction-fail test
+    /// once the toggle set exists. Today, an unsafe set alone builds (no toggle operand to conflict with).
+    #[test]
+    fn public_unsafe_alone_builds_and_the_toggle_interlock_is_a_design_lock_owed_to_delib_34() {
+        let path = std::env::temp_dir().join("tb-public-unsafe-designlock");
+        let entry = format!("logs=file:{}", path.display());
+        let services = services(&[&entry]);
+        // No toggle operand exists today, so an unsafe set on its own is fully legal.
+        assert!(
+            super::Exposer::new(
+                services,
+                super::Registry::new(),
+                Gate::Open,
+                PublicUnsafeRequest::new(["logs".to_owned()]),
+            )
+            .is_ok(),
+            "an unsafe raw-stream set alone builds; the toggle mutual-exclusion is owed to the delib-34 build"
         );
     }
 
@@ -2041,8 +2390,14 @@ mod tests {
         // a public gate over `stdin:` would exfil them. Refused at the same door as a public shell or a public file:.
         let piped = services(&["cam=stdin:"]);
         assert!(
-            super::Exposer::new(piped, super::Registry::new(), Gate::Open).is_err(),
-            "an open gate over a stdin: source must be refused"
+            super::Exposer::new(
+                piped,
+                super::Registry::new(),
+                Gate::Open,
+                PublicUnsafeRequest::none()
+            )
+            .is_err(),
+            "an open gate over a stdin: source with no unsafe opt-in must be refused"
         );
     }
 
@@ -2071,6 +2426,7 @@ mod tests {
                     registry: std::sync::Arc::new(Registry::new()),
                     gate: Gate::Open,
                     public: PublicServices::default(),
+                    public_unsafe: PublicServices::default(),
                 };
                 tokio::task::spawn_local(async move {
                     exposer
@@ -2113,6 +2469,7 @@ mod tests {
             registry: std::sync::Arc::new(Registry::new()),
             gate: Gate::Open,
             public: PublicServices::default(),
+            public_unsafe: PublicServices::default(),
         };
         let cancel = super::CancellationToken::new();
 
@@ -2163,6 +2520,7 @@ mod tests {
                     registry: std::sync::Arc::new(Registry::new()),
                     gate: Gate::Open,
                     public: PublicServices::default(),
+                    public_unsafe: PublicServices::default(),
                 };
                 tokio::task::spawn_local(async move {
                     exposer.run(&exposer_node, super::CancellationToken::new()).await.expect("exposer runs");
@@ -2218,13 +2576,14 @@ mod tests {
         path
     }
 
-    /// A `Serving` context over `services` sharing one `permits` pool, on a `Gate::Open` base with an empty
-    /// public overlay and an empty registry: the shared node state the raw-stream cap tests drive many
+    /// A `Serving` context over `services` sharing one `permits` pool, on a `Gate::Open` base with empty
+    /// public overlays and an empty registry: the shared node state the raw-stream cap tests drive many
     /// `serve_request`s against.
     fn open_serving(services: Services, permits: Semaphore) -> std::sync::Arc<super::Serving> {
         std::sync::Arc::new(super::Serving {
             gate: Gate::Open,
             public: PublicServices::default(),
+            public_unsafe: PublicServices::default(),
             services,
             registry: std::sync::Arc::new(Registry::new()),
             raw_stream_opens: permits,
@@ -2469,7 +2828,13 @@ mod tests {
         // dial-time mystery reset. (Here a `handler:` scheme is exposed but nothing registered it.)
         let unregistered = services(&["a=handler:"]);
         assert!(
-            super::Exposer::new(unregistered, super::Registry::new(), Gate::Open).is_err(),
+            super::Exposer::new(
+                unregistered,
+                super::Registry::new(),
+                Gate::Open,
+                PublicUnsafeRequest::none()
+            )
+            .is_err(),
             "exposing a handler scheme with no registered handler must be refused at construction"
         );
     }
@@ -2534,6 +2899,7 @@ mod tests {
                     registry: std::sync::Arc::new(Registry::new()),
                     gate: Gate::family(signet.node_id(), denylist),
                     public: PublicServices::default(),
+                    public_unsafe: PublicServices::default(),
                 };
 
                 let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
@@ -2627,6 +2993,7 @@ mod tests {
                     registry: std::sync::Arc::new(Registry::new()),
                     gate: Gate::Open,
                     public: PublicServices::default(),
+                    public_unsafe: PublicServices::default(),
                 };
 
                 let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
@@ -2659,33 +3026,81 @@ mod tests {
         )
     }
 
-    /// The per-service admission core (BLOCKER-1): a `PublicServices` HIT admits any peer with no token
-    /// (minting a `Slip`, never a member), while EVERY miss -- a gated-present name AND a name the node does
-    /// not serve at all -- takes the identical family path and is refused. The one branch on the service name
-    /// is the set-membership test; there is no cheaper path for "absent" than for "gated-present".
+    /// The per-service admission core (BLOCKER-1): a HIT on EITHER open overlay (the safe `public` or the
+    /// unsafe raw-stream `public_unsafe`) admits any peer with no token (minting a `Slip`, never a member),
+    /// while EVERY miss -- a gated-present name AND a name the node does not serve at all -- takes the
+    /// identical family path and is refused. The one branch on the service name is the set-membership test;
+    /// there is no cheaper path for "absent" than for "gated-present", and a hit on either open set reveals
+    /// only the already-public fact that the service admits anyone.
     #[test]
     fn a_public_member_admits_a_stranger_and_every_miss_takes_the_family_path() {
         let gate = family_gate("admit");
         let public = super::PublicServices(["speed".to_owned()].into_iter().collect());
+        // The unsafe overlay is disjoint from the safe one: `logs` is an unsafe-open raw stream, `speed` a
+        // safe-open handler. Both admit a stranger; neither leaks into the other's set.
+        let public_unsafe = super::PublicServices(["logs".to_owned()].into_iter().collect());
         let stranger = bifrost::NodeId::from_ed25519_secret(&[5u8; 32]);
 
-        // HIT: the opened `speed` admits a tokenless stranger, and the witness is a Slip (an opened service
-        // proves nothing about the peer), never a whole-node member.
-        let admitted = super::admit(&gate, &public, stranger, None, None, &svc("speed"))
-            .expect("an opened service admits a stranger");
+        // HIT (safe overlay): the opened `speed` admits a tokenless stranger, and the witness is a Slip (an
+        // opened service proves nothing about the peer), never a whole-node member.
+        let admitted = super::admit(
+            &gate,
+            &public,
+            &public_unsafe,
+            stranger,
+            None,
+            None,
+            &svc("speed"),
+        )
+        .expect("an opened service admits a stranger");
         assert!(
             !admitted.is_member(),
             "an opened service admits as a Slip, never a whole-node member"
         );
 
-        // MISS (gated-present): `control.stop` is served but NOT public, so a stranger takes the family path
-        // and is refused. MISS (absent): a name the node does not serve takes the SAME path and is refused.
+        // HIT (unsafe overlay): a stranger reaching the unsafe-open raw stream is admitted the same way, also
+        // as a Slip (§9 `an_unsafe_raw_stream_member_admits_a_stranger`).
+        let unsafe_admitted = super::admit(
+            &gate,
+            &public,
+            &public_unsafe,
+            stranger,
+            None,
+            None,
+            &svc("logs"),
+        )
+        .expect("an unsafe-open raw stream admits a stranger");
         assert!(
-            super::admit(&gate, &public, stranger, None, None, &svc("control.stop")).is_err(),
+            !unsafe_admitted.is_member(),
+            "an unsafe-open raw stream admits as a Slip, never a whole-node member"
+        );
+
+        // MISS (gated-present): `control.stop` is served but NOT open on either overlay, so a stranger takes
+        // the family path and is refused. MISS (absent): a name the node does not serve takes the SAME path.
+        assert!(
+            super::admit(
+                &gate,
+                &public,
+                &public_unsafe,
+                stranger,
+                None,
+                None,
+                &svc("control.stop")
+            )
+            .is_err(),
             "a served-but-gated service is refused for a stranger (family path)"
         );
         assert!(
-            super::admit(&gate, &public, stranger, None, None, &svc("nope")).is_err(),
+            super::admit(
+                &gate,
+                &public,
+                &public_unsafe,
+                stranger,
+                None,
+                None,
+                &svc("nope")
+            )
+            .is_err(),
             "an absent service is refused for a stranger, on the same family path"
         );
     }
@@ -2713,6 +3128,7 @@ mod tests {
         let admitted = super::admit(
             &gate,
             &public,
+            &super::PublicServices::default(),
             peer,
             Some(badge.as_str()),
             Some("not a sheer link"),
@@ -2740,10 +3156,15 @@ mod tests {
                 let registry = Registry::new()
                     .with("open", OpenNoop)
                     .with("locked", GatedNoop);
-                let exposer = Exposer::new(services, registry, family_gate("flagship"))
-                    .expect("assembles")
-                    .with_public(PublicRequest::new(["open".to_owned()]))
-                    .expect("`open` is OptIn, so it opens");
+                let exposer = Exposer::new(
+                    services,
+                    registry,
+                    family_gate("flagship"),
+                    PublicUnsafeRequest::none(),
+                )
+                .expect("assembles")
+                .with_public(PublicRequest::new(["open".to_owned()]))
+                .expect("`open` is OptIn, so it opens");
 
                 let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
                 let exposer_id = exposer_node.node_id();
@@ -2789,10 +3210,12 @@ mod tests {
     }
 
     /// `with_public` is the wall (BLOCKER-2): it refuses a `Never` handler named public with a teaching error
-    /// (leading with the fix, never leaking the marker names), and refuses a name the node does not serve.
+    /// (leading with the fix, never leaking the marker names), refuses a name the node does not serve, and
+    /// REDIRECTS a raw stream named in the SAFE overlay toward the unsafe overlay (a distinct message from the
+    /// `Never`-handler hard refusal). The three walls are disjoint.
     #[test]
     fn with_public_refuses_a_never_handler_and_an_unexposed_name() {
-        let services = services(&["ssh=locked:", "speed=open:"]);
+        let services = services(&["ssh=locked:", "speed=open:", "logs=file:/etc/hosts"]);
         let registry = || {
             Registry::new()
                 .with("locked", GatedNoop)
@@ -2801,8 +3224,13 @@ mod tests {
 
         // A Never handler named public is refused: the teaching error names the SERVICE and the fix, never a
         // marker type. (A stranger never sees it; it is a build-time bail to the operator's own terminal.)
-        let assembled =
-            Exposer::new(services.clone(), registry(), family_gate("never")).expect("assembles");
+        let assembled = Exposer::new(
+            services.clone(),
+            registry(),
+            family_gate("never"),
+            PublicUnsafeRequest::none(),
+        )
+        .expect("assembles");
         let Err(never) = assembled.with_public(PublicRequest::new(["ssh".to_owned()])) else {
             panic!("a Never handler cannot be opened");
         };
@@ -2818,9 +3246,37 @@ mod tests {
             );
         }
 
+        // A raw stream named in the SAFE overlay is REDIRECTED to the unsafe overlay, with a message DISTINCT
+        // from the `Never`-handler refusal (§9 `with_public_naming_a_raw_stream_redirects_to_public_unsafe`).
+        let assembled = Exposer::new(
+            services.clone(),
+            registry(),
+            family_gate("rawredirect"),
+            PublicUnsafeRequest::none(),
+        )
+        .expect("assembles");
+        let Err(raw) = assembled.with_public(PublicRequest::new(["logs".to_owned()])) else {
+            panic!("a raw stream cannot be opened by the safe overlay; it is redirected");
+        };
+        let raw_message = raw.to_string();
+        assert!(
+            raw_message.contains("raw byte source")
+                && raw_message.contains("unsafe raw-stream set"),
+            "a raw stream in the safe overlay is redirected to the unsafe raw-stream set: {raw_message:?}"
+        );
+        assert_ne!(
+            raw_message, message,
+            "the raw-stream redirect is a distinct message from the Never-handler hard refusal"
+        );
+
         // A name the node does not serve is refused, and the error names what it DOES serve.
-        let assembled =
-            Exposer::new(services, registry(), family_gate("unknown")).expect("assembles");
+        let assembled = Exposer::new(
+            services,
+            registry(),
+            family_gate("unknown"),
+            PublicUnsafeRequest::none(),
+        )
+        .expect("assembles");
         let Err(unknown) = assembled.with_public(PublicRequest::new(["nope".to_owned()])) else {
             panic!("an unexposed name cannot be opened");
         };
@@ -2895,6 +3351,7 @@ mod tests {
         let catalog = services.catalog(
             &family_gate("catalog"),
             &PublicRequest::new(["speed".to_owned()]),
+            &PublicUnsafeRequest::none(),
         );
         for entry in catalog.entries() {
             let expected = if entry.name == "speed" {

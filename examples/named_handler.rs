@@ -74,9 +74,14 @@ async fn run() -> eyre::Result<()> {
 
     let services = Services::parse(&["shout=shout:".to_owned()])?;
     tokio::task::spawn_local(async move {
-        if let Err(e) = Exposer::new(services, registry, Gate::Open)?
-            .run(&exposer, CancellationToken::new())
-            .await
+        if let Err(e) = Exposer::new(
+            services,
+            registry,
+            Gate::Open,
+            tightbeam::tunnel::PublicUnsafeRequest::none(),
+        )?
+        .run(&exposer, CancellationToken::new())
+        .await
         {
             eprintln!("exposer stopped: {e}");
         }

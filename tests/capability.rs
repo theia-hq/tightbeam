@@ -38,11 +38,16 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
             tokio::task::spawn_local(async move {
                 let services = Services::parse(&[format!("ssh={echo_addr}")]).unwrap();
                 let gate = tunnel::resolve_gate(Some(signet), empty_denylist().await).unwrap();
-                Exposer::new(services, tightbeam::tunnel::Registry::new(), gate)
-                    .unwrap()
-                    .run(&exposer, CancellationToken::new())
-                    .await
-                    .unwrap();
+                Exposer::new(
+                    services,
+                    tightbeam::tunnel::Registry::new(),
+                    gate,
+                    tightbeam::tunnel::PublicUnsafeRequest::none(),
+                )
+                .unwrap()
+                .run(&exposer, CancellationToken::new())
+                .await
+                .unwrap();
             });
 
             // A cap for ssh, valid for an hour, minted by the exposer's identity.

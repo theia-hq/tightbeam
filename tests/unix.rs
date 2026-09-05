@@ -44,11 +44,16 @@ async fn tunnels_to_a_unix_socket() {
             let service = format!("unix:{}", sock.display());
             tokio::task::spawn_local(async move {
                 let services = Services::parse(&[service]).unwrap();
-                Exposer::new(services, tightbeam::tunnel::Registry::new(), Gate::Open)
-                    .unwrap()
-                    .run(&exposer, CancellationToken::new())
-                    .await
-                    .unwrap();
+                Exposer::new(
+                    services,
+                    tightbeam::tunnel::Registry::new(),
+                    Gate::Open,
+                    tightbeam::tunnel::PublicUnsafeRequest::none(),
+                )
+                .unwrap()
+                .run(&exposer, CancellationToken::new())
+                .await
+                .unwrap();
             });
             tokio::task::spawn_local(async move {
                 Connector::to_node(exposer_id, "default".to_owned(), None)

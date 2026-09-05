@@ -4,16 +4,41 @@ A forward carries bytes. Anything that speaks over a TCP port or a Unix socket r
 the program on each end does not know the overlay is there. Below are worked examples. Each shows the
 host's one line, the other machine's one line, and what happens.
 
-Two facts hold for every example:
+Two rules hold for every example:
 
-- `connect` binds a plain `127.0.0.1:<port>` on your machine. You point any local client at that port.
-- A service is reachable only by a peer that holds the host's key and passes its gate (its signet by
-  default, or a `sheer:` link). `--public` opens a FORWARD (`host:port`/`unix:`) to anyone, the one gate
-  opt-out; a raw-stream source (`file:`/`fifo:`/`stdin:`) can not be made public, it has no auth of its own,
-  so it stays gated. So the file and live-feed examples below reach only a peer that holds your key.
+- `connect` gives you a local endpoint on your machine: a plain `127.0.0.1:<port>`, or this process's
+  own stdout with `--to -`. You point any local client at it.
+- Who may reach a service is the host's choice, made when it runs `expose`. By default only the host's own
+  devices and anyone the host hands a key can reach it. The two sections below are the two ways in: **Give
+  someone a key** (the normal, safe way) and **Serve to anyone** (the deliberate, dangerous opt-out).
 
 `<peer>` is the host's node id, printed in the `expose` readiness banner, or a `sheer:` link from
 `tightbeam share`.
+
+## Give someone a key (the safe default)
+
+The host runs sshd and wants one other person to reach it: no port-forward, no public IP, and no account
+on any middleman. The host's own devices already pass its gate. To let someone else in, mint a link to one
+service and send it. The link is the grant: signed, expiring, and good for that one service only.
+
+```sh
+# on the host: expose ssh, then mint a 2-hour link to it
+tightbeam expose ssh=127.0.0.1:22
+tightbeam share ssh --expires 2h        # prints: sheer:<node-id>.<token>
+```
+
+```sh
+# on their machine: the link carries both the host's key and the grant, so nothing else is needed
+tightbeam connect sheer:<node-id>.<token> --service ssh --to 2222
+ssh -p 2222 you@127.0.0.1
+```
+
+The link works only for `ssh`, expires on its own after two hours, and reaches nothing else on the host.
+Revoke it early with `tightbeam revoke`; short expiry backs that up. Add `--delegable` to `share` if the
+holder may narrow the link and pass it on.
+
+Everything from here to the last section reaches the host the same way: a peer that holds the host's key
+and passes its gate. The final section is the one exception, where you serve to anyone with no key at all.
 
 ## Stream a file by key
 
@@ -30,7 +55,8 @@ tightbeam connect <peer> --service movie --to - | mpv -    # on your machine
 
 `file:<path>` streams the file's raw bytes toward the peer, so there is no port to bind, no `cat`, and
 no background process. It is a read-only source: it refuses block/char devices (`/dev/zero`,
-`/dev/urandom`), directories, and a symlink at the named path.
+`/dev/urandom`), directories, and a symlink at the named path. It reaches only a peer that holds your key;
+to hand the file to anyone with no key, see the last section.
 
 ## A live feed to a player on the other side
 
@@ -117,3 +143,50 @@ tightbeam expose docker=unix:/var/run/docker.sock           # on the host
 tightbeam connect <peer> --service docker --to 2375        # on your machine
 DOCKER_HOST=tcp://127.0.0.1:2375 docker ps
 ```
+
+## Serve to anyone (the deliberate, dangerous opt-out)
+
+Everything above reaches only someone who holds the host's key. Sometimes you want the opposite: hand a
+file or a live feed to anyone who connects, with no key at all, e.g. a public release artifact or a feed
+you mean to broadcast. That is `--public-unsafe`, and it is exactly as dangerous as the name says: anyone
+who can reach the host reads those bytes.
+
+A raw-stream source (`file:`/`fifo:`/`stdin:`) has no way to check who is on the other end, so it is never
+opened by accident. Plain `--public` refuses it and points you here:
+
+```sh
+tightbeam expose movie=file:/srv/films/big.mkv --public
+# error: `movie` is a raw byte source (file:/fifo:/stdin:) with no auth of its own, so a public gate
+#        will not serve it. to serve its raw bytes to anyone, name it in `--public-unsafe`; otherwise
+#        gate it or drop it from the public set
+```
+
+Opening it is a separate, deliberate step. `--public-unsafe` takes the exact service names you mean to
+open. On this binary `--public` opens the whole node to anyone, and `--public-unsafe` names which raw
+streams that open node may serve, so you pass both:
+
+```sh
+tightbeam expose movie=file:/srv/films/big.mkv --public --public-unsafe movie
+```
+
+```sh
+# on anyone's machine, no key needed:
+tightbeam connect <peer> --service movie --to - | mpv -
+```
+
+On startup the host prints a loud warning naming the exact bytes at risk, one line per opened stream, by
+resolved absolute path:
+
+```
+UNSAFE: `movie` is serving the raw bytes of /srv/films/big.mkv to anyone, no auth
+```
+
+Read that path. It is the real file the host is about to hand to any stranger, resolved from whatever you
+typed. So `--public-unsafe logs` where `logs=file:~/.ssh/id_ed25519` prints the actual key path, your cue
+that you just aimed a secret at the world. If the path is not what you meant, stop the host (ctrl-c) and
+fix it before anyone connects. A live source names its risk too: `stdin:` and `fifo:` report `serving this
+process's piped stdin to anyone, no auth`.
+
+`--public-unsafe` is the only way a raw stream is ever served without a key, and you name each one by hand:
+there is no "open everything" switch. Everything not named stays gated to your key, exactly as in the
+sections above.

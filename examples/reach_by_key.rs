@@ -61,9 +61,14 @@ async fn run() -> eyre::Result<()> {
     //    handler; you inject `Handler`s (a keyless shell, an HTTP fetcher) for named services.
     let services = Services::parse(&[echo_addr.to_string()])?;
     tokio::task::spawn_local(async move {
-        if let Err(e) = Exposer::new(services, Registry::new(), Gate::Open)?
-            .run(&exposer, CancellationToken::new())
-            .await
+        if let Err(e) = Exposer::new(
+            services,
+            Registry::new(),
+            Gate::Open,
+            tightbeam::tunnel::PublicUnsafeRequest::none(),
+        )?
+        .run(&exposer, CancellationToken::new())
+        .await
         {
             eprintln!("exposer stopped: {e}");
         }

@@ -77,7 +77,7 @@ ones, and the `Gate` that decides who may reach them.
 
 ```rust
 use nauthy::Denylist;
-use tightbeam::tunnel::{self, CancellationToken, Exposer, Registry, Services};
+use tightbeam::tunnel::{self, CancellationToken, Exposer, PublicUnsafeRequest, Registry, Services};
 
 // `name=addr` entries. A `host:port` or `unix:<path>` is a raw forward tightbeam splices itself;
 // a bare `<name>:` scheme names a handler you register (see below).
@@ -88,15 +88,19 @@ let services = Services::parse(&["web=127.0.0.1:8080".into(), "shell=sh:".into()
 // denylist from wherever it persists revocations and passes it in.
 let gate = tunnel::resolve_gate(Some(signet), denylist)?;
 
-let exposer = Exposer::new(services, registry, gate)?;
+// The fourth argument is the UNSAFE raw-stream opt-in set: raw byte sources (`file:`/`fifo:`/`stdin:`)
+// have no authorization of their own, so under an open gate they are refused unless the operator
+// knowingly names them here. `PublicUnsafeRequest::none()` opts nothing in.
+let exposer = Exposer::new(services, registry, gate, PublicUnsafeRequest::none())?;
 exposer.run(&node, CancellationToken::new()).await?;   // runs until cancelled; prints nothing
 ```
 
-`Exposer::new` is a fully-gated node: every service faces the family gate. Opening a service to strangers is
-a deliberate second step, `Exposer::with_public(PublicRequest::new([...]))`, which proves each named service
-is exposed and safe to open before the node serves it. A handler with no authorization of its own (a keyless
-shell) can never be opened this way. The `CancellationToken` is the node's teardown seam: a caller may hold
-a clone and fire it to stop the accept loop.
+`Exposer::new` is a fully-gated node: every service faces the family gate. Opening a legitimate service to
+strangers is a deliberate second step, `Exposer::with_public(PublicRequest::new([...]))`, which proves each
+named service is exposed and safe to open before the node serves it. A handler with no authorization of its
+own (a keyless shell) can never be opened this way, and a raw byte source is redirected to the distinct,
+louder unsafe opt-in (`PublicUnsafeRequest`, the fourth `new` argument). The `CancellationToken` is the
+node's teardown seam: a caller may hold a clone and fire it to stop the accept loop.
 
 ## Inject a named service
 

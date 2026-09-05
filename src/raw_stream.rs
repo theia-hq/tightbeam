@@ -48,7 +48,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::unix::AsyncFd;
 
 use crate::raw_stream_fanout::Fanout;
-use crate::tunnel::{BoxRead, RAW_STREAM_OPEN_TIMEOUT};
+use crate::tunnel::{BoxRead, RAW_STREAM_OPEN_TIMEOUT, RawSource};
 
 /// Which OS object types a path-based raw-stream forward accepts. Both fix the direction (a read-only source
 /// toward the peer); they differ only in the type guard, so the scheme the operator wrote is honored:
@@ -125,10 +125,14 @@ impl Stdin {
 /// shared bounded ring in [`crate::raw_stream_fanout`]. The underlying source is opened lazily (on the first
 /// consumer) because a `fifo:` open is async and fallible and must not run until someone actually connects;
 /// the [`Opener`] is what to open. Once opened, the [`Fanout`] is memoized, so every later consumer attaches
-/// to the SAME ring. Behind a `tokio::sync::Mutex` so the "first consumer opens, the rest attach" transition
-/// is a single critical section.
+/// to the SAME ring. The lazy-open transition is behind a `tokio::sync::Mutex` so "first consumer opens, the
+/// rest attach" is a single critical section; the banner-facing [`RawSource`] is recorded ALONGSIDE it at
+/// construction so a manifest read needs no async lock (and stays valid after the opener is taken).
 #[derive(Clone)]
-struct Lossy(std::sync::Arc<tokio::sync::Mutex<LossyState>>);
+struct Lossy {
+    source: RawSource,
+    state: std::sync::Arc<tokio::sync::Mutex<LossyState>>,
+}
 
 /// The lazy-open state of a [`Lossy`] source: what to open on the first consumer, then the memoized fan-out.
 struct LossyState {
@@ -157,10 +161,19 @@ impl core::fmt::Debug for Lossy {
 
 impl Lossy {
     fn new(opener: Opener) -> Self {
-        Self(std::sync::Arc::new(tokio::sync::Mutex::new(LossyState {
-            opener: Some(opener),
-            fanout: None,
-        })))
+        // Record the banner-facing source before the opener is moved into the shared state: a `fifo:+lossy`
+        // names its absolute path, a `stdin:+lossy` (or a test reader) names the piped-stdin marker.
+        let source = match &opener {
+            Opener::Fifo(path) => RawSource::Path(absolute_display(path)),
+            Opener::Ready(_) => RawSource::Stdin,
+        };
+        Self {
+            source,
+            state: std::sync::Arc::new(tokio::sync::Mutex::new(LossyState {
+                opener: Some(opener),
+                fanout: None,
+            })),
+        }
     }
 
     /// Attach a consumer: on the first, open the underlying source (a `fifo:` under the guards, or take the
@@ -168,8 +181,7 @@ impl Lossy {
     /// returned as a [`BoxRead`]. Refuses if the source already ran to completion and closed (a non-rewindable
     /// `stdin:+lossy` session): there is nothing left to attach to.
     async fn open(&self) -> eyre::Result<BoxRead> {
-        let Self(state) = self;
-        let mut state = state.lock().await;
+        let mut state = self.state.lock().await;
         // First consumer: open the source and arm the fan-out. The `fifo:` open is async and fallible, so a
         // failure here is returned as a clean refusal, never a half-armed fan-out.
         if let Some(opener) = state.opener.take() {
@@ -281,6 +293,35 @@ impl RawStream {
             Source::Lossy(lossy) => lossy.open().await,
         }
     }
+
+    /// The [`RawSource`] a caller's banner names in its unsafe warning: which bytes reach a stranger when this
+    /// stream is served open. A path source resolves to its ABSOLUTE path (lexically, via
+    /// [`std::path::absolute`]: no FS access, no symlink follow, no existence requirement, so a not-yet-created
+    /// `fifo:` still renders); a `stdin:` source has no path (the risk is this process's piped input). NOT
+    /// [`Path::canonicalize`], which hits the FS, follows symlinks, and fails for a `fifo:` that does not exist
+    /// yet; the operator's security question is "which path did I name", made unambiguous, and the
+    /// `O_NOFOLLOW` guard already refuses a symlink at open. A `+lossy` source reports its underlying kind's
+    /// source, recorded at construction.
+    pub fn raw_source(&self) -> RawSource {
+        let Self(source) = self;
+        match source {
+            Source::Path { path, .. } => RawSource::Path(absolute_display(path)),
+            Source::Stdin(_) => RawSource::Stdin,
+            Source::Lossy(lossy) => RawSource::clone(&lossy.source),
+        }
+    }
+}
+
+/// Render `path` as an ABSOLUTE, lexically-resolved string for a banner's unsafe warning: [`std::path::absolute`]
+/// prepends the CWD and normalizes `.`/`..` WITHOUT touching the filesystem, so it is infallible in practice,
+/// works before the file exists (a not-yet-created `fifo:`), and follows no symlink. On the rare error (an
+/// empty path, or a CWD that cannot be read) it falls back to the operator's path verbatim rather than failing
+/// a banner. Deliberately not `canonicalize`: the security-relevant fact is which path was NAMED, not where a
+/// symlink would resolve.
+fn absolute_display(path: &Path) -> String {
+    std::path::absolute(path)
+        .map(|absolute| absolute.display().to_string())
+        .unwrap_or_else(|_| path.display().to_string())
 }
 
 /// Open a path source under the four guards and box its reader. Split out from [`RawStream::open`] so the
