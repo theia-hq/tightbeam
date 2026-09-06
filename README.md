@@ -23,11 +23,11 @@ at a single ship, not a broadcast. The privacy is in the aim; the security, here
 
 ## Add it as a dependency
 
-Not yet published. Point at a checkout:
+Git-only for now, not published to crates.io. Point at the repo:
 
 ```toml
 [dependencies]
-tightbeam = { path = "../tightbeam" }
+tightbeam = { git = "https://github.com/theia-hq/tightbeam", tag = "v0.4.0" }
 ```
 
 You also depend on `bifrost` (to bind an overlay node) and `nauthy` (to build the gate and mint
@@ -192,11 +192,15 @@ refused, then the transparent byte pipe begins.
 - **The catalog is member-only.** A member may read the node's `ServiceCatalog`: its served service names
   and the `Posture` (gated or open) a dialer faces for each. A stranger cannot.
 
-## The thin binary
+## The binary
 
-There is a `tightbeam` binary, but it is a thin bridge, not the product: it drives the library over an empty
-registry, so it serves only raw forwards. Its one real use is as an ssh `ProxyCommand`, reaching an sshd
-over a stream. The library is the product; the binary is a way to exercise it from the shell.
+The library is the product, but the `tightbeam` binary is a real command-line tool that drives it from the
+shell, and the [getting-started walkthrough](examples.md) runs entirely on it. It exposes services (raw
+`host:port` / `unix:` forwards, and the `echo:` / `stdin:` / `file:` / `fifo:` sources), gated by default or
+opened with `--public` (and `--public-unsafe` for a raw source); it reaches them with `connect`; and it
+mints, shares, and revokes `sheer:` links. It registers no `Handler` of its own, so a named handler (a
+shell, say) is something a library embedder adds in code. On its own the binary already covers forwarding,
+raw streams, and an ssh `ProxyCommand`.
 
 ## The honest limit
 
