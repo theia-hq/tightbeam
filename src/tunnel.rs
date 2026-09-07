@@ -24,6 +24,7 @@ use tokio::sync::Semaphore;
 // reaches it through `tightbeam::tunnel` alongside `Exposer` rather than depending on tokio-util directly.
 pub use tokio_util::sync::CancellationToken;
 
+use crate::enabled::{AllEnabled, EnabledServices};
 use crate::identity::{AsNodeId as _, AsVerifyKey as _};
 use crate::open_policy::PublicUse;
 use crate::protocol::{Request, Response};
@@ -804,6 +805,13 @@ pub struct Exposer {
     /// read `!public_unsafe.is_empty()` trivially, and the on-thesis reading stays legible: `public` =
     /// "opened a legitimate service", `public_unsafe` = "knowingly serves raw bytes with no auth".
     public_unsafe: PublicServices,
+    /// The live enable/disable oracle the per-stream gate consults (delib-47): a stream for a name this
+    /// reports disabled is refused at the admit seam, exactly like a revoked capability. Defaults to
+    /// [`AllEnabled`] (nothing disabled), so a caller that never toggles pays nothing; a caller that does
+    /// wires a file-backed [`FileDisabledList`](crate::enabled::FileDisabledList) with
+    /// [`with_enabled`](Exposer::with_enabled). Boxed like the gate's own [`Revocations`](nauthy::Revocations)
+    /// store, so a consumer may plug any oracle over its own state.
+    enabled: Box<dyn EnabledServices + Send + Sync>,
 }
 
 impl Exposer {
@@ -893,7 +901,24 @@ impl Exposer {
             gate,
             public: PublicServices::default(),
             public_unsafe: proven_unsafe,
+            // Nothing is disabled until a caller wires a real oracle. This keeps `new` unchanged for the many
+            // callers that never toggle; live enable/disable is the deliberate `with_enabled` opt-in below.
+            enabled: Box::new(AllEnabled),
         })
+    }
+
+    /// Wire the live enable/disable oracle the per-stream gate consults (delib-47): a stream requesting a
+    /// service this oracle reports disabled is refused at the admit seam, indistinguishably from a gated or
+    /// absent service, and a re-enable restores it LIVE with no restart (the oracle re-reads its backing state
+    /// when it changes). A separate builder, NOT a `new` parameter, because disabling is orthogonal to the
+    /// door interlocks `new` enforces and every existing caller/test builds a fully-gated exposer without it.
+    ///
+    /// The oracle never OPENS a service (it can only refuse a declared one), so it grants no authority and
+    /// cannot raise posture: a disabled service that is re-enabled returns to its ALREADY-declared baseline,
+    /// never more exposed than the launch set. That is why it needs no interlock against the unsafe overlay.
+    pub fn with_enabled(mut self, enabled: impl EnabledServices + Send + Sync + 'static) -> Self {
+        self.enabled = Box::new(enabled);
+        self
     }
 
     /// Open the requested services to any reaching peer, per-service, PROVING each one first: this is the
@@ -1034,14 +1059,15 @@ impl Exposer {
             gate,
             public,
             public_unsafe,
+            enabled,
         } = self;
         // Cap concurrent raw-stream opens across the whole node (all sessions share this one semaphore) as
         // cheap defense-in-depth: the nonblocking open cannot park a thread, so this bounds the fds held
         // mid-open, not a leak. See `RAW_STREAM_OPEN_PERMITS`.
         //
-        // The whole per-node serving context (gate + public overlay + services + registry + the open pool)
-        // is bundled behind ONE `Arc` so each accepted session carries a single handle rather than a fistful
-        // of clones.
+        // The whole per-node serving context (gate + public overlay + services + registry + the open pool +
+        // the enable/disable oracle) is bundled behind ONE `Arc` so each accepted session carries a single
+        // handle rather than a fistful of clones.
         let serving = Arc::new(Serving {
             gate,
             public,
@@ -1049,6 +1075,7 @@ impl Exposer {
             services,
             registry,
             raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
+            enabled,
         });
         let mut sessions = FuturesUnordered::new();
         loop {
@@ -1094,6 +1121,9 @@ struct Serving {
     services: Services,
     registry: Arc<Registry>,
     raw_stream_opens: Semaphore,
+    /// The live enable/disable oracle (delib-47), consulted per stream at the admit seam beside the gate: a
+    /// disabled service is refused with the same indistinguishable refusal a gate miss gives.
+    enabled: Box<dyn EnabledServices + Send + Sync>,
 }
 
 /// Serve one accepted session: handle each inbound stream's service request under the gate.
@@ -1157,6 +1187,7 @@ where
         services,
         registry,
         raw_stream_opens,
+        enabled,
     } = &*serving;
     let Services(services) = services;
     // Bound the pre-gate read: a peer that opens a stream but never sends its request would otherwise
@@ -1181,6 +1212,20 @@ where
     // no exposed service (a connector defaulting to `default`) and there is only one, resolve to it. Done
     // BEFORE the gate so a delegated slip for that service still matches (the gate checks the RESOLVED service).
     let service = resolve_single_service(service, services);
+
+    // Live enable/disable (delib-47), consulted at the SAME seam the gate is, on the RESOLVED name: a service
+    // the operator has disabled refuses here, before admission, and a re-enable restores it on the next stream
+    // with no restart (the oracle re-reads its backing file on change). The wire gets the SAME indistinguishable
+    // refusal a gate miss gives, so a disabled service reads exactly like a gated or absent one: no dialer can
+    // tell "disabled" from "not a member", and toggling leaks nothing. An already-open stream to a service
+    // disabled mid-flight stays open (next-stream semantics, identical to revocation).
+    if !enabled.is_enabled(service.as_str()) {
+        tracing::warn!(%peer, service = %service, "refused: service disabled");
+        return Response::Error(UNIFORM_REFUSAL.to_owned())
+            .write(&mut writer)
+            .await
+            .map_err(Into::into);
+    }
 
     let admitted = match admit(
         gate,
@@ -1937,7 +1982,7 @@ mod tests {
     use tokio::io::AsyncReadExt as _;
 
     use super::{
-        BoxRead, BoxWrite, Exposer, Handler, Posture, PublicRequest, PublicServices,
+        AllEnabled, BoxRead, BoxWrite, Exposer, Handler, Posture, PublicRequest, PublicServices,
         PublicUnsafeRequest, RAW_STREAM_OPEN_PERMITS, RawSource, Registry, Semaphore,
         ServiceCatalog, ServiceEntry, Services, Target, TargetKind, resolve_single_service,
         serve_request,
@@ -2620,6 +2665,7 @@ mod tests {
                     gate: Gate::Open,
                     public: PublicServices::default(),
                     public_unsafe: PublicServices::default(),
+                    enabled: Box::new(AllEnabled),
                 };
                 tokio::task::spawn_local(async move {
                     exposer
@@ -2718,6 +2764,7 @@ mod tests {
             gate: Gate::Open,
             public: PublicServices::default(),
             public_unsafe: PublicServices::default(),
+            enabled: Box::new(AllEnabled),
         };
         let cancel = super::CancellationToken::new();
 
@@ -2769,6 +2816,7 @@ mod tests {
                     gate: Gate::Open,
                     public: PublicServices::default(),
                     public_unsafe: PublicServices::default(),
+                    enabled: Box::new(AllEnabled),
                 };
                 tokio::task::spawn_local(async move {
                     exposer.run(&exposer_node, super::CancellationToken::new()).await.expect("exposer runs");
@@ -2835,6 +2883,7 @@ mod tests {
             services,
             registry: std::sync::Arc::new(Registry::new()),
             raw_stream_opens: permits,
+            enabled: Box::new(AllEnabled),
         })
     }
 
@@ -2996,6 +3045,88 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// delib-47 live toggle, END TO END through the gate seam: a service named in the `<home>/disabled` file is
+    /// refused at `serve_request` with the SAME indistinguishable refusal a gate miss gives, and after the file
+    /// is rewritten to RE-ENABLE it, the very next stream against the SAME running serving context serves it,
+    /// with no restart (the mtime-watched [`FileDisabledList`] re-read the change). This is the property the
+    /// whole feature turns on: disable refuses live, enable restores live.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_disabled_service_is_refused_at_the_gate_then_restored_live_on_re_enable() {
+        use std::io::Write as _;
+
+        use tokio::io::AsyncReadExt as _;
+
+        // A `file:` service so the served (enabled) path returns deterministic bytes with no external socket.
+        let path = std::env::temp_dir().join(format!("tb-toggle-served-{}", std::process::id()));
+        let body = b"served once re-enabled";
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(body))
+            .expect("write scratch file");
+
+        // The disabled-list file starts with `doc` disabled.
+        let disabled = std::env::temp_dir().join(format!("tb-toggle-list-{}", std::process::id()));
+        std::fs::write(&disabled, "doc\n").expect("write disabled list");
+
+        let services = services(&[&format!("doc=file:{}", path.display())]);
+        let enabled = crate::enabled::FileDisabledList::load(disabled.clone())
+            .await
+            .expect("load disabled list");
+        // One serving context, held across the toggle: the same `Arc` serves both drives, so a pass proves the
+        // LIVE re-read, not a rebuild.
+        let serving = std::sync::Arc::new(super::Serving {
+            gate: Gate::Open,
+            public: PublicServices::default(),
+            public_unsafe: PublicServices::default(),
+            services,
+            registry: std::sync::Arc::new(Registry::new()),
+            raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
+            enabled: Box::new(enabled),
+        });
+
+        // Disabled: the gate refuses with the uniform token, before any dispatch.
+        let (mut client_read, serve) = drive_open("doc", std::sync::Arc::clone(&serving));
+        tokio::spawn(serve);
+        match crate::protocol::Response::read(&mut client_read)
+            .await
+            .expect("read response")
+        {
+            crate::protocol::Response::Error(message) => assert_eq!(
+                message,
+                super::UNIFORM_REFUSAL,
+                "a disabled service refuses with the indistinguishable uniform token"
+            ),
+            crate::protocol::Response::Ok => {
+                panic!("a disabled service must be refused at the gate")
+            }
+        }
+
+        // Re-enable: rewrite the file without `doc` and wait past the mtime-watch debounce (100ms).
+        std::fs::write(&disabled, "\n").expect("re-enable doc");
+        tokio::time::sleep(core::time::Duration::from_millis(250)).await;
+
+        // The SAME serving context now serves it: Ok, then the file's exact bytes. No restart.
+        let (mut client_read, serve) = drive_open("doc", std::sync::Arc::clone(&serving));
+        tokio::spawn(serve);
+        match crate::protocol::Response::read(&mut client_read)
+            .await
+            .expect("read response")
+        {
+            crate::protocol::Response::Ok => {}
+            crate::protocol::Response::Error(message) => {
+                panic!("a re-enabled service must serve, got: {message}")
+            }
+        }
+        let mut got = Vec::new();
+        client_read.read_to_end(&mut got).await.expect("read bytes");
+        assert_eq!(
+            got, body,
+            "the re-enabled service serves the file's exact bytes"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&disabled);
+    }
+
     /// A tiny test client that speaks tightbeam's `Request`/`Response` handshake on one stream, so the unit
     /// tests can reach a service without the `Connector`'s port/stdio machinery.
     struct ServiceStream<W, R> {
@@ -3148,6 +3279,7 @@ mod tests {
                     gate: Gate::rooted(signet.verifying_key(), denylist),
                     public: PublicServices::default(),
                     public_unsafe: PublicServices::default(),
+                    enabled: Box::new(AllEnabled),
                 };
 
                 let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
@@ -3242,6 +3374,7 @@ mod tests {
                     gate: Gate::Open,
                     public: PublicServices::default(),
                     public_unsafe: PublicServices::default(),
+                    enabled: Box::new(AllEnabled),
                 };
 
                 let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
