@@ -3,6 +3,15 @@
 All notable changes to tightbeam, newest first. This first entry reaches back over the arc since v0.3.0,
 so nothing user-facing is lost.
 
+## Unreleased
+
+### New
+- **The `EnabledServices` gate oracle.** A `Revocations`-shaped, mtime-watched trait (with a
+  `FileDisabledList` impl and an `AllEnabled` default), overlaid on an `Exposer` via `with_enabled`, that
+  lets a consumer disable a served service live: the gate refuses a disabled service with the same uniform
+  refusal a gate miss gives, fail-closed (a read error keeps the last-known set), restored on re-enable with
+  no restart.
+
 ## v0.4.0 - 2026-09-05
 
 ### New
