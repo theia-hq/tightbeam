@@ -59,7 +59,7 @@ async fn run() -> eyre::Result<()> {
     //    anyone who reaches the key; in production you pass a signet gate so only your own devices and the
     //    delegates you signed get in. `Registry::new()` is empty because a raw forward needs no named
     //    handler; you inject `Handler`s (a keyless shell, an HTTP fetcher) for named services.
-    let services = Services::parse(&[echo_addr.to_string()])?;
+    let services = Services::parse(&[format!("echo={echo_addr}")])?;
     tokio::task::spawn_local(async move {
         if let Err(e) = Exposer::new(
             services,

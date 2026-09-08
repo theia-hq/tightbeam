@@ -41,7 +41,7 @@ async fn tunnels_to_a_unix_socket() {
             let exposer_id = exposer.node_id();
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
 
-            let service = format!("unix:{}", sock.display());
+            let service = format!("sock=unix:{}", sock.display());
             tokio::task::spawn_local(async move {
                 let services = Services::parse(&[service]).unwrap();
                 Exposer::new(

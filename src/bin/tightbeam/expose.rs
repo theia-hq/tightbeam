@@ -26,7 +26,7 @@ use tightbeam::tunnel::{
 /// anyone, unauthenticated.
 #[derive(Debug, Args)]
 pub struct ExposeCmd {
-    /// expose local services as `name=addr` (bare `addr` = `default`)
+    /// expose local services as `name=addr` (every entry must be `name=addr`)
     #[arg(required = true, value_name = "name=addr")]
     pub services: Vec<String>,
     /// open the WHOLE node to anyone, unauthenticated (the one opt-out from the signet)

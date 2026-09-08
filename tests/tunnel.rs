@@ -43,7 +43,7 @@ async fn tunnels_tcp_over_bifrost() {
             // Drive the tunnel core directly (no CLI, no banner): an open gate needs no identity or signet,
             // so any peer reaching the key is served (this test exercises the tunnel path, not authorization).
             tokio::task::spawn_local(async move {
-                let services = Services::parse(&[echo_addr.to_string()]).unwrap();
+                let services = Services::parse(&[format!("echo={echo_addr}")]).unwrap();
                 Exposer::new(
                     services,
                     tightbeam::tunnel::Registry::new(),

@@ -166,22 +166,24 @@ pub enum TargetKind {
 pub struct Services(HashMap<String, Target>);
 
 impl Services {
-    /// Parse `name=addr` service entries; a bare `addr` becomes the `default` service. A bare `<name>:`
+    /// Parse `name=addr` service entries; every entry must name its service. A bare `<name>:`
     /// scheme resolves to a handler; `echo:` to the built-in loopback reflector; a `host:port` / `unix:<path>`
     /// to a raw forward. A scheme may be dotted (`<iface>.<method>:`) for a method on an interface.
     pub fn parse(entries: &[String]) -> eyre::Result<Self> {
         let mut services = HashMap::new();
         for entry in entries {
-            let (name, addr) = match entry.split_once('=') {
-                Some((name, addr)) => (name.to_owned(), addr.to_owned()),
-                None => ("default".to_owned(), String::clone(entry)),
+            let Some((name, addr)) = entry.split_once('=') else {
+                eyre::bail!(
+                    "`{entry}` names no service. Every serve entry must be `name=addr`, e.g. \
+                     `ping=ping:`, `web=127.0.0.1:8080`"
+                );
             };
             // Validate the name through the same domain type the wire uses, so an exposed name and a
             // requested name are compared as the same kind of thing.
             name.parse::<Service>()?;
-            // Resolve (and validate) the addr into a Target: a bare service name (`expose web`) or a bogus
+            // Resolve (and validate) the addr into a Target: a bogus
             // address fails HERE with a teaching message, not at dial time as an opaque reset.
-            services.insert(name, parse_target(&addr, entry)?);
+            services.insert(name.to_owned(), parse_target(addr, entry)?);
         }
         Ok(Self(services))
     }
@@ -1568,27 +1570,20 @@ fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
         }
     }
     reject_lossy(addr)?;
-    validate_forward(addr, entry)?;
+    validate_forward(addr)?;
     Ok(Target::Forward(addr.to_owned()))
 }
 
-/// Reject a forward addr that is not a real target, so a bare service name (`expose web`) fails at parse
-/// with a teaching message instead of silently pointing the `default` service at an undialable host. Valid
+/// Reject a forward addr that is not a real target, so a named service pointed at a bogus addr
+/// (`web=nonsense`) fails at parse with a teaching message instead of pointing at an undialable host.
+/// Valid
 /// forwards: `unix:<path>` or a `host:port` (a bare `<name>:` handler scheme is resolved earlier).
-fn validate_forward(addr: &str, entry: &str) -> eyre::Result<()> {
+fn validate_forward(addr: &str) -> eyre::Result<()> {
     let is_host_port = addr
         .rsplit_once(':')
         .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
     if addr.starts_with("unix:") || is_host_port {
         return Ok(());
-    }
-    // A bare token with no `=` was almost certainly meant as a service NAME, not an address.
-    if !entry.contains('=') {
-        eyre::bail!(
-            "`{entry}` is not an address to forward to. Did you mean a service pointing at one, e.g. \
-             `{entry}=127.0.0.1:8080`? (an address is host:port, unix:<path>, file:<path>, fifo:<path>, \
-             or a bare `<name>:` handler scheme)"
-        );
     }
     eyre::bail!(
         "`{addr}` is not a valid forwarding address (host:port, unix:<path>, file:<path>, fifo:<path>, \
@@ -2205,12 +2200,24 @@ mod tests {
 
     #[test]
     fn a_bare_service_name_is_rejected_with_a_hint() {
-        // `expose web` was silently mapped to the `default` service at addr "web"; now it fails at parse.
+        // Every serve entry must be `name=addr`; a bare entry names no service and fails at parse.
         let Err(err) = Services::parse(&["web".to_owned()]) else {
-            panic!("bare `web` should be rejected, not treated as addr \"web\"");
+            panic!("bare `web` should be rejected, not served");
         };
         assert!(
-            err.to_string().contains("web=127.0.0.1:8080"),
+            err.to_string().contains("name=addr"),
+            "the error should teach the grammar: {err}"
+        );
+    }
+
+    #[test]
+    fn a_bare_scheme_without_a_name_is_rejected() {
+        // Bare `ping:` names no service either: only `ping=ping:` is spelled.
+        let Err(err) = Services::parse(&["ping:".to_owned()]) else {
+            panic!("bare `ping:` should be rejected, not served");
+        };
+        assert!(
+            err.to_string().contains("name=addr"),
             "the error should teach the grammar: {err}"
         );
     }
@@ -2224,7 +2231,6 @@ mod tests {
             "db=unix:/run/db.sock",
             "pipe=file:/tmp/beam",
             "named=fifo:/tmp/beam",
-            "127.0.0.1:5000",
         ] {
             assert!(
                 Services::parse(&[entry.to_owned()]).is_ok(),
