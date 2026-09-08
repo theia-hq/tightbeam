@@ -14,13 +14,7 @@ program that embeds it supplies the services, the identity, and the output. The 
 is [bifrost](https://github.com/theia-hq/bifrost)'s; who may pass a gate is
 [nauthy](https://github.com/theia-hq/nauthy)'s.
 
-**The name.** A tightbeam is a tight, aimed beam: a private point-to-point link that goes only where you
-point it, not out to everyone. That is what this does, one machine's service reaching exactly one other,
-addressed by key. The word is borrowed from The Expanse, where a tightbeam is a directed transmission aimed
-at a single ship, not a broadcast. The privacy is in the aim; the security, here, is in the key at each end.
-
 > Experimental. Works for TCP over the iroh transport; not ready for production use.
-
 ## Add it as a dependency
 
 Git-only for now, not published to crates.io. Point at the repo:
@@ -212,6 +206,13 @@ short expiry and revocation bound the rest.
 
 swoosh is a command-line tool built on tightbeam; see
 [swoosh](https://github.com/theia-hq/swoosh) for a worked consumer that drives this library end to end.
+
+## The name
+
+A tightbeam is a tight, aimed beam: a private point-to-point link that goes only where you
+point it, not out to everyone. That is what this does, one machine's service reaching exactly one other,
+addressed by key. The word is borrowed from The Expanse, where a tightbeam is a directed transmission aimed
+at a single ship, not a broadcast. The privacy is in the aim; the security, here, is in the key at each end.
 
 ## License
 
