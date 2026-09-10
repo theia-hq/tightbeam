@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Instant, SystemTime};
 
+use tokio::io::AsyncReadExt as _;
+
 /// The enable/disable oracle the exposer consults per inbound stream, right where it consults the gate.
 ///
 /// Synchronous by design: admission is synchronous policy, so the enabled check must never require an async
@@ -81,7 +83,9 @@ struct State {
 const STAT_DEBOUNCE: Duration = Duration::from_millis(100);
 
 impl FileDisabledList {
-    /// Load the disabled list from `path`; an absent file is an empty set (nothing disabled).
+    /// Load the disabled list from `path`; an absent file is an empty set (nothing disabled). The contents
+    /// and the `(mtime, len)` stamp come from one opened handle, so a file replaced during this load cannot
+    /// stamp the old contents as current and make every later refresh skip a real toggle.
     pub async fn load(path: PathBuf) -> Result<Self, DisabledListError> {
         let (disabled, stamp) = read_names(&path).await?;
         Ok(Self {
@@ -160,18 +164,57 @@ impl EnabledServices for FileDisabledList {
 async fn read_names(
     path: &Path,
 ) -> Result<(HashSet<String>, Option<(SystemTime, u64)>), DisabledListError> {
-    match tokio::fs::read_to_string(path).await {
-        Ok(text) => {
-            let names = parse_names(&text);
-            let stamp = tokio::fs::metadata(path)
-                .await
-                .ok()
-                .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
-            Ok((names, stamp))
+    // Open ONCE and take both the bytes and the stamp from that handle (`read_names_from`). Reading the
+    // path and then stat-ing the path again is the defect this closes: a writer that replaces the file
+    // between the two calls made the old contents wear the new file's (mtime, len), so every later
+    // refresh saw the stamp as current and a disable froze until the next edit.
+    let mut file = match open_readonly(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((HashSet::new(), None));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((HashSet::new(), None)),
-        Err(error) => Err(DisabledListError::Io(error)),
-    }
+        Err(error) => return Err(DisabledListError::Io(error)),
+    };
+    read_names_from(&mut file).await
+}
+
+/// Open the control file read-only with `O_NOFOLLOW`: the disabled list is an operator control input, so a
+/// symlink planted at the final component is refused rather than followed to an object this node does not
+/// own. Non-unix has no such flag; the read-only open still pins one handle.
+#[cfg(unix)]
+async fn open_readonly(path: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .await
+}
+
+/// The non-unix twin of `open_readonly`; `O_NOFOLLOW` does not exist there.
+#[cfg(not(unix))]
+async fn open_readonly(path: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::File::open(path).await
+}
+
+/// Read the names and their `(mtime, len)` stamp from ONE already-open handle. The single handle is the
+/// invariant: the bytes and the stamp describe the same inode, so a path replacement between the open and
+/// the read can never pair old contents with the replacement's freshness. An unreadable body is an error;
+/// a stamp the platform will not report degrades to `None`, so the next refresh re-reads rather than
+/// trusting a stale stamp.
+async fn read_names_from(
+    file: &mut tokio::fs::File,
+) -> Result<(HashSet<String>, Option<(SystemTime, u64)>), DisabledListError> {
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .await
+        .map_err(DisabledListError::Io)?;
+    let names = parse_names(&text);
+    let stamp = file
+        .metadata()
+        .await
+        .ok()
+        .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+    Ok((names, stamp))
 }
 
 /// Decode a disabled-list file body into a set of service names: one trimmed, non-empty name per line. There

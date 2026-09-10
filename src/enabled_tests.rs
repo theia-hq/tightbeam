@@ -86,3 +86,49 @@ async fn deletion_fails_closed() {
         "still disabled after deletion (fail-closed), not silently re-enabled"
     );
 }
+
+/// The M2 race at its smallest: a writer replaces the path between the loader's open and its read. The
+/// loaded names and the freshness stamp must both come from the one opened handle, so the loader reports
+/// the handle's bytes with the handle's `(mtime, len)`, never the old bytes wearing the replacement's
+/// stamp (which would make every later refresh skip and freeze a disable until the next edit).
+#[tokio::test]
+async fn load_pairs_content_and_stamp_from_one_handle() {
+    let path = temp_path("race");
+    std::fs::write(&path, "old\n").expect("write the first generation");
+    let mut handle = tokio::fs::File::open(&path)
+        .await
+        .expect("open the first generation");
+
+    // Replace the path with a different inode after the open: a truncating in-place write would be seen
+    // through the still-open handle, so write a sibling and rename it over the path.
+    let replacement = temp_path("race-replacement");
+    std::fs::write(&replacement, "fresh\n").expect("write the replacement generation");
+    std::fs::rename(&replacement, &path).expect("rename the replacement over the path");
+
+    let (names, stamp) = super::read_names_from(&mut handle)
+        .await
+        .expect("read from the opened handle");
+    assert!(
+        names.contains("old"),
+        "the loaded set is the handle's bytes, not the replacement path's"
+    );
+    assert!(
+        !names.contains("fresh"),
+        "the replacement's bytes are not loaded"
+    );
+
+    let held = handle.metadata().await.expect("stat the opened handle");
+    assert_eq!(
+        stamp,
+        Some((held.modified().expect("mtime"), held.len())),
+        "the stamp describes the same inode as the bytes"
+    );
+    let replaced = std::fs::metadata(&path).expect("stat the replacement path");
+    assert_ne!(
+        stamp,
+        Some((replaced.modified().expect("mtime"), replaced.len())),
+        "the stamp is not the replacement path's"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
