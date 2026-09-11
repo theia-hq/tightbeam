@@ -1,3 +1,5 @@
+use bifrost::{Refusal, RefusalDetail};
+
 use crate::protocol::{Request, Response};
 
 #[tokio::test]
@@ -26,8 +28,9 @@ async fn request_roundtrips_with_a_capability() {
 
 #[tokio::test]
 async fn request_roundtrips_with_both_slots() {
-    // TB03: a signet-bound dial carries slot 1 (the slip) AND slot 2 (a badge under the foreign fleet). Both
-    // present must round-trip byte-for-byte, so the gate reads the same two tokens the dialer wrote.
+    // TB03 added this second slot: a signet-bound dial carries slot 1 (the slip) AND slot 2 (a badge under
+    // the foreign fleet). Both present must round-trip byte-for-byte, so the gate reads the same two tokens
+    // the dialer wrote.
     let request = Request {
         service: "ssh".to_owned(),
         capability: Some("sheer:bf01abc.def".to_owned()),
@@ -40,7 +43,18 @@ async fn request_roundtrips_with_both_slots() {
 
 #[tokio::test]
 async fn response_roundtrips() {
-    for response in [Response::Ok, Response::Error("unknown service".to_owned())] {
+    // Every refusal variant round-trips: the payload-free `NotAdmitted` and both bounded-detail
+    // variants, so a host can only write a frame its own reader reconstructs.
+    for response in [
+        Response::Ok,
+        Response::Refused(Refusal::NotAdmitted),
+        Response::Refused(Refusal::BadRequest {
+            detail: RefusalDetail::bounded("unknown service"),
+        }),
+        Response::Refused(Refusal::Unavailable {
+            detail: RefusalDetail::bounded("no handler"),
+        }),
+    ] {
         let mut buf = Vec::new();
         response.write(&mut buf).await.unwrap();
         assert_eq!(Response::read(&mut buf.as_slice()).await.unwrap(), response);

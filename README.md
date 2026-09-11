@@ -172,14 +172,14 @@ is one of:
 
 ## The wire
 
-Each stream opens with a small versioned preamble, `TB03`, before any bytes flow: the service name, an
+Each stream opens with a small versioned preamble, `TB04`, before any bytes flow: the service name, an
 optional capability in slot 1, and an optional membership badge in slot 2. The host replies reached or
 refused, then the transparent byte pipe begins.
 
 - **Two-cap admit.** A signet-bound slip in slot 1 grants a service to a whole fleet without naming a
   device. The host admits it only when slot 2 also proves the presenter is a member of that fleet, ANDing
   the two. Every plain dial presents slot 1 alone, and the host never consults slot 2.
-- **One uniform refusal.** A dialer the gate does not admit gets a single indistinguishable "refused": no
+- **One uniform refusal.** A dialer the gate does not admit gets one payload-free refusal (`Refused`): no
   reason that separates a stranger from a revoked token from a wrong service, and no service menu. The
   existence and shape of a service are revealed only after the gate admits you for it, so the wire is not a
   capability-enumeration or revocation oracle. The real reason still reaches the host's own logs.

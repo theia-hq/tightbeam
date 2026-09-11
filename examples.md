@@ -172,9 +172,9 @@ echo 'hi from a friend' | tightbeam connect sheer:<node-id>.<token> --service de
 ```
 
 Their bytes echo back. The link works only for `demo`, expires on its own after two hours, and reaches
-nothing else. Without it, a stranger who dials the host is refused (`service refused: refused`). Revoke a
-link early with `tightbeam revoke`; short expiry backs that up. Add `--delegable` to `share` if the holder
-may narrow the link and hand it on.
+nothing else. Without it, a stranger who dials the host is refused (`not admitted: no member badge or
+capability for this service was accepted`). Revoke a link early with `tightbeam revoke`; short expiry backs
+that up. Add `--delegable` to `share` if the holder may narrow the link and hand it on.
 
 This is the one-machine, one-authority form. Running a single authority across several of your own devices,
 so any of them can serve and be reached by name, is what [swoosh](https://github.com/theia-hq/swoosh) is for.

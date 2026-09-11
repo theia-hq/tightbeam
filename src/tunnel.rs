@@ -12,11 +12,11 @@ use core::time::Duration;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use bifrost::{ConnInfo, Discovery, Node, NodeId, Session, Transport};
+use bifrost::{ConnInfo, Discovery, Node, NodeId, Refusal, RefusalDetail, Session, Transport};
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use nauthy::{Admitted, Cap, FileDenylist, Gate, Identity, ProvenPeer, Refusal, Service};
+use nauthy::{Admitted, Cap, FileDenylist, Gate, Identity, ProvenPeer, Service};
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -61,19 +61,6 @@ const MAX_STREAMS_PER_SESSION: usize = 256;
 /// briefly held). Small because a legitimate node serves a handful of raw streams, never hundreds; a request
 /// over the cap is refused cleanly.
 const RAW_STREAM_OPEN_PERMITS: usize = 16;
-
-/// The single, indistinguishable refusal a not-admitted dialer receives on the wire. A dialer the gate does
-/// not admit gets THIS and nothing else: no reason that separates a stranger (missing token) from a
-/// not-granting token from a revoked one, and no hint that names or enumerates a service. Existence, shape,
-/// and verdict of a service are revealed ONLY AFTER the gate admits the caller for that service, so the
-/// refusal path is not a pre-authorization capability-enumeration or revocation oracle (deliberation 18).
-/// The real reason still reaches the SERVER'S OWN logs (`tracing`); it is only the WIRE that is uniform.
-///
-/// Public so a dialer-side renderer can RECOGNIZE this exact token and phrase it descriptively ("reached,
-/// but refused at the gate") rather than echoing the bare word doubled (`refused (refused)`). Recognizing
-/// the token leaks nothing new: it is what every not-admitted dialer already receives; the descriptive
-/// phrasing is client-side rendering of an outcome the dialer already holds, not a new on-wire signal.
-pub const UNIFORM_REFUSAL: &str = "refused";
 
 /// A forwarding target for one exposed service, resolved once at parse time so `serve_request` matches an
 /// enum rather than a string prefix: either tightbeam's own raw forward (a local socket it splices to) or a
@@ -1203,12 +1190,22 @@ where
             return Ok(());
         }
     };
-    let Ok(service) = request.service.parse::<Service>() else {
-        let message = format!("invalid service name {:?}", request.service);
-        return Response::Error(message)
+    let service = match request.service.parse::<Service>() {
+        Ok(service) => service,
+        Err(error) => {
+            // The request's shape is the peer's own grammar, already public, so the wire names it; the
+            // host log carries the parse failure for the operator.
+            tracing::warn!(%peer, service = %request.service, %error, "invalid service name");
+            return Response::Refused(Refusal::BadRequest {
+                detail: RefusalDetail::bounded(format!(
+                    "invalid service name {:?}",
+                    request.service
+                )),
+            })
             .write(&mut writer)
             .await
             .map_err(Into::into);
+        }
     };
     // A node exposing exactly one service should not require the request to name it: if the request names
     // no exposed service (a connector defaulting to `default`) and there is only one, resolve to it. Done
@@ -1223,7 +1220,7 @@ where
     // disabled mid-flight stays open (next-stream semantics, identical to revocation).
     if !enabled.is_enabled(service.as_str()) {
         tracing::warn!(%peer, service = %service, "refused: service disabled");
-        return Response::Error(UNIFORM_REFUSAL.to_owned())
+        return Response::Refused(Refusal::NotAdmitted)
             .write(&mut writer)
             .await
             .map_err(Into::into);
@@ -1240,12 +1237,13 @@ where
     ) {
         Ok(admitted) => admitted,
         Err(refusal) => {
-            // The real reason (missing / not-granted / revoked / malformed) is a LOCAL log line for the
-            // node's own operator. The WIRE gets one indistinguishable refusal, so a not-admitted dialer
-            // cannot tell a stranger's `Missing` from a revoked holder's `Revoked`, nor confirm a service
-            // exists at all: no pre-authorization revocation or capability-enumeration oracle.
+            // The full cause (malformed / missing / not-granted / revoked, the typed `HostRefusal`) is a
+            // LOCAL log line for the node's own operator. The WIRE gets one indistinguishable
+            // `Refusal::NotAdmitted`, so a not-admitted dialer cannot tell a stranger's `Missing` from a
+            // revoked holder's `Revoked`, nor confirm a service exists at all: no pre-authorization
+            // revocation or capability-enumeration oracle.
             tracing::warn!(%peer, service = %service, %refusal, "refused");
-            return Response::Error(UNIFORM_REFUSAL.to_owned())
+            return Response::Refused(Refusal::NotAdmitted)
                 .write(&mut writer)
                 .await
                 .map_err(Into::into);
@@ -1289,9 +1287,11 @@ where
                 }
                 Err(error) => {
                     tracing::warn!(%peer, service = %service, %error, "raw-stream open refused");
-                    Response::Error(error.to_string())
-                        .write(&mut writer)
-                        .await?;
+                    Response::Refused(Refusal::Unavailable {
+                        detail: RefusalDetail::bounded(error.to_string()),
+                    })
+                    .write(&mut writer)
+                    .await?;
                 }
             }
         }
@@ -1321,8 +1321,15 @@ where
             // `Exposer::new` proved every exposed handler is registered, so this is unreachable in practice;
             // answer defensively rather than panic if an exposer was hand-built around that invariant.
             None => {
-                let message = format!("no handler for service {:?}", service.as_str());
-                Response::Error(message).write(&mut writer).await?;
+                tracing::warn!(%peer, service = %service, "no handler registered for the exposed service");
+                Response::Refused(Refusal::Unavailable {
+                    detail: RefusalDetail::bounded(format!(
+                        "no handler for service {:?}",
+                        service.as_str()
+                    )),
+                })
+                .write(&mut writer)
+                .await?;
             }
         },
         None => {
@@ -1343,7 +1350,7 @@ where
                 exposes = %available.join(", "),
                 "unknown service requested"
             );
-            Response::Error(UNIFORM_REFUSAL.to_owned())
+            Response::Refused(Refusal::NotAdmitted)
                 .write(&mut writer)
                 .await?;
         }
@@ -1351,15 +1358,36 @@ where
     Ok(())
 }
 
+/// Why the host did not admit a stream, in full, for the host's OWN log. It
+/// never crosses the wire: the dialer gets one uniform `Refusal::NotAdmitted`,
+/// so a stranger cannot tell a missing token from a revoked one, nor confirm an
+/// absent name (deliberation 18).
+#[derive(Debug, thiserror::Error)]
+enum HostRefusal {
+    /// A presented capability link did not parse. The parse error is the cause;
+    /// the wire still says only "not admitted".
+    #[error("malformed capability")]
+    MalformedCapability(#[source] nauthy::CapError),
+    /// The gate ruled: nauthy's typed cause.
+    #[error(transparent)]
+    Gate(nauthy::Refusal),
+}
+
+impl From<nauthy::Refusal> for HostRefusal {
+    fn from(refusal: nauthy::Refusal) -> Self {
+        HostRefusal::Gate(refusal)
+    }
+}
+
 /// Rule on a request under the node's per-service admission: the two disjoint open overlays (`public`, the
 /// safe one, and `public_unsafe`, the unsafe raw-stream one) composed with the `base` family gate, returning
-/// the [`Admitted`] witness on success or a DISTINGUISHING refusal string for the node's OWN logs. A service
+/// the [`Admitted`] witness on success or the typed [`HostRefusal`] for the node's OWN logs. A service
 /// the operator opened (a member of EITHER overlay) admits any reaching peer; every other service faces the
 /// `base` gate. The witness is required to reach a service handler, so "authorize before
-/// serve" is a compile-time precondition (see [`nauthy::Admitted`]). The reason returned here NEVER crosses
-/// the wire (the caller sends [`UNIFORM_REFUSAL`] to a not-admitted dialer); it exists only so the operator
-/// can see WHY on their own `tracing` output. Distinguishing missing/not-granted/revoked to the wire would
-/// be a revocation + capability-enumeration oracle for an unauthorized peer (deliberation 18).
+/// serve" is a compile-time precondition (see [`nauthy::Admitted`]). The refusal returned here NEVER crosses
+/// the wire (the caller sends the payload-free `Refusal::NotAdmitted` to a not-admitted dialer); it exists
+/// only so the operator can see WHY on their own `tracing` output. Distinguishing missing/not-granted/revoked
+/// to the wire would be a revocation + capability-enumeration oracle for an unauthorized peer (deliberation 18).
 fn admit(
     base: &Gate,
     public: &PublicServices,
@@ -1368,7 +1396,7 @@ fn admit(
     capability: Option<&str>,
     membership: Option<&str>,
     service: &Service,
-) -> Result<Admitted, String> {
+) -> Result<Admitted, HostRefusal> {
     // The ONLY branch admission takes on the service NAME is this open-set membership test, and it runs
     // BEFORE any dispatch (the `services.get` in `serve_request` is reached only past this admit). A HIT on
     // EITHER overlay is the sole fast/open path: the service was proven open at `with_public` (safe) or at
@@ -1380,11 +1408,9 @@ fn admit(
     // the identical family path below.
     if public.contains(service.as_str()) || public_unsafe.contains(service.as_str()) {
         // An open service needs no badge, so the signet-bound membership slot is irrelevant on this path.
-        return mint(Gate::Open.admit_witnessed(
-            ProvenPeer::from_handshake(peer.verify_key()),
-            None,
-            service,
-        ));
+        return Gate::Open
+            .admit_witnessed(ProvenPeer::from_handshake(peer.verify_key()), None, service)
+            .map_err(HostRefusal::from);
     }
     // A MISS is EITHER a gated-present name OR a name the node does not serve at all: both take this
     // identical family path (the same cap parse, the same two ed25519 verifies, the same refusal), so a
@@ -1396,7 +1422,7 @@ fn admit(
     // stream ends cleanly rather than being dropped mid-read.
     let cap = match capability.map(Cap::parse).transpose() {
         Ok(cap) => cap,
-        Err(_) => return Err("malformed capability".to_owned()),
+        Err(error) => return Err(HostRefusal::MalformedCapability(error)),
     };
     // Parse the SECOND slot ONLY when the first is a signet-bound slip: that is the sole path that ANDs a
     // fleet badge, so a plain/bearer/device slip (or none) never triggers the extra `Cap::parse`. The server
@@ -1406,7 +1432,7 @@ fn admit(
     let membership = match cap.as_ref() {
         Some(slip) if slip.is_authority_bound() => match membership.map(Cap::parse).transpose() {
             Ok(membership) => membership,
-            Err(_) => return Err("malformed capability".to_owned()),
+            Err(error) => return Err(HostRefusal::MalformedCapability(error)),
         },
         _ => None,
     };
@@ -1420,71 +1446,13 @@ fn admit(
     // `Some` only when slot 1 is an authority-bound slip and a badge parsed, so that pairing is the only
     // caller of the foreign twin.
     match (cap.as_ref(), membership.as_ref()) {
-        (Some(slip), Some(badge)) => mint(base.admit_foreign_witnessed(peer, slip, badge, service)),
-        (presented, _) => mint(base.admit_witnessed(peer, presented, service)),
+        (Some(slip), Some(badge)) => base
+            .admit_foreign_witnessed(peer, slip, badge, service)
+            .map_err(HostRefusal::from),
+        (presented, _) => base
+            .admit_witnessed(peer, presented, service)
+            .map_err(HostRefusal::from),
     }
-}
-
-/// Map a nauthy admission result to the [`admit`] contract: the witness on success, or a DISTINGUISHING
-/// reason for the node's OWN logs on refusal (never the wire). Shared by the public-HIT path (whose
-/// [`Gate::Open`] admission never actually refuses) and the family MISS path, so both surface a refusal the
-/// same way.
-fn mint(result: Result<Admitted, Refusal>) -> Result<Admitted, String> {
-    result.map_err(|refusal| match refusal {
-        Refusal::Missing => "this service requires a capability".to_owned(),
-        Refusal::NotGranted => "capability does not grant this service".to_owned(),
-        Refusal::Revoked => "capability has been revoked".to_owned(),
-    })
-}
-
-/// Render, for a DIALER, the reason a host returned on the wire, descriptively. The dialer REACHED the host
-/// and was refused (an unreachable peer never receives a [`Response`]), so this is the "reached but refused"
-/// outcome, distinct from "could not reach". It recognizes the [`UNIFORM_REFUSAL`] token a not-admitted
-/// dialer gets and phrases it as a reason a person can act on, rather than echoing the bare word (which a
-/// caller wrapping it in "refused (…)" would double into `refused (refused)`). A host that returned a MORE
-/// specific reason (a service that admitted the stream, then declined the requested method) keeps it
-/// verbatim. This is purely client-side rendering of the outcome the dialer already holds: it reveals
-/// nothing the wire did not, so the anti-oracle stands (a true stranger still cannot tell WHICH gated
-/// service exists, only that this dial was refused).
-pub fn refusal_reason(message: &str) -> String {
-    if message == UNIFORM_REFUSAL {
-        "not admitted: not a member of this node's family, and no capability for this service"
-            .to_owned()
-    } else {
-        message.to_owned()
-    }
-}
-
-/// The prefix this layer stamps on a host gate refusal when it surfaces the reason through a
-/// [`bifrost::Error::Stream`] (see [`ServiceSession::open_bi`], [`request_service`], [`request_stdio`]). The
-/// top-level `Stream` error renders as just "stream", so the reason travels in the boxed SOURCE behind this
-/// prefix; [`gate_refusal_reason`] is the client twin that reads it back. One constant, so the write sites and
-/// the recognizer never drift.
-const GATE_REFUSAL_PREFIX: &str = "service refused: ";
-
-/// The refusal reason if `error` is a gate refusal this layer surfaced, else `None`. A [`ServiceSession`] (and
-/// the forward/stdio paths) map a host gate refusal to a [`bifrost::Error::Stream`] whose SOURCE reads
-/// `"service refused: <reason>"`; the top-level `Stream` renders as just "stream", so the reason lives in the
-/// boxed source. This walks the source chain for [`GATE_REFUSAL_PREFIX`] so a dialer-side renderer can tell
-/// "the gate refused you" (recover the `<reason>` and pass it through [`refusal_reason`]) from a genuine i/o
-/// failure (which renders as the bare transport word). The client twin of the phrasing this layer writes.
-pub fn gate_refusal_reason(error: &bifrost::Error) -> Option<String> {
-    let mut source: Option<&(dyn core::error::Error + 'static)> = Some(error);
-    while let Some(cause) = source {
-        if let Some(reason) = cause.to_string().strip_prefix(GATE_REFUSAL_PREFIX) {
-            return Some(reason.to_owned());
-        }
-        source = cause.source();
-    }
-    None
-}
-
-/// A one-line dialer-side refusal for a REACHED host: `reached <node>, but refused: <reason>`. Used where a
-/// probe reached the peer and its gate refused (e.g. [`Connector::preflight`]); it names the peer, states it
-/// was reached (not unreachable), and renders the reason through [`refusal_reason`] so a bare gate refusal
-/// is descriptive and never doubled.
-fn refusal_reached(dial: NodeId, message: &str) -> String {
-    format!("reached {dial}, but refused: {}", refusal_reason(message))
 }
 
 /// Resolve the requested service against what is exposed: if it names no exposed service but exactly one
@@ -1615,6 +1583,18 @@ where
     Ok(())
 }
 
+/// A dial that reached the peer and was refused: the peer plus the typed
+/// classification, rendered as one line. Returned by [`Connector::preflight`].
+#[derive(Debug, thiserror::Error)]
+#[error("reached {dial}, but refused: {refusal}")]
+pub struct DialRefused {
+    /// The peer that refused the dial.
+    pub dial: NodeId,
+    /// The peer's classification. Not a `source`: this line is the whole story,
+    /// and the refusal has no cause the dialer can see.
+    pub refusal: Refusal,
+}
+
 /// A resolved connect: the node to dial, the service to ask for, and any token to present.
 ///
 /// The domain half of a `connect`, with the CLI's target-parsing (`Target`/`FromStr`) left in the CLI
@@ -1684,7 +1664,7 @@ impl Connector {
     /// [`PortForward`] ready to run. Admission is proven here, before any success is announced: a probe
     /// stream sends the request and awaits the host's [`Response`], so a refusal (an unexposed service, a
     /// revoked or non-granting cap, an unauthorized identity) surfaces as an `Err` from THIS call, carrying
-    /// the host's reason, rather than a silently-reset connection once the caller has already printed
+    /// the typed [`Refusal`], rather than a silently-reset connection once the caller has already printed
     /// "forwarding …". The caller announces readiness only after this returns `Ok`. Prints nothing.
     pub async fn preflight<T: Transport, D: Discovery>(
         self,
@@ -1699,8 +1679,12 @@ impl Connector {
         // request to the same gate, so this one admission faithfully predicts theirs.
         let (mut writer, mut reader) = session.open_bi().await?;
         request.write(&mut writer).await?;
-        if let Response::Error(message) = Response::read(&mut reader).await? {
-            eyre::bail!("{}", refusal_reached(self.dial, &message));
+        if let Response::Refused(refusal) = Response::read(&mut reader).await? {
+            return Err(DialRefused {
+                dial: self.dial,
+                refusal,
+            }
+            .into());
         }
         drop((writer, reader));
         let listener = TcpListener::bind(("127.0.0.1", port)).await?;
@@ -1790,7 +1774,7 @@ impl<S: Session> PortForward<S> {
 
 /// A [`Session`] view that gates every stream it opens through a fixed service request. Wraps a live
 /// bifrost session; on `open_bi` it opens a real stream, sends the request, and yields the admitted halves
-/// ONLY on `Response::Ok`, mapping a refusal to [`bifrost::Error::Stream`]. Any caller-injected
+/// ONLY on `Response::Ok`, mapping a refusal to [`bifrost::Error::Refused`]. Any caller-injected
 /// `Session`-generic protocol runs over it unchanged, every one of its streams admitted by the gate.
 ///
 /// The associated stream halves are the inner session's own (`type Write = S::Write; type Read =
@@ -1822,11 +1806,9 @@ impl<S: Session> Session for ServiceSession<S> {
             .map_err(|error| bifrost::Error::Stream(Box::new(error)))?
         {
             Response::Ok => Ok((writer, reader)),
-            // Surface the host's refusal reason through the stream error, using the same phrasing
-            // `request_service` gives the forward path, so a caller's error chain reads one way.
-            Response::Error(message) => Err(bifrost::Error::Stream(
-                format!("{GATE_REFUSAL_PREFIX}{message}").into(),
-            )),
+            // The typed refusal travels as its own `Error` variant, so a caller MATCHES it instead of
+            // walking the source chain for a formatted reason.
+            Response::Refused(refusal) => Err(bifrost::Error::Refused(refusal)),
         }
     }
 
@@ -1861,7 +1843,7 @@ where
     request.write(&mut writer).await?;
     match Response::read(&mut reader).await? {
         Response::Ok => splice(tcp, writer, reader).await?,
-        Response::Error(message) => eyre::bail!("{GATE_REFUSAL_PREFIX}{message}"),
+        Response::Refused(refusal) => return Err(bifrost::Error::Refused(refusal).into()),
     }
     Ok(())
 }
@@ -1879,7 +1861,7 @@ where
     request.write(&mut writer).await?;
     match Response::read(&mut reader).await? {
         Response::Ok => pipe_stdio_bridge(writer, reader).await?,
-        Response::Error(message) => eyre::bail!("{GATE_REFUSAL_PREFIX}{message}"),
+        Response::Refused(refusal) => return Err(bifrost::Error::Refused(refusal).into()),
     }
     Ok(())
 }
@@ -2691,12 +2673,17 @@ mod tests {
                 // Second CONCURRENT connection: the source is taken, so the host refuses cleanly with the
                 // single-consumer reason, never a racing (corrupting) second read.
                 let session2 = consumer.connect(exposer_id).await.expect("second connect");
-                let Err(err) = ServiceStream::open(&session2, "cam").await else {
+                let Err(refusal) = ServiceStream::open(&session2, "cam").await else {
                     panic!("the second reader must be refused, not a racing second read");
                 };
+                let bifrost::Refusal::Unavailable { detail } = &refusal else {
+                    panic!("the second reader must be refused as unavailable, got: {refusal:?}");
+                };
                 assert!(
-                    err.contains("single-consumer source, already in use"),
-                    "the refusal must name the single-consumer contract: {err}"
+                    detail
+                        .as_str()
+                        .contains("single-consumer source, already in use"),
+                    "the refusal must name the single-consumer contract: {detail}"
                 );
             })
             .await;
@@ -2971,7 +2958,7 @@ mod tests {
         }
 
         // With every permit taken, the OVER-cap opens must be refused immediately with the cap message, never
-        // parking another thread. Each returns a `Response::Error` a client can read at once.
+        // parking another thread. Each returns a `Response::Refused` a client can read at once.
         for _ in 0..OVER {
             let (mut client_read, serve) = drive_open("pipe", std::sync::Arc::clone(&serving));
             tokio::spawn(serve);
@@ -2983,13 +2970,13 @@ mod tests {
             .expect("an over-cap open must answer promptly, not park")
             .expect("read response");
             match response {
-                crate::protocol::Response::Error(message) => assert!(
-                    message.contains("too many raw streams"),
-                    "the over-cap refusal must name the cap: {message}"
-                ),
-                crate::protocol::Response::Ok => {
-                    panic!("an over-cap open must be refused, not served")
+                crate::protocol::Response::Refused(bifrost::Refusal::Unavailable { detail }) => {
+                    assert!(
+                        detail.as_str().contains("too many raw streams"),
+                        "the over-cap refusal must name the cap: {detail}"
+                    );
                 }
+                other => panic!("an over-cap open must be refused with a detail, got: {other:?}"),
             }
         }
 
@@ -3040,9 +3027,7 @@ mod tests {
             .expect("read response")
         {
             crate::protocol::Response::Ok => {}
-            crate::protocol::Response::Error(message) => {
-                panic!("a single open under the cap must succeed, got: {message}")
-            }
+            other => panic!("a single open under the cap must succeed, got: {other:?}"),
         }
         let mut got = Vec::new();
         client_read.read_to_end(&mut got).await.expect("read bytes");
@@ -3089,21 +3074,15 @@ mod tests {
             enabled: Box::new(enabled),
         });
 
-        // Disabled: the gate refuses with the uniform token, before any dispatch.
+        // Disabled: the gate refuses with the uniform typed refusal, before any dispatch.
         let (mut client_read, serve) = drive_open("doc", std::sync::Arc::clone(&serving));
         tokio::spawn(serve);
         match crate::protocol::Response::read(&mut client_read)
             .await
             .expect("read response")
         {
-            crate::protocol::Response::Error(message) => assert_eq!(
-                message,
-                super::UNIFORM_REFUSAL,
-                "a disabled service refuses with the indistinguishable uniform token"
-            ),
-            crate::protocol::Response::Ok => {
-                panic!("a disabled service must be refused at the gate")
-            }
+            crate::protocol::Response::Refused(bifrost::Refusal::NotAdmitted) => {}
+            other => panic!("a disabled service must be refused at the gate, got: {other:?}"),
         }
 
         // Re-enable: rewrite the file without `doc` and wait past the mtime-watch debounce (100ms).
@@ -3118,9 +3097,7 @@ mod tests {
             .expect("read response")
         {
             crate::protocol::Response::Ok => {}
-            crate::protocol::Response::Error(message) => {
-                panic!("a re-enabled service must serve, got: {message}")
-            }
+            other => panic!("a re-enabled service must serve, got: {other:?}"),
         }
         let mut got = Vec::new();
         client_read.read_to_end(&mut got).await.expect("read bytes");
@@ -3145,8 +3122,8 @@ mod tests {
         W: tokio::io::AsyncWrite + Unpin,
         R: tokio::io::AsyncRead + Unpin,
     {
-        /// Open a stream, request `service`, and return it on `Ok` or the host's reason on refusal.
-        async fn open<S>(session: &S, service: &str) -> Result<Self, String>
+        /// Open a stream, request `service`, and return it on `Ok` or the host's typed refusal.
+        async fn open<S>(session: &S, service: &str) -> Result<Self, bifrost::Refusal>
         where
             S: bifrost::Session<Write = W, Read = R>,
         {
@@ -3154,13 +3131,13 @@ mod tests {
         }
 
         /// Like [`open`](Self::open) but presents `capability`, so a test can dial as a stranger (`None`) or
-        /// as a token-holder (a revoked slip). Returns the host's refusal string verbatim on `Error`, which
-        /// is what lets a test assert two dialers got BYTE-IDENTICAL refusals.
+        /// as a token-holder (a revoked slip). Returns the host's typed refusal verbatim, which is what lets
+        /// a test assert two dialers got the SAME refusal value.
         async fn open_with<S>(
             session: &S,
             service: &str,
             capability: Option<String>,
-        ) -> Result<Self, String>
+        ) -> Result<Self, bifrost::Refusal>
         where
             S: bifrost::Session<Write = W, Read = R>,
         {
@@ -3174,11 +3151,11 @@ mod tests {
             service: &str,
             capability: Option<String>,
             membership: Option<String>,
-        ) -> Result<Self, String>
+        ) -> Result<Self, bifrost::Refusal>
         where
             S: bifrost::Session<Write = W, Read = R>,
         {
-            let (mut writer, mut reader) = session.open_bi().await.map_err(|e| e.to_string())?;
+            let (mut writer, mut reader) = session.open_bi().await.expect("open a stream");
             crate::protocol::Request {
                 service: service.to_owned(),
                 capability,
@@ -3186,13 +3163,13 @@ mod tests {
             }
             .write(&mut writer)
             .await
-            .map_err(|e| e.to_string())?;
+            .expect("write request");
             match crate::protocol::Response::read(&mut reader)
                 .await
-                .map_err(|e| e.to_string())?
+                .expect("read response")
             {
                 crate::protocol::Response::Ok => Ok(Self { writer, reader }),
-                crate::protocol::Response::Error(message) => Err(message),
+                crate::protocol::Response::Refused(refusal) => Err(refusal),
             }
         }
 
@@ -3244,9 +3221,10 @@ mod tests {
     /// indistinguishable refusal on the wire. No reason separates a stranger (no token) from a revoked
     /// holder from a not-granting token, and no response enumerates or confirms a service. This test dials a
     /// Family-gated node four ways -- a stranger, a revoked-slip holder, an unknown-service probe, and a
-    /// slip-for-the-wrong-service holder -- and asserts every refusal is BYTE-IDENTICAL, so the wire is not a
-    /// revocation oracle and not a capability-enumeration oracle. The gate is the discovery boundary:
-    /// existence, shape, and verdict are revealed only AFTER admission.
+    /// slip-for-the-wrong-service holder -- and asserts every refusal is the same payload-free
+    /// `NotAdmitted` (one wire code, nothing after it), so the wire is not a revocation oracle and not a
+    /// capability-enumeration oracle. The gate is the discovery boundary: existence, shape, and verdict are
+    /// revealed only AFTER admission.
     #[tokio::test]
     async fn an_unadmitted_dialer_gets_one_uniform_refusal_no_reason_no_menu() {
         use nauthy::{FileDenylist, Identity};
@@ -3302,27 +3280,28 @@ mod tests {
                         let session = consumer.connect(exposer_id).await.expect("connect");
                         match ServiceStream::open_with(&session, service, cap).await {
                             Ok(_) => panic!("dial for {service:?} must be refused, not served"),
-                            Err(message) => message,
+                            Err(refusal) => refusal,
                         }
                     }
                 };
 
-                // (a) a STRANGER: no token at all -> gate refuses (Missing) -> uniform "refused".
+                // (a) a STRANGER: no token at all -> gate refuses (Missing) -> `NotAdmitted`.
                 let stranger = dial("ssh", None).await;
                 // (b) a REVOKED holder: presents the now-denylisted `ssh` slip -> gate refuses (Revoked).
                 let revoked = dial("ssh", Some(revoked_slip.link().expect("link"))).await;
-                // (c) an UNKNOWN-SERVICE probe by a stranger: gate refuses the unknown name -> uniform.
+                // (c) an UNKNOWN-SERVICE probe by a stranger: gate refuses the unknown name -> NotAdmitted.
                 let unknown = dial("admin", None).await;
                 // (d) a WRONG-SERVICE slip: a valid, UNREVOKED slip for `web` presented for `ssh` -> gate
-                //     refuses (NotGranted). Distinct internal reason, must still be the same wire string.
+                //     refuses (NotGranted). Distinct internal reason, must still be the same wire class.
                 let wrong_slip = signet.mint(&svc("web"), hour).expect("mint web slip");
                 let not_granted = dial("ssh", Some(wrong_slip.link().expect("link"))).await;
 
-                // The whole point: all four are BYTE-IDENTICAL. A walker cannot tell revoked from stranger
-                // from not-granted, and cannot confirm `ssh` exists or that `admin` does not.
+                // The whole point: all four are the SAME payload-free `NotAdmitted`, so no consumer can
+                // tell revoked from stranger from not-granted, and none can confirm `ssh` exists or that
+                // `admin` does not.
                 assert_eq!(
                     stranger, revoked,
-                    "a revoked holder and a stranger must get byte-identical refusals (no revocation oracle)"
+                    "a revoked holder and a stranger must get the same refusal (no revocation oracle)"
                 );
                 assert_eq!(
                     stranger, unknown,
@@ -3333,9 +3312,11 @@ mod tests {
                     "a not-granting slip must get the same refusal as a stranger (no capability oracle)"
                 );
 
-                // And the refusal reveals NOTHING: no reason word, no service name, no menu.
+                // And the refusal renders NOTHING distinguishing: no cause word, no service name, no menu.
+                // The ratified `NotAdmitted` phrase names both credential kinds by policy ("no member badge
+                // or capability ... was accepted"), the same bytes for every cause, so it is not a leak.
+                let rendered = stranger.to_string();
                 for leaked in [
-                    "capability",
                     "revoked",
                     "requires",
                     "grant",
@@ -3346,8 +3327,8 @@ mod tests {
                     "admin",
                 ] {
                     assert!(
-                        !stranger.contains(leaked),
-                        "the uniform refusal must not leak {leaked:?}: {stranger:?}"
+                        !rendered.contains(leaked),
+                        "the uniform refusal must not leak {leaked:?}: {rendered:?}"
                     );
                 }
 
@@ -3391,13 +3372,14 @@ mod tests {
                 });
 
                 let session = consumer.connect(exposer_id).await.expect("connect");
-                let Err(message) = ServiceStream::open(&session, "nope").await else {
+                let Err(refusal) = ServiceStream::open(&session, "nope").await else {
                     panic!("an unknown service must be refused, not served");
                 };
+                let rendered = refusal.to_string();
                 for leaked in ["cam", "mic", "exposes", "unknown"] {
                     assert!(
-                        !message.contains(leaked),
-                        "an admitted unknown-service probe must not learn the menu; leaked {leaked:?}: {message:?}"
+                        !rendered.contains(leaked),
+                        "an admitted unknown-service probe must not learn the menu; leaked {leaked:?}: {rendered:?}"
                     );
                 }
             })
@@ -3531,7 +3513,7 @@ mod tests {
     /// The flagship, at the tunnel level (delib-39): a family-gated node opens ONE service per-service via
     /// `with_public`; a stranger with no token is ADMITTED to that service but still REFUSED, uniformly, for
     /// a gated service and for the always-on `control.stop`, which can never be opened. Proves the anti-oracle
-    /// survives the overlay: the gated refusals are byte-identical.
+    /// survives the overlay: the gated refusals are the same payload-free class.
     #[tokio::test]
     async fn a_stranger_is_admitted_to_an_opened_service_and_uniformly_refused_for_the_rest() {
         let local = tokio::task::LocalSet::new();
@@ -3573,8 +3555,8 @@ mod tests {
                     .await
                     .expect("the opened service serves the stranger");
 
-                // The same stranger is REFUSED for a gated service AND for control.stop, byte-identically:
-                // opening one service leaks nothing about the gated ones.
+                // The same stranger is REFUSED for a gated service AND for control.stop, with the same
+                // typed refusal: opening one service leaks nothing about the gated ones.
                 let session = consumer.connect(exposer_id).await.expect("connect");
                 let Err(gated) = ServiceStream::open(&session, "locked").await else {
                     panic!("a gated service must refuse the stranger");
@@ -3585,12 +3567,12 @@ mod tests {
                 };
                 assert_eq!(
                     gated, control,
-                    "a gated service and the control surface refuse byte-identically (no oracle)"
+                    "a gated service and the control surface refuse identically (no oracle)"
                 );
                 assert_eq!(
                     gated,
-                    super::UNIFORM_REFUSAL,
-                    "the refusal is the uniform token"
+                    bifrost::Refusal::NotAdmitted,
+                    "the refusal is the payload-free uniform class"
                 );
             })
             .await;
@@ -3761,24 +3743,18 @@ mod tests {
         }
     }
 
-    /// B3: a dialer-side render recognizes the uniform refusal token and phrases it descriptively (not the
-    /// bare word, which a `refused (…)` wrapper would double), while a more specific host reason is kept.
+    /// B3: the uniform refusal renders descriptively (a reason a person can act on), never as the bare
+    /// wire word, so a `refused (…)` wrapper can never double it into `refused (refused)`.
     #[test]
-    fn a_dialer_refusal_reason_is_descriptive_for_the_uniform_token() {
-        let uniform = super::refusal_reason(super::UNIFORM_REFUSAL);
-        assert_ne!(
-            uniform,
-            super::UNIFORM_REFUSAL,
-            "the bare token is not echoed back"
+    fn a_not_admitted_refusal_renders_descriptively_never_doubled() {
+        let rendered = bifrost::Refusal::NotAdmitted.to_string();
+        assert!(
+            rendered.contains("not admitted"),
+            "the uniform refusal renders as a reason a person can act on: {rendered:?}"
         );
         assert!(
-            uniform.contains("not admitted"),
-            "the uniform refusal renders as a reason a person can act on: {uniform:?}"
-        );
-        assert_eq!(
-            super::refusal_reason("this service does not serve that method"),
-            "this service does not serve that method",
-            "a specific host reason is preserved verbatim"
+            !rendered.contains("refused: refused"),
+            "the refusal render must never double the bare word: {rendered:?}"
         );
     }
 }
