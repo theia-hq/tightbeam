@@ -165,6 +165,7 @@ _The doc voice, proven across every repo. A README, crate description, or `--hel
 - **Dependencies introduced sparingly**, every one indisputable and absolutely necessary.
 
 ## Commits & PRs (read like a story)
+- **Subject: one imperative line, about 70 characters, no trailing period; the why goes in the body.** A blank line, then a body naming the reason, the constraint, and the evidence (the failing case, the test that proves it, the review finding it closes). `git log --oneline` stays scannable; `git log` carries the detail.
 - **Each commit is one coherent step, builds and passes on its own,** and its message says what it did *and* what it sets up, earlier commits visibly lay the groundwork a later feature clicks into.
 - **PR body uses the house template:** Motivation / In this PR / Test Plan / Backwards compatibility / Future Work. Narrate the correctness invariants so review questions are pre-answered.
 - **Small, reviewable diffs.** An "and also" section means it was two PRs.
