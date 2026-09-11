@@ -2,12 +2,12 @@
 //! share one shape, so `expose` treats them all as a read-only [`crate::tunnel::Target::RawStream`]
 //! (inheriting the source-only splice and the public-gate refusal):
 //!
-//! - `file:<path>` / `fifo:<path>` — open an OS object the operator named on disk. Its input is an
+//! - `file:<path>` / `fifo:<path>`: open an OS object the operator named on disk. Its input is an
 //!   untrusted path resolved at DIAL time, so every open goes through four guards (each named at its site
 //!   in [`open_guarded`]).
-//! - `stdin:` — this process's own standard input (fd 0). No path, so none of the path guards apply; it is
+//! - `stdin:`: this process's own standard input (fd 0). No path, so none of the path guards apply; it is
 //!   a SINGLE-CONSUMER source (fd 0 is one non-re-openable stream) taken once and never re-armed.
-//! - `stdin:+lossy` / `fifo:<path>+lossy` — the operator's opt-in to FAN-OUT (delib-20 SYNTHESIS + delib-24):
+//! - `stdin:+lossy` / `fifo:<path>+lossy`: the operator's opt-in to FAN-OUT (delib-20 SYNTHESIS + delib-24):
 //!   the source is opened ONCE and read by MANY consumers through one shared bounded ring, a consumer that
 //!   falls behind having its bytes dropped rather than stalling the producer or the others. The `+lossy` claim
 //!   ("this stream tolerates loss") is legal only on these live single-writer sources (a `file:` is already
@@ -56,9 +56,9 @@ use crate::tunnel::{BoxRead, RAW_STREAM_OPEN_TIMEOUT, RawSource};
 /// `fifo:` insists on a FIFO (a regular file behind it is a mistake to surface), `file:` accepts either.
 #[derive(Debug, Clone, Copy)]
 enum Kind {
-    /// `file:<path>` — a regular file or a FIFO. The general "the bytes at this path."
+    /// `file:<path>`: a regular file or a FIFO. The general "the bytes at this path."
     File,
-    /// `fifo:<path>` — a FIFO only. A regular file at the path is refused, because the operator asked for a
+    /// `fifo:<path>`: a FIFO only. A regular file at the path is refused, because the operator asked for a
     /// named pipe (whose reopen-blocks-until-writer semantics are usually the point).
     Fifo,
 }
@@ -111,7 +111,8 @@ impl Stdin {
     }
 
     /// Take the reader, or refuse if a prior connection already holds it. `None` means "already in use": the
-    /// caller turns it into a clean `Response::Error`, never a racing second read.
+    /// caller turns it into a clean `Response::Refused` carrying an `Unavailable` detail, never a racing
+    /// second read.
     fn take(&self) -> Option<BoxRead> {
         let Self(cell) = self;
         // A poisoned lock means a prior holder panicked mid-take; treat the source as taken (never hand out a
