@@ -5,10 +5,10 @@
 //! NOT a mutation of the running exposer. Instead it mirrors the [`Revocations`](nauthy::Revocations) shape
 //! exactly: a small, node-local set the gate consults per stream, backed by a file another process (an
 //! `enable`/`disable` command) writes. The set here is DISABLED service names; a stream requesting a name in
-//! the set is refused at the same seam a revoked capability is, with the same indistinguishable refusal, so a
+//! the set is refused at the same point a revoked capability is, with the same indistinguishable refusal, so a
 //! disabled service reads to a dialer exactly like a gated or absent one (no enumeration oracle).
 //!
-//! [`EnabledServices`] is the seam. It is a synchronous, one-method trait, so a consumer whose state lives in
+//! [`EnabledServices`] is the extension point. It is a synchronous, one-method trait, so a consumer whose state lives in
 //! a database or a config reload implements it over that store and needs no file. The batteries-included impl
 //! is [`FileDisabledList`] (behind default tokio-fs use), a persisted set of disabled names on disk.
 //!

@@ -103,7 +103,7 @@ UNIVERSE=$(printf '%s\n%s\n' "$universe_pkgs" "$universe_deps" | grep -v '^$' | 
 #   * LOCAL   -- a package DEFINED in this tree (a co-located sibling), vs an EXTERNAL crate
 #     known only as a git dependency. A crate may freely name a co-located sibling LIBRARY
 #     (the substrate crates in a workspace document each other: bifrost-core points at where
-#     the `Transport` seam lives, quirk describes its bifrost adapter). Naming an EXTERNAL
+#     the `Transport` trait lives, quirk describes its bifrost adapter). Naming an EXTERNAL
 #     crate you do not depend on is the cross-layer leak (`measure` naming `tightbeam`).
 #   * APP     -- a package whose primary product is a binary (a `src/main.rs`, Cargo's
 #     application convention: `swoosh`). The application IS the consumer; NO other crate may

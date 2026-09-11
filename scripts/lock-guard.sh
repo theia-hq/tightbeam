@@ -110,7 +110,7 @@ lock_block() {
 }
 
 # Derive siblings as "name repo rev" (space-separated; names/revs never contain spaces) from
-# every theia-hq git dep across the manifests. The `|| true` on the grep is load-bearing: under
+# every theia-hq git dep across the manifests. The `|| true` on the grep is necessary: under
 # `set -e` a no-match (exit 1) in this pipeline kills the `list_manifests | while` subshell at
 # the first manifest that declares no theia dep, so a git dep declared outside the ROOT manifest
 # was never enumerated (bifrost/quirk/nauthy reported 0 siblings and their drift went unchecked).

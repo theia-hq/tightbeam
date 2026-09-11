@@ -41,7 +41,7 @@ async fn a_listed_name_is_disabled() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// The load-bearing property: a `disable` written AFTER the oracle loaded is honored live (a re-read on the
+/// The essential property: a `disable` written AFTER the oracle loaded is honored live (a re-read on the
 /// mtime change), and a later `enable` restores the service, both with no reconstruction. This is the
 /// no-restart toggle the exposer relies on.
 #[tokio::test]
