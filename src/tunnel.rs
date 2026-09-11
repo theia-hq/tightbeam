@@ -808,7 +808,7 @@ pub struct Exposer {
     /// "opened a legitimate service", `public_unsafe` = "knowingly serves raw bytes with no auth".
     public_unsafe: PublicServices,
     /// The live enable/disable oracle the per-stream gate consults (delib-47): a stream for a name this
-    /// reports disabled is refused at the admit seam, exactly like a revoked capability. Defaults to
+    /// reports disabled is refused at admission, exactly like a revoked capability. Defaults to
     /// [`AllEnabled`] (nothing disabled), so a caller that never toggles pays nothing; a caller that does
     /// wires a file-backed [`FileDisabledList`](crate::enabled::FileDisabledList) with
     /// [`with_enabled`](Exposer::with_enabled). Boxed like the gate's own [`Revocations`](nauthy::Revocations)
@@ -910,7 +910,7 @@ impl Exposer {
     }
 
     /// Wire the live enable/disable oracle the per-stream gate consults (delib-47): a stream requesting a
-    /// service this oracle reports disabled is refused at the admit seam, indistinguishably from a gated or
+    /// service this oracle reports disabled is refused at admission, indistinguishably from a gated or
     /// absent service, and a re-enable restores it LIVE with no restart (the oracle re-reads its backing state
     /// when it changes). A separate builder, NOT a `new` parameter, because disabling is orthogonal to the
     /// door interlocks `new` enforces and every existing caller/test builds a fully-gated exposer without it.
@@ -1123,7 +1123,7 @@ struct Serving {
     services: Services,
     registry: Arc<Registry>,
     raw_stream_opens: Semaphore,
-    /// The live enable/disable oracle (delib-47), consulted per stream at the admit seam beside the gate: a
+    /// The live enable/disable oracle (delib-47), consulted per stream at admission, beside the gate: a
     /// disabled service is refused with the same indistinguishable refusal a gate miss gives.
     enabled: Box<dyn EnabledServices + Send + Sync>,
 }
@@ -1215,7 +1215,7 @@ where
     // BEFORE the gate so a delegated slip for that service still matches (the gate checks the RESOLVED service).
     let service = resolve_single_service(service, services);
 
-    // Live enable/disable (delib-47), consulted at the SAME seam the gate is, on the RESOLVED name: a service
+    // Live enable/disable (delib-47), consulted at the SAME point in admission as the gate, on the RESOLVED name: a service
     // the operator has disabled refuses here, before admission, and a re-enable restores it on the next stream
     // with no restart (the oracle re-reads its backing file on change). The wire gets the SAME indistinguishable
     // refusal a gate miss gives, so a disabled service reads exactly like a gated or absent one: no dialer can
@@ -1410,7 +1410,7 @@ fn admit(
         },
         _ => None,
     };
-    // Mint the transport-proven peer at this admission seam: the `peer` NodeId reached here only via a
+    // Mint the transport-proven peer at admission: the `peer` NodeId reached here only via a
     // completed bifrost handshake (`serve_session` reads it from `Session::peer`), which proves the dialer
     // holds the secret behind it, exactly the precondition `ProvenPeer::from_handshake` marks.
     let peer = ProvenPeer::from_handshake(peer.verify_key());
@@ -2757,7 +2757,7 @@ mod tests {
             .await;
     }
 
-    /// The cancel seam (delib-18/S18): `Exposer::run` returns gracefully when its cancel token fires, so any
+    /// The cancel path (delib-18/S18): `Exposer::run` returns gracefully when its cancel token fires, so any
     /// holder of a CLONE of this token can stop the node. Here the token is cancelled from OUTSIDE the run
     /// (the shape any such holder uses); the run must finish with `Ok(())` rather than accept forever. Uses
     /// the mem transport so no real socket is bound.
@@ -3051,7 +3051,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// delib-47 live toggle, END TO END through the gate seam: a service named in the `<home>/disabled` file is
+    /// delib-47 live toggle, END TO END through the gate: a service named in the `<home>/disabled` file is
     /// refused at `serve_request` with the SAME indistinguishable refusal a gate miss gives, and after the file
     /// is rewritten to RE-ENABLE it, the very next stream against the SAME running serving context serves it,
     /// with no restart (the mtime-watched [`FileDisabledList`] re-read the change). This is the property the

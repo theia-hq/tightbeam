@@ -94,7 +94,7 @@ strangers is a deliberate second step, `Exposer::with_public(PublicRequest::new(
 named service is exposed and safe to open before the node serves it. A handler with no authorization of its
 own (a keyless shell) can never be opened this way, and a raw byte source is redirected to the distinct,
 louder unsafe opt-in (`PublicUnsafeRequest`, the fourth `new` argument). The `CancellationToken` is the
-node's teardown seam: a caller may hold a clone and fire it to stop the accept loop.
+node's teardown handle: a caller may hold a clone and fire it to stop the accept loop.
 
 ## Inject a named service
 

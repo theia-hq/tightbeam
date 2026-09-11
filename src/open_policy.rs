@@ -17,7 +17,7 @@
 //! [`Exposer::new`](crate::tunnel::Exposer::new) reads the erased `OPEN_SAFE` once to refuse an open gate over
 //! a [`Never`] handler.
 //!
-//! The seal is load-bearing, so it is guarded by a compile-fail probe: a downstream marker is REJECTED
+//! The seal is necessary, so it is guarded by a compile-fail probe: a downstream marker is REJECTED
 //! because the `sealed::Sealed` supertrait it would need is private and unnameable. This doc-test fails to
 //! build (as it must) precisely because the third marker cannot satisfy `PublicUse`:
 //!
