@@ -237,6 +237,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "bifrost"
 version = "0.0.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=26e8272d890b0b424bc6960b9d38e09b40cc428d#26e8272d890b0b424bc6960b9d38e09b40cc428d"
 dependencies = [
  "bifrost-core",
  "bifrost-transport",
@@ -246,6 +247,7 @@ dependencies = [
 [[package]]
 name = "bifrost-core"
 version = "0.0.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=26e8272d890b0b424bc6960b9d38e09b40cc428d#26e8272d890b0b424bc6960b9d38e09b40cc428d"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -256,6 +258,7 @@ dependencies = [
 [[package]]
 name = "bifrost-iroh"
 version = "0.0.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=26e8272d890b0b424bc6960b9d38e09b40cc428d#26e8272d890b0b424bc6960b9d38e09b40cc428d"
 dependencies = [
  "bifrost-core",
  "bifrost-transport",
@@ -266,6 +269,7 @@ dependencies = [
 [[package]]
 name = "bifrost-mdns"
 version = "0.0.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=26e8272d890b0b424bc6960b9d38e09b40cc428d#26e8272d890b0b424bc6960b9d38e09b40cc428d"
 dependencies = [
  "bifrost-core",
  "swarm-discovery",
@@ -277,6 +281,7 @@ dependencies = [
 [[package]]
 name = "bifrost-mem"
 version = "0.0.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=26e8272d890b0b424bc6960b9d38e09b40cc428d#26e8272d890b0b424bc6960b9d38e09b40cc428d"
 dependencies = [
  "bifrost-core",
  "bifrost-transport",
@@ -287,6 +292,7 @@ dependencies = [
 [[package]]
 name = "bifrost-transport"
 version = "0.0.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=26e8272d890b0b424bc6960b9d38e09b40cc428d#26e8272d890b0b424bc6960b9d38e09b40cc428d"
 dependencies = [
  "bifrost-core",
  "tokio",
@@ -295,6 +301,7 @@ dependencies = [
 [[package]]
 name = "bifrost-wire"
 version = "0.0.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=26e8272d890b0b424bc6960b9d38e09b40cc428d#26e8272d890b0b424bc6960b9d38e09b40cc428d"
 dependencies = [
  "blake3",
  "thiserror 2.0.20",
@@ -2203,6 +2210,7 @@ dependencies = [
 [[package]]
 name = "nauthy"
 version = "0.1.0"
+source = "git+https://github.com/theia-hq/nauthy?rev=7a4c9d4850f84db9acf5288c324bf3808a1b089f#7a4c9d4850f84db9acf5288c324bf3808a1b089f"
 dependencies = [
  "biscuit-auth",
  "data-encoding",
@@ -4812,11 +4820,3 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[patch.unused]]
-name = "quirk"
-version = "0.0.0"
-
-[[patch.unused]]
-name = "bifrost-quirk"
-version = "0.0.0"
