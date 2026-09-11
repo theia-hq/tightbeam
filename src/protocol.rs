@@ -2,13 +2,15 @@
 //! service, optionally presents a capability, and reports whether it was reached, before the transparent
 //! byte pipe begins. Pure framing; the payload after it is raw bytes (the point of a tunnel).
 
+use bifrost::{Refusal, RefusalDetail};
 use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
 
-/// Magic + version prefixing a request; a foreign or mismatched-version stream is rejected. `TB03` adds an
-/// optional `membership` field after `capability`, for a signet-bound slip that ANDs a foreign-fleet badge;
-/// a `TB02` peer that omitted it is no longer wire compatible, which is correct: the two ends of one tunnel
-/// are one release.
-const MAGIC: [u8; 4] = *b"TB03";
+/// Magic + version prefixing a request; a foreign or mismatched-version stream is rejected. `TB04` types
+/// the tag-1 response: a refusal code byte plus a bounded detail, replacing the free-form string. The
+/// request layout is unchanged from `TB03` (which added the optional `membership` field after
+/// `capability`), but the tag-1 meaning changed, so a `TB03` peer is no longer wire compatible, which is
+/// correct: the two ends of one tunnel are one release.
+const MAGIC: [u8; 4] = *b"TB04";
 
 /// A connector's opening frame: reach the named service, optionally presenting a capability and, for a
 /// signet-bound slip, a membership badge under the foreign fleet the slip names.
@@ -29,8 +31,17 @@ pub struct Request {
 pub enum Response {
     /// The service was reached; the byte pipe follows.
     Ok,
-    /// The service could not be reached, with a human-readable reason.
-    Error(String),
+    /// The host refused the stream. Typed: a consumer matches the
+    /// classification; there is no free-form string to parse.
+    Refused(Refusal),
+}
+
+/// Wire codes for the [`Refusal`] variants, beside the frame they
+/// select. A new variant forces a code here and an arm in the reader.
+mod refusal_tag {
+    pub const NOT_ADMITTED: u8 = 0;
+    pub const BAD_REQUEST: u8 = 1;
+    pub const UNAVAILABLE: u8 = 2;
 }
 
 impl Request {
@@ -62,9 +73,19 @@ impl Response {
     pub async fn write<W: io::AsyncWrite + Unpin>(&self, writer: &mut W) -> io::Result<()> {
         match self {
             Response::Ok => writer.write_all(&[0]).await,
-            Response::Error(message) => {
+            Response::Refused(refusal) => {
                 writer.write_all(&[1]).await?;
-                write_str(writer, message).await
+                match refusal {
+                    Refusal::NotAdmitted => writer.write_all(&[refusal_tag::NOT_ADMITTED]).await,
+                    Refusal::BadRequest { detail } => {
+                        writer.write_all(&[refusal_tag::BAD_REQUEST]).await?;
+                        write_detail(writer, detail).await
+                    }
+                    Refusal::Unavailable { detail } => {
+                        writer.write_all(&[refusal_tag::UNAVAILABLE]).await?;
+                        write_detail(writer, detail).await
+                    }
+                }
             }
         }
     }
@@ -75,7 +96,22 @@ impl Response {
         reader.read_exact(&mut tag).await?;
         match tag[0] {
             0 => Ok(Response::Ok),
-            1 => Ok(Response::Error(read_str(reader).await?)),
+            1 => {
+                let mut code = [0u8; 1];
+                reader.read_exact(&mut code).await?;
+                match code[0] {
+                    refusal_tag::NOT_ADMITTED => Ok(Response::Refused(Refusal::NotAdmitted)),
+                    refusal_tag::BAD_REQUEST => Ok(Response::Refused(Refusal::BadRequest {
+                        detail: read_detail(reader).await?,
+                    })),
+                    refusal_tag::UNAVAILABLE => Ok(Response::Refused(Refusal::Unavailable {
+                        detail: read_detail(reader).await?,
+                    })),
+                    other => Err(io::Error::other(format!(
+                        "unknown refusal code {other:#04x}"
+                    ))),
+                }
+            }
             other => Err(io::Error::other(format!(
                 "unknown response tag {other:#04x}"
             ))),
@@ -108,6 +144,37 @@ async fn read_opt<R: io::AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option
             "unknown presence tag {other:#04x}"
         ))),
     }
+}
+
+/// Write a bounded refusal detail as a `u16` byte count plus UTF-8 bytes. The
+/// text is already bounded by [`RefusalDetail::bounded`], so the count cannot
+/// overflow the wire field; the conversion is still checked rather than
+/// unwrapped, so a future unbounded caller fails the write instead of cutting a
+/// codepoint.
+async fn write_detail<W: io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    detail: &RefusalDetail,
+) -> io::Result<()> {
+    let bytes = detail.as_str().as_bytes();
+    let len =
+        u16::try_from(bytes.len()).map_err(|_| io::Error::other("refusal detail too long"))?;
+    writer.write_all(&len.to_be_bytes()).await?;
+    writer.write_all(bytes).await
+}
+
+/// Read a bounded refusal detail written by [`write_detail`]. An over-cap
+/// claim is rejected before the reader allocates, and the bytes must be valid
+/// UTF-8: a corrupt or hostile frame is an error, never lossily repaired.
+async fn read_detail<R: io::AsyncRead + Unpin>(reader: &mut R) -> io::Result<RefusalDetail> {
+    let mut len = [0u8; 2];
+    reader.read_exact(&mut len).await?;
+    let len = usize::from(u16::from_be_bytes(len));
+    if len > RefusalDetail::MAX_LEN {
+        return Err(io::Error::other("refusal detail too long"));
+    }
+    let mut bytes = vec![0u8; len];
+    reader.read_exact(&mut bytes).await?;
+    RefusalDetail::try_from(bytes).map_err(io::Error::other)
 }
 
 pub(crate) async fn write_str<W: io::AsyncWrite + Unpin>(
