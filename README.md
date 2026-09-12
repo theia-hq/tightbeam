@@ -9,10 +9,10 @@ and passing the gate, reaches one service and gets a plain byte stream to it. An
 TCP port or a Unix socket rides it unchanged. No port forwarding, no VPN, no public IP.
 
 tightbeam is a Rust library you embed. You build an `Exposer` to serve services behind a gate, or a
-`Connector` to reach one and get a stream back. It ships no services of its own and prints nothing: the
-program that embeds it supplies the services, the identity, and the output. The keyed connection underneath
-is [bifrost](https://github.com/theia-hq/bifrost)'s; who may pass a gate is
-[nauthy](https://github.com/theia-hq/nauthy)'s.
+`Connector` to reach one and get a stream back. It ships only its own built-ins (`echo:`, forwards, raw
+streams) and prints nothing: the program that embeds it supplies the other services, the identity, and
+the output. The keyed connection underneath is [bifrost](https://github.com/theia-hq/bifrost)'s; who may
+pass a gate is [nauthy](https://github.com/theia-hq/nauthy)'s.
 
 > Experimental. Works for TCP over the iroh transport; not ready for production use.
 ## Add it as a dependency
