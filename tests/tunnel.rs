@@ -56,7 +56,7 @@ async fn tunnels_tcp_over_bifrost() {
                 .unwrap();
             });
             tokio::task::spawn_local(async move {
-                Connector::to_node(exposer_id, "default".to_owned(), None)
+                Connector::to_node(exposer_id, "default".parse().unwrap(), None)
                     .preflight(&consumer, local_port)
                     .await
                     .unwrap()

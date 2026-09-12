@@ -130,28 +130,28 @@ let registry = Registry::new().with("sh", Shell);
 
 A gate rooted at a node's signet admits the node's own devices and their delegates. A delegate holds a
 `sheer:` capability: a signed, expiring, attenuable link the gate verifies offline, with no server in the
-loop and no allowlist to sync. tightbeam exposes minting, narrowing, and revoking as plain operations over
-these links.
+loop and no allowlist to sync. The link is a [`nauthy::Link`], and minting, narrowing, and revoking are
+methods on it.
 
 ```rust
 use core::time::Duration;
-use tightbeam::tunnel::{mint_bound_link, mint_link, mint_signet_link, narrow_link, revoke_into};
+use nauthy::Link;
 
 // A delegable link granting one service for two hours; the holder may narrow it and hand it on.
-let link = mint_link(&identity, &service, Duration::from_secs(2 * 3600), true)?;
+let link = Link::mint(&identity, &service, Duration::from_secs(2 * 3600))?;
 
 // Bind a link to one device, so a copy observed in flight or at rest grants no one.
-let bound = mint_bound_link(&identity, &service, device_key, Duration::from_secs(3600))?;
+let bound = Link::mint_bound(&identity, &service, device_key, Duration::from_secs(3600))?;
 
 // Issue once to a whole fleet: every device that fleet vouches for may use it, and only when the
 // presenter ALSO proves membership under that fleet (the two-token admission the wire carries below).
-let slip = mint_signet_link(&identity, &service, fleet_root, Duration::from_secs(3600))?;
+let slip = Link::mint_signet(&identity, &service, fleet_root, Duration::from_secs(3600))?;
 
 // A holder narrows a link further, offline, before delegating (no key, no network).
-let tighter = narrow_link(&link, Some(&service), Some(Duration::from_secs(1800)))?;
+let tighter = link.narrow(Some(&service), Some(Duration::from_secs(1800)))?;
 
 // Revoke a link into a denylist, so the gate refuses it and everything attenuated from it.
-revoke_into(&mut denylist, &link).await?;
+link.revoke(&mut denylist).await?;
 ```
 
 A link works only for the service it grants, expires on its own, and can be narrowed and delegated without

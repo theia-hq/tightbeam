@@ -2,10 +2,10 @@
 //!
 //! This is the domain a tunnel is made of, with no CLI around it: an [`Exposer`] that accepts overlay
 //! sessions and forwards inbound streams to local services, a [`Connector`] that reaches a peer's exposed
-//! service, the [`resolve_gate`] policy, and the offline capability operations ([`mint_link`],
-//! [`narrow_link`], [`revoke_into`]). It prints NOTHING and reads no config path: a caller (tightbeam's
-//! own CLI, or any other consumer) loads the signet, denylist, and identity, prints its own banner, and drives
-//! this core. Everything here already speaks `bifrost` and `nauthy`, never clap or a store.
+//! service, the [`resolve_gate`] policy, and the offline credential operations on a [`Link`] (mint, narrow,
+//! revoke). It prints NOTHING and reads no config path: a caller loads the signet, denylist, and identity,
+//! prints its own banner, and drives this core. Everything here already speaks `bifrost` and `nauthy`, never
+//! clap or a store.
 
 use core::future::Future;
 use core::time::Duration;
@@ -16,7 +16,7 @@ use bifrost::{ConnInfo, Discovery, Node, NodeId, Refusal, RefusalDetail, Session
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use nauthy::{Admitted, Cap, FileDenylist, Gate, Identity, ProvenPeer, Service};
+use nauthy::{Admitted, Cap, FileDenylist, Gate, Link, ProvenPeer, Service};
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -380,10 +380,8 @@ impl Services {
                 }
                 // Crossing the token: the unsafe overlay is ONLY for raw byte sources. A handler or a forward
                 // named here is redirected to the SAFE public overlay, never silently opened, never leaking a
-                // marker type name. STRING B, CLI-Architect round-3, in its library-PURE form: the layering
-                // gate forbids a library naming a consumer flag, so this speaks the concept (the public
-                // overlay) and each consumer bin's --help names the exact flag. See the report FLAG to
-                // CLI-Architect/Style-Warden on the flag-named-vs-conceptual branch.
+                // marker type name. The layering gate forbids a library naming a consumer's flags, so this
+                // speaks the concept (the public overlay) and a caller's own help names the exact flag.
                 // An `echo:` reflector is not a raw byte source either (it exposes no host resource), so it
                 // joins the handler/forward redirect: its safe public form is the SAFE public set, never this
                 // louder raw-stream opt-in.
@@ -445,7 +443,7 @@ impl Posture {
         }
     }
 
-    /// The word a table renders for this posture (`gated` / `open`), so the CLI reads at a glance.
+    /// The word a table renders for this posture (`gated` / `open`), so a caller's table reads at a glance.
     pub fn label(self) -> &'static str {
         match self {
             Self::Gated => "gated",
@@ -750,8 +748,8 @@ impl Registry {
     }
 }
 
-/// Resolve the exposer's node BASE gate, in ONE place so every embedder (tightbeam's own CLI and any other
-/// consumer) applies the SAME policy: a family gate on the node's provisioned `signet`; an UNPROVISIONED
+/// Resolve the exposer's node BASE gate, in ONE place so every embedder applies the SAME policy: a family
+/// gate on the node's provisioned `signet`; an UNPROVISIONED
 /// node fails LOUD rather than ever defaulting to open. The caller loads the denylist and passes it as a
 /// value. This exists so the two security-relevant conventions (fail-loud-on-unprovisioned,
 /// real-loaded-denylist) are enforced once, not hand-copied into each caller.
@@ -929,9 +927,9 @@ impl Exposer {
                 );
             };
             if matches!(gate, Gate::Open) && !handler.open_safe() {
-                // STRING C (CLI-Architect round-3), `{scheme}` variant: a keyless shell has NO safe way to be
-                // opened, so it hard-refuses with no redirect (unlike a raw stream, which STRING A points at
-                // the unsafe raw-stream set).
+                // The `{scheme}` variant of the keyless-shell refusal: a keyless shell has NO safe way to be
+                // opened, so it hard-refuses with no redirect (unlike a raw stream, which the raw-stream
+                // refusal points at the unsafe raw-stream set).
                 eyre::bail!(
                     "`{scheme}` has no legitimate public use: a keyless shell (or an alias of one) would hand a \
                      shell to anyone who reaches this node. keep it family-gated; drop it from the public set"
@@ -954,11 +952,10 @@ impl Exposer {
                 .raw_stream_names()
                 .find(|name| !proven_unsafe.contains(name))
         {
-            // STRING A (CLI-Architect round-3), library-PURE form: the ONE unified raw-stream-under-a-public-
-            // gate refusal, shared byte-for-byte with the per-service `with_public` door below (differing only
-            // in `{name}`). It REDIRECTS to the unsafe raw-stream set (a raw stream is now deliberately
-            // openable), not a flat refusal; the exact flag token is named by each consumer bin's --help
-            // (the layering gate forbids a library naming a consumer flag).
+            // The ONE unified raw-stream-under-a-public-gate refusal, shared byte-for-byte with the
+            // per-service `with_public` door below (differing only in `{name}`). It REDIRECTS to the unsafe
+            // raw-stream set (a raw stream is now deliberately openable), not a flat refusal; a caller's own
+            // help names the exact flag (the layering gate forbids a library naming a consumer flag).
             eyre::bail!(
                 "`{name}` is a raw byte source (file:/fifo:/stdin:) with no auth of its own, so a public gate \
                  will not serve it. to serve its raw bytes to anyone, name it in the unsafe raw-stream set; \
@@ -1068,17 +1065,16 @@ impl Exposer {
             match &route.target {
                 // A raw stream named in the SAFE overlay is a teaching REDIRECT, not a flat refusal: the safe
                 // overlay never opens a raw byte source (`open_safe` stays `false` for it), but the operator
-                // CAN serve its bytes knowingly through the DISTINCT unsafe overlay. STRING A (CLI-Architect
-                // round-3), byte-for-byte the SAME string as the whole-node door above: one condition, one
-                // string, both bins.
+                // CAN serve its bytes knowingly through the DISTINCT unsafe overlay. Byte-for-byte the SAME
+                // string as the whole-node door above: one condition, one string, both callers.
                 Target::RawStream(_) => eyre::bail!(
                     "`{name}` is a raw byte source (file:/fifo:/stdin:) with no auth of its own, so a public \
                      gate will not serve it. to serve its raw bytes to anyone, name it in the unsafe raw-stream \
                      set; otherwise gate it or drop it from the public set"
                 ),
                 // A keyless shell or an aliased shell is a HARD no: it has no legitimate public use and no
-                // redirect exists (unlike a raw stream). STRING C (CLI-Architect round-3), `{name}` variant.
-                // Never leaks a marker type name.
+                // redirect exists (unlike a raw stream). The `{name}` variant of the shell refusal; never
+                // leaks a marker type name.
                 _ if !route.target.open_safe(&self.registry) => eyre::bail!(
                     "`{name}` has no legitimate public use: a keyless shell (or an alias of one) would hand a \
                      shell to anyone who reaches this node. keep it family-gated; drop it from the public set"
@@ -1347,7 +1343,7 @@ where
     // refusal a gate miss gives, so a disabled service reads exactly like a gated or absent one: no dialer can
     // tell "disabled" from "not a member", and toggling leaks nothing. An already-open stream to a service
     // disabled mid-flight stays open (next-stream semantics, identical to revocation).
-    if !enabled.is_enabled(service.as_str()) {
+    if !enabled.is_enabled(&service) {
         tracing::warn!(%peer, service = %service, "refused: service disabled");
         return Response::Refused(Refusal::NotAdmitted)
             .write(&mut writer)
@@ -1742,21 +1738,21 @@ pub struct DialRefused {
 
 /// A resolved connect: the node to dial, the service to ask for, and any token to present.
 ///
-/// The domain half of a `connect`, with the CLI's target-parsing (`Target`/`FromStr`) left in the CLI
-/// layer. A caller builds one with [`Connector::to_node`] (a raw node id, optionally presenting a link) or
-/// [`Connector::from_link`] (a `sheer:` link that supplies both the node and the token), then drives it
-/// with [`Connector::preflight`] (then [`PortForward::run`]) or [`Connector::pipe_stdio`].
+/// The domain half of a `connect`, with target parsing left to the caller. A caller builds one with
+/// [`Connector::to_node`] (a raw node id, optionally presenting a [`Link`]) or [`Connector::from_link`]
+/// (a `sheer:` link that supplies both the node and the token), then drives it with
+/// [`Connector::preflight`] (then [`PortForward::run`]) or [`Connector::pipe_stdio`].
 pub struct Connector {
     dial: NodeId,
-    service: String,
-    capability: Option<String>,
-    membership: Option<String>,
+    service: Service,
+    capability: Option<Link>,
+    membership: Option<Link>,
 }
 
 impl Connector {
     /// Connect to a raw node id, requesting `service`. A raw-node dial may still present a token via
     /// `present`, for the case where the node id was shared separately from the capability.
-    pub fn to_node(dial: NodeId, service: String, present: Option<String>) -> Self {
+    pub fn to_node(dial: NodeId, service: Service, present: Option<Link>) -> Self {
         Self {
             dial,
             service,
@@ -1767,13 +1763,13 @@ impl Connector {
 
     /// Connect via a `sheer:` capability link, requesting `service`. The link supplies the node to dial
     /// (the cap's root) and carries the token; the host refuses unless the token actually grants `service`.
-    pub fn from_link(link: &str, service: String) -> eyre::Result<Self> {
-        Ok(Self {
-            dial: Cap::parse(link)?.root().node_id(),
+    pub fn from_link(link: &Link, service: Service) -> Self {
+        Self {
+            dial: link.root().node_id(),
             service,
-            capability: Some(link.to_owned()),
+            capability: Some(Link::clone(link)),
             membership: None,
-        })
+        }
     }
 
     /// Also present `badge` in the SECOND slot: a membership badge under the foreign fleet a signet-bound
@@ -1781,7 +1777,7 @@ impl Connector {
     /// valid under the fleet the slip names) before admitting. A no-op for every plain dial, whose slot 1
     /// admits alone and whose host never consults slot 2.
     #[must_use]
-    pub fn with_membership(mut self, badge: String) -> Self {
+    pub fn with_membership(mut self, badge: Link) -> Self {
         self.membership = Some(badge);
         self
     }
@@ -1792,16 +1788,17 @@ impl Connector {
     }
 
     /// The service this connector requests.
-    pub fn service(&self) -> &str {
+    pub fn service(&self) -> &Service {
         &self.service
     }
 
-    /// The opening request this connector sends on each stream: the service to reach and any token.
+    /// The opening request this connector sends on each stream: the service to reach and any token. The
+    /// one place the typed slots become the wire's raw text.
     fn request(&self) -> Request {
         Request {
-            service: String::clone(&self.service),
-            capability: self.capability.clone(),
-            membership: self.membership.clone(),
+            service: self.service.to_string(),
+            capability: self.capability.as_ref().map(ToString::to_string),
+            membership: self.membership.as_ref().map(ToString::to_string),
         }
     }
 
@@ -1908,7 +1905,7 @@ impl<S: Session> PortForward<S> {
                     if let Err(error) = result {
                         // A refused stream (an unexposed service, a revoked or non-granting cap) carries a
                         // user-actionable reason. The core is print-free (a library embedder owns its own
-                        // output), so route it through `tracing`; the CLI adapter surfaces it to the user.
+                        // output), so route it through `tracing`; the caller surfaces it to its user.
                         tracing::warn!("connection failed: {error:#}");
                     }
                 }
@@ -2008,89 +2005,6 @@ where
         Response::Ok => pipe_stdio_bridge(writer, reader).await?,
         Response::Refused(refusal) => return Err(bifrost::Error::Refused(refusal).into()),
     }
-    Ok(())
-}
-
-/// Mint a `sheer:` capability link granting `service`, valid for `lifetime`.
-///
-/// A non-delegable link is sealed so no holder can append a narrower block; a delegable one is left open.
-/// Verification is unaffected either way. Offline: needs the signing `identity` but no network.
-pub fn mint_link(
-    identity: &Identity,
-    service: &Service,
-    lifetime: Duration,
-    delegable: bool,
-) -> eyre::Result<String> {
-    let cap = identity.mint(service, nauthy::Request::expires_in(lifetime))?;
-    let cap = if delegable { cap } else { cap.seal()? };
-    Ok(cap.link()?)
-}
-
-/// Mint a device-bound `sheer:` capability link granting `service` to the proven device `bound_to`, valid
-/// for `lifetime`.
-///
-/// The standing per-service grant for one device (see [`nauthy::Identity::mint_bound`]): the link is inert
-/// unless presented by `bound_to`, so a copy observed in flight or at rest grants no one. Always sealed:
-/// a bound slip is non-delegable by construction (it cannot be narrowed and handed onward, which is the
-/// point of binding it), so unlike [`mint_link`] there is no `delegable` option. Offline: needs the signing
-/// `identity` but no network.
-pub fn mint_bound_link(
-    identity: &Identity,
-    service: &Service,
-    bound_to: nauthy::VerifyKey,
-    lifetime: Duration,
-) -> eyre::Result<String> {
-    let cap = identity.mint_bound(service, bound_to, nauthy::Request::expires_in(lifetime))?;
-    Ok(cap.seal()?.link()?)
-}
-
-/// Mint a signet-bound `sheer:` link granting `service` to any device of the fleet `foreign_root`, valid
-/// for `lifetime`.
-///
-/// The work-sim primitive: issue ONCE to a person's signet `foreign_root`, and every device that signet
-/// vouches for may use it (see [`nauthy::Identity::mint_authority_slip`]). Inert alone: the far gate admits it
-/// only when the presenter ALSO proves membership under `foreign_root`. Always sealed: a fleet-bound slip is
-/// theft-resistant and non-delegable by construction (like [`mint_bound_link`]). Offline: needs the signing
-/// `identity` but no network.
-pub fn mint_signet_link(
-    identity: &Identity,
-    service: &Service,
-    foreign_root: nauthy::VerifyKey,
-    lifetime: Duration,
-) -> eyre::Result<String> {
-    let cap = identity.mint_authority_slip(
-        service,
-        foreign_root,
-        nauthy::Request::expires_in(lifetime),
-    )?;
-    Ok(cap.seal()?.link()?)
-}
-
-/// Narrow a `sheer:` link offline: tighten its service and/or shorten its expiry, returning the tighter
-/// link. Only ever adds constraints, so the result is never broader than the input. At least one of
-/// `service` or `shorten` must be given.
-pub fn narrow_link(
-    link: &str,
-    service: Option<&Service>,
-    shorten: Option<Duration>,
-) -> eyre::Result<String> {
-    if service.is_none() && shorten.is_none() {
-        eyre::bail!("narrow it by service and/or a shorter expiry");
-    }
-    let cap = Cap::parse(link)?;
-    let shorten = shorten.map(nauthy::Request::expires_in);
-    let narrowed = cap.attenuate(service, shorten)?;
-    Ok(narrowed.link()?)
-}
-
-/// Revoke a `sheer:` link into an open denylist, so the gate refuses it and everything attenuated from it.
-///
-/// The caller opens the denylist (from wherever it persists revocations) and passes it BY REF; the core
-/// never reads a config path. It records EXACTLY the link's id and every narrower cap delegated from it,
-/// NOT the wider grant it was attenuated from.
-pub async fn revoke_into(denylist: &mut FileDenylist, link: &str) -> eyre::Result<()> {
-    let cap = Cap::parse(link)?;
-    denylist.revoke(&cap).await?;
     Ok(())
 }
 
@@ -2779,7 +2693,7 @@ mod tests {
     #[test]
     fn public_unsafe_naming_a_handler_or_forward_is_redirected() {
         // The disjoint-token partition: the unsafe overlay is ONLY for raw streams. A handler or a forward
-        // named in it is a teaching redirect to the public overlay (STRING B, CLI-Architect round-3), never silently
+        // named in it is a teaching redirect to the public overlay, never silently
         // opened.
         let handler = services(&["ping=ping:"]);
         let registry = super::Registry::new().with("ping", OpenNoop);
@@ -2891,7 +2805,7 @@ mod tests {
 
     /// The full served path: an exposer over a `stdin:`-shaped source, a connector reaching it over the
     /// in-process transport, and the peer receiving the source's EXACT bytes. Drives the same take-once +
-    /// `Target::RawStream` splice the binary uses, with an injected reader in place of the real fd 0. A second
+    /// `Target::RawStream` splice the served path uses, with an injected reader in place of the real fd 0. A second
     /// concurrent connection finds the source taken and is refused cleanly (not a corrupted second read).
     #[tokio::test]
     async fn a_stdin_source_is_served_to_the_peer_and_a_second_reader_is_refused() {
@@ -2953,7 +2867,7 @@ mod tests {
 
     /// The full served path for the built-in reflector: an exposer over an `echo:` target, a connector
     /// reaching it over the in-process transport, and the peer receiving its OWN bytes back verbatim. Drives
-    /// the exact `Target::Echo` loopback the binary serves. The open BASE gate keeps the peer admitted with no
+    /// the exact `Target::Echo` loopback the exposer serves. The open BASE gate keeps the peer admitted with no
     /// token, isolating the reflect path (the safe-public admission is covered by
     /// `echo_is_admitted_under_plain_public_with_no_unsafe_opt_in`).
     #[tokio::test]
@@ -3045,7 +2959,7 @@ mod tests {
     /// each receiving the source's bytes from ONE shared ring. The source is a duplex whose write half the test
     /// holds, so all N consumers attach BEFORE any bytes flow (a live session, not a replay); then the body is
     /// written once and every consumer reads it. This drives the exact `Target::RawStream(RawStream::lossy)`
-    /// serve path the binary uses, proving one source fans out to many independent cursors.
+    /// serve path, proving one source fans out to many independent cursors.
     #[tokio::test]
     async fn a_lossy_source_fans_out_to_many_consumers() {
         use tokio::io::AsyncWriteExt as _;
@@ -3554,13 +3468,14 @@ mod tests {
                 // (a) a STRANGER: no token at all -> gate refuses (Missing) -> `NotAdmitted`.
                 let stranger = dial("ssh", None).await;
                 // (b) a REVOKED holder: presents the now-denylisted `ssh` slip -> gate refuses (Revoked).
-                let revoked = dial("ssh", Some(revoked_slip.link().expect("link"))).await;
+                let revoked = dial("ssh", Some(revoked_slip.link().expect("link").to_string())).await;
                 // (c) an UNKNOWN-SERVICE probe by a stranger: gate refuses the unknown name -> NotAdmitted.
                 let unknown = dial("admin", None).await;
                 // (d) a WRONG-SERVICE slip: a valid, UNREVOKED slip for `web` presented for `ssh` -> gate
                 //     refuses (NotGranted). Distinct internal reason, must still be the same wire class.
                 let wrong_slip = signet.mint(&svc("web"), hour).expect("mint web slip");
-                let not_granted = dial("ssh", Some(wrong_slip.link().expect("link"))).await;
+                let not_granted =
+                    dial("ssh", Some(wrong_slip.link().expect("link").to_string())).await;
 
                 // The whole point: all four are the SAME payload-free `NotAdmitted`, so no consumer can
                 // tell revoked from stranger from not-granted, and none can confirm `ssh` exists or that
@@ -3895,7 +3810,7 @@ mod tests {
                     .expect("link");
                 let session = member.connect(exposer_id).await.expect("connect");
                 for name in ["locked", "reflect"] {
-                    ServiceStream::open_with(&session, name, Some(badge.clone()))
+                    ServiceStream::open_with(&session, name, Some(badge.to_string()))
                         .await
                         .expect("a member badge passes the member floor");
                 }
@@ -3915,7 +3830,7 @@ mod tests {
                     .expect("link");
                 let session = delegate.connect(exposer_id).await.expect("connect");
                 let Err(slip_refused) =
-                    ServiceStream::open_with(&session, "locked", Some(slip)).await
+                    ServiceStream::open_with(&session, "locked", Some(slip.to_string())).await
                 else {
                     panic!("a slip must not pass a member-only route");
                 };

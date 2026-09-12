@@ -1,7 +1,7 @@
 //! `tightbeam share`: mint a `sheer:` capability link for one of this node's services.
 
 use clap::Args;
-use nauthy::{Identity, Service};
+use nauthy::{Identity, Link, Service};
 use tightbeam::duration::Lifetime;
 
 /// Mint a share-link that IS a capability: a signed, expiring, attenuable grant to one service.
@@ -25,12 +25,10 @@ pub struct ShareCmd {
 impl ShareCmd {
     /// Mint the link and print it.
     pub fn run(self, identity: &Identity) -> eyre::Result<()> {
-        let link = tightbeam::tunnel::mint_link(
-            identity,
-            &self.service,
-            self.expires.duration(),
-            self.delegable,
-        )?;
+        let link = Link::mint(identity, &self.service, self.expires.duration())?;
+        // A non-delegable link is sealed so no holder can append a narrower block; a delegable one is left
+        // open. Verification is unaffected either way.
+        let link = if self.delegable { link } else { link.seal()? };
         println!("{link}");
         Ok(())
     }

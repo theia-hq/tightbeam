@@ -239,7 +239,7 @@ impl RawStream {
         if is_stdin_a_tty() {
             eyre::bail!(
                 "stdin: has no pipe to read: fd 0 is a terminal, so it would consume your keystrokes. \
-                 Pipe a producer in, e.g. `ffmpeg ... | tightbeam expose cam=stdin:`"
+                 pipe a producer in instead of serving a terminal"
             );
         }
         let reader: BoxRead = Box::new(tokio::io::stdin());
@@ -252,7 +252,7 @@ impl RawStream {
 
     /// A `stdin:`-shaped source over an arbitrary reader, for tests: arm the take-once cell (single-consumer)
     /// or the fan-out (`lossy`) with an in-memory reader so the full served path is exercised without the
-    /// process's real fd 0. Not compiled into the binary.
+    /// process's real fd 0. Not compiled outside tests.
     #[cfg(test)]
     pub(crate) fn from_reader(reader: BoxRead) -> Self {
         Self(Source::Stdin(Stdin::new(reader)))

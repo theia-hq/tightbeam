@@ -11,7 +11,8 @@ use std::path::PathBuf;
 
 use bifrost::{Node, NodeId, Transport};
 use clap::Args;
-use nauthy::{Cap, SCHEME};
+use eyre::WrapErr as _;
+use nauthy::{Link, SCHEME, Service};
 use tightbeam::tunnel::Connector;
 
 /// Where a reached service's bytes go locally: the one `--to` selector, parsed to a closed enum so the
@@ -94,9 +95,9 @@ impl FromStr for Target {
 
     fn from_str(text: &str) -> eyre::Result<Self> {
         if text.starts_with(SCHEME) {
-            // Parse it now so a malformed link fails fast at the CLI boundary, not mid-connect. The
-            // owned string is re-parsed at use so the token travels whole to the host.
-            Cap::parse(text)?;
+            // Parse it now so a malformed link fails fast at the CLI boundary, not mid-connect: the
+            // connector reparses the validated text so the token travels whole to the host.
+            text.parse::<Link>()?;
             Ok(Target::Capability(text.to_owned()))
         } else {
             Ok(Target::Node(text.parse::<NodeId>()?))
@@ -120,7 +121,7 @@ impl ConnectCmd {
                 // admission, and binds the port, returning an error (with the host's reason) on refusal.
                 // Only past it is "forwarding …" true, so an unauthorized forward fails loudly here, never
                 // a fake success then a silent reset.
-                let (dial, service) = (connector.dial(), connector.service().to_owned());
+                let (dial, service) = (connector.dial(), Service::clone(connector.service()));
                 let forward = connector.preflight(node, port).await?;
                 println!("forwarding 127.0.0.1:{port} to {dial} ({service})");
                 forward.run().await
@@ -136,10 +137,20 @@ impl ConnectCmd {
     /// Resolve the target into a [`Connector`]: a raw node id (optionally presenting a link) or a link that
     /// supplies both the node to dial and the token.
     fn connector(&self) -> eyre::Result<Connector> {
-        let service = String::clone(&self.service);
+        let service = self
+            .service
+            .parse::<Service>()
+            .wrap_err_with(|| format!("`{}` is not a valid service name", self.service))?;
         match &self.target {
-            Target::Node(node) => Ok(Connector::to_node(*node, service, self.present.clone())),
-            Target::Capability(link) => Connector::from_link(link, service),
+            Target::Node(node) => {
+                let present = self
+                    .present
+                    .as_ref()
+                    .map(|text| text.parse::<Link>())
+                    .transpose()?;
+                Ok(Connector::to_node(*node, service, present))
+            }
+            Target::Capability(text) => Ok(Connector::from_link(&text.parse::<Link>()?, service)),
         }
     }
 }
