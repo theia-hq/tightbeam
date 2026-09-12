@@ -39,6 +39,8 @@ pub mod protocol;
 #[cfg(test)]
 mod duration_tests;
 #[cfg(test)]
+mod identity_tests;
+#[cfg(test)]
 mod open_policy_tests;
 #[cfg(test)]
 mod protocol_tests;
