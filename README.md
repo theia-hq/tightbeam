@@ -70,7 +70,7 @@ it names. You build it from three things: the services to publish, a `Registry` 
 ones, and the `Gate` that decides who may reach them.
 
 ```rust
-use nauthy::Denylist;
+use nauthy::FileDenylist;
 use tightbeam::tunnel::{self, CancellationToken, Exposer, PublicUnsafeRequest, Registry, Services};
 
 // `name=addr` entries. A `host:port` or `unix:<path>` is a raw forward tightbeam splices itself;

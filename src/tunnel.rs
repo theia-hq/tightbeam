@@ -147,10 +147,50 @@ pub enum TargetKind {
     Echo,
 }
 
-/// The local services an exposer publishes: a map of service name to its [`Target`], validated once at
-/// parse time so the rest of the core receives names and targets that are already well-formed.
+/// A route's access class: what the gate must have proven beyond admission. Declared where the route is
+/// registered ([`Services::member_only`]), never on the handler: a handler's compile-time marker
+/// ([`Handler::Public`]) says what the CODE may face, while access is a property of the NAME a caller
+/// reaches. Per-route is also the only axis that lets two names bound to one handler carry different
+/// floors, and it keeps a handler impl from growing a fourth mandatory item (the cold-author bar).
+///
+/// [`Family`](Access::Family) is the default and means "the gate alone decides": under a node-wide open
+/// gate it admits anyone, so it is no floor beyond the gate, never "this node's family".
+/// [`Member`](Access::Member) can only REFUSE: it reads one bit of the witness the gate minted and never
+/// mints, clones, or widens one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// The default: the gate's verdict is the whole verdict, byte-identical to a node with no declaration.
+    Family,
+    /// MEMBER-only: a witness the gate admitted as a whole-node member passes; every other witness (a
+    /// delegated slip, a stranger on an open node) is refused with the same payload-free class the gate
+    /// gives a miss, BEFORE any `Response::Ok` is written.
+    Member,
+}
+
+/// One served route: the [`Target`] the name resolves to and the [`Access`] class declared for it. Access
+/// travels with the route so the two can never drift apart, and a name a node does not serve cannot carry
+/// a declaration.
 #[derive(Debug, Clone)]
-pub struct Services(HashMap<String, Target>);
+struct Route {
+    target: Target,
+    access: Access,
+}
+
+impl Route {
+    /// A route under the default [`Access::Family`] floor (the gate alone decides).
+    fn family(target: Target) -> Self {
+        Self {
+            target,
+            access: Access::Family,
+        }
+    }
+}
+
+/// The local services an exposer publishes: a map of service name to its [`Route`] (a [`Target`] plus the
+/// [`Access`] class declared at registration), validated once at parse time so the rest of the core
+/// receives names, targets, and floors that are already well-formed.
+#[derive(Debug, Clone)]
+pub struct Services(HashMap<String, Route>);
 
 impl Services {
     /// Parse `name=addr` service entries; every entry must name its service. A bare `<name>:`
@@ -168,9 +208,17 @@ impl Services {
             // Validate the name through the same domain type the wire uses, so an exposed name and a
             // requested name are compared as the same kind of thing.
             name.parse::<Service>()?;
+            // A duplicate name is refused HERE, the same policy `with_handler` and `Registry::extend`
+            // apply: silently overwriting would drop the first target (and, after `member_only`, could
+            // silently move a declared floor off the route the operator thought they marked).
+            if services.contains_key(name) {
+                eyre::bail!(
+                    "service `{name}` is already defined; a name may map to only one target"
+                );
+            }
             // Resolve (and validate) the addr into a Target: a bogus
             // address fails HERE with a teaching message, not at dial time as an opaque reset.
-            services.insert(name.to_owned(), parse_target(addr, entry)?);
+            services.insert(name.to_owned(), Route::family(parse_target(addr, entry)?));
         }
         Ok(Self(services))
     }
@@ -192,7 +240,34 @@ impl Services {
         if services.contains_key(name) {
             eyre::bail!("service `{name}` is already defined; a name may map to only one target");
         }
-        services.insert(name.to_owned(), Target::Handler(scheme.to_owned()));
+        services.insert(
+            name.to_owned(),
+            Route::family(Target::Handler(scheme.to_owned())),
+        );
+        Ok(self)
+    }
+
+    /// Declare `name` MEMBER-only: only a witness the gate admitted as a whole-node member may reach it,
+    /// and a delegated slip for the same name is refused with the same uniform refusal a gate miss gives,
+    /// before any `Response::Ok` (see [`Access::Member`]). The default is [`Access::Family`] (the gate
+    /// alone decides), so a declaration can only tighten an already-admitted caller.
+    ///
+    /// Fallible for the same reason [`with_handler`](Self::with_handler) is: a name the node does not
+    /// serve is a caller error, not a silent no-op. The contradicting pairings are refused at the door,
+    /// never here: [`Exposer::new`] refuses a member-only route under a node-wide open gate (an open gate
+    /// mints only slips, so the route would refuse every dialer) or in the unsafe raw-stream set (the same
+    /// dead route, rendered open); [`Exposer::with_public`] refuses one named public.
+    pub fn member_only(mut self, name: &str) -> eyre::Result<Self> {
+        let Self(routes) = &mut self;
+        let Some(route) = routes.get_mut(name) else {
+            let mut served: Vec<&str> = routes.keys().map(String::as_str).collect();
+            served.sort_unstable();
+            eyre::bail!(
+                "no service named `{name}` to mark member-only; this node serves: {}",
+                served.join(", ")
+            );
+        };
+        route.access = Access::Member;
         Ok(self)
     }
 
@@ -244,10 +319,20 @@ impl Services {
     /// against the injected registry: every named handler must be registered, and a handler with no auth of
     /// its own may not sit behind an open gate.
     fn handler_schemes(&self) -> impl Iterator<Item = &str> {
-        let Self(services) = self;
-        services.values().filter_map(|target| match target {
+        let Self(routes) = self;
+        routes.values().filter_map(|route| match &route.target {
             Target::Handler(scheme) => Some(scheme.as_str()),
             Target::Forward(_) | Target::RawStream(_) | Target::Echo => None,
+        })
+    }
+
+    /// The served names declared [`Access::Member`], for the construction interlocks: a member-only route
+    /// no dialer can reach is a dead route, and when it renders `Open` (the public overlays) that is a
+    /// posture lie too.
+    fn member_only_names(&self) -> impl Iterator<Item = &str> {
+        let Self(routes) = self;
+        routes.iter().filter_map(|(name, route)| {
+            matches!(route.access, Access::Member).then_some(name.as_str())
         })
     }
 
@@ -259,11 +344,13 @@ impl Services {
     /// up, so it may still be a public gate; a bare file path or a piped stdin is one keystroke from a
     /// secret, so it may not.
     fn raw_stream_names(&self) -> impl Iterator<Item = &str> {
-        let Self(services) = self;
-        services.iter().filter_map(|(name, target)| match target {
-            Target::RawStream(_) => Some(name.as_str()),
-            Target::Handler(_) | Target::Forward(_) | Target::Echo => None,
-        })
+        let Self(routes) = self;
+        routes
+            .iter()
+            .filter_map(|(name, route)| match &route.target {
+                Target::RawStream(_) => Some(name.as_str()),
+                Target::Handler(_) | Target::Forward(_) | Target::Echo => None,
+            })
     }
 
     /// Prove an UNSAFE raw-stream opt-in set: this is the wall that turns a raw [`PublicUnsafeRequest`] into
@@ -282,7 +369,7 @@ impl Services {
         let Self(services) = self;
         let mut proven = HashSet::with_capacity(names.len());
         for name in names {
-            match services.get(&name) {
+            match services.get(&name).map(|route| &route.target) {
                 None => {
                     let mut served: Vec<&str> = services.keys().map(String::as_str).collect();
                     served.sort_unstable();
@@ -807,9 +894,11 @@ impl Exposer {
     /// Assemble an exposer from the parsed services, the caller-injected handler registry, the node BASE
     /// gate, and the operator's UNSAFE raw-stream opt-in set, enforcing the door interlocks: every named
     /// handler is actually registered (a typo or an unbuilt feature fails HERE, not at dial time); a handler
-    /// with no auth of its own (a keyless shell) may not sit behind a node-wide [`Gate::Open`] BASE; and a
+    /// with no auth of its own (a keyless shell) may not sit behind a node-wide [`Gate::Open`] BASE; a
     /// raw-stream source under an open BASE is refused UNLESS the operator knowingly opted it into
-    /// `public_unsafe` (proven here into the disjoint unsafe overlay).
+    /// `public_unsafe` (proven here into the disjoint unsafe overlay); and a route declared
+    /// [`Access::Member`] may not pair with an open BASE or with that unsafe overlay, both of which admit
+    /// only slips and would make the floor a route no dialer can reach (and, opened, a posture lie).
     ///
     /// The two raw-stream interlocks stay DISJOINT (delib-37): the keyless-handler refusal reads a compile-time
     /// marker (`type Public`), while the raw-stream-unsafe refusal is a RUNTIME opt-in guard (the danger
@@ -876,7 +965,35 @@ impl Exposer {
                  otherwise gate it or drop it from the public set"
             );
         }
-        // Interlock 3 (toggle mutual-exclusion): a DESIGN-LOCK with no operand today. delib-34's live-toggle
+        // Interlock 3 (member floor, delib-54): a route declared member-only is reachable only through a
+        // witness the gate minted as a whole-node member, so two pairings make it DEAD and both fail here
+        // rather than ship a route no dialer can reach:
+        //   * a node-wide open gate proves nothing about a peer (its witness is always a slip), so every
+        //     dial would hit the floor and be refused: the operator would serve a route that answers no one.
+        //   * a raw stream proven into the unsafe overlay is admitted through that same open path, so the
+        //     route is dead AND the catalog/manifest render it `Open`: an operator-facing posture lie.
+        // The safe public overlay's pairing is refused by `with_public` (the builder that owns it). Read
+        // one name at a time so the teaching error can name the route.
+        if matches!(gate, Gate::Open)
+            && let Some(name) = services.member_only_names().next()
+        {
+            eyre::bail!(
+                "`{name}` is member-only, so an open gate will never serve it: an open gate admits everyone \
+                 and proves nothing about who they are, so no dial can count as a member. keep the service on \
+                 a gate that admits members, or drop the member-only declaration"
+            );
+        }
+        if let Some(name) = services
+            .member_only_names()
+            .find(|name| proven_unsafe.contains(name))
+        {
+            eyre::bail!(
+                "`{name}` is member-only, so it cannot be served to everyone as a raw byte source: an opened \
+                 stream carries no membership proof, so the route would refuse every caller while the manifest \
+                 renders it open. drop it from the unsafe raw-stream set, or drop the member-only declaration"
+            );
+        }
+        // Interlock 4 (toggle mutual-exclusion): a DESIGN-LOCK with no operand today. delib-34's live-toggle
         // set (`ActiveSet`/`--toggleable`) is UNBUILT, so there is no second set to refuse; inventing a toggle
         // field now purely to refuse it would be machinery for a case that cannot occur yet. When the toggle
         // allowlist lands it enters THIS constructor beside `public_unsafe` and adds ONE bail here:
@@ -920,23 +1037,35 @@ impl Exposer {
     /// decides, never the name. A survivor set freezes into the overlay [`admit`] consults.
     ///
     /// This REPLACES a node-wide open value with a per-service one: a caller opens `speed` and `fetch` by
-    /// name while `control.*` and every keyless shell stay member-only by set non-membership. The teaching
+    /// name while `control.*` and every keyless shell stay gated by set non-membership (a route declared
+    /// member-only additionally refuses non-members, see [`Services::member_only`]). The teaching
     /// bails fire at BUILD time to the operator's own terminal (no remote party observes them), so there is
     /// no dial-time oracle. It never names a marker type (`Never`/`OptIn`), only the constraint.
     pub fn with_public(mut self, requested: PublicRequest) -> eyre::Result<Self> {
         let PublicRequest(names) = requested;
-        let Services(services) = &self.services;
+        let Services(routes) = &self.services;
         let mut proven = HashSet::with_capacity(names.len());
         for name in names {
-            let Some(target) = services.get(&name) else {
-                let mut served: Vec<&str> = services.keys().map(String::as_str).collect();
+            let Some(route) = routes.get(&name) else {
+                let mut served: Vec<&str> = routes.keys().map(String::as_str).collect();
                 served.sort_unstable();
                 eyre::bail!(
                     "no service named `{name}` to open; this node serves: {}",
                     served.join(", ")
                 );
             };
-            match target {
+            // A member-only route cannot be public: the public overlay admits through `Gate::Open`, whose
+            // only witness is a slip, so a public dial could never pass the floor while the catalog renders
+            // the name `Open`: a dead route and a posture lie. Refused here, where the overlay is proven, so
+            // the contradiction cannot be built however the two declarations were ordered.
+            if matches!(route.access, Access::Member) {
+                eyre::bail!(
+                    "`{name}` is member-only, so it cannot be opened to everyone: a public dial carries no \
+                     membership proof, so the route would refuse every caller while the catalog renders it \
+                     open. drop it from the public set, or drop the member-only declaration"
+                );
+            }
+            match &route.target {
                 // A raw stream named in the SAFE overlay is a teaching REDIRECT, not a flat refusal: the safe
                 // overlay never opens a raw byte source (`open_safe` stays `false` for it), but the operator
                 // CAN serve its bytes knowingly through the DISTINCT unsafe overlay. STRING A (CLI-Architect
@@ -950,7 +1079,7 @@ impl Exposer {
                 // A keyless shell or an aliased shell is a HARD no: it has no legitimate public use and no
                 // redirect exists (unlike a raw stream). STRING C (CLI-Architect round-3), `{name}` variant.
                 // Never leaks a marker type name.
-                _ if !target.open_safe(&self.registry) => eyre::bail!(
+                _ if !route.target.open_safe(&self.registry) => eyre::bail!(
                     "`{name}` has no legitimate public use: a keyless shell (or an alias of one) would hand a \
                      shell to anyone who reaches this node. keep it family-gated; drop it from the public set"
                 ),
@@ -972,10 +1101,10 @@ impl Exposer {
     /// this is the local banner view (kind + amplifier never cross the wire).
     pub fn manifest(&self) -> Vec<ManifestEntry> {
         let node_open = matches!(self.gate, Gate::Open);
-        let Services(services) = &self.services;
-        let mut entries: Vec<ManifestEntry> = services
+        let Services(routes) = &self.services;
+        let mut entries: Vec<ManifestEntry> = routes
             .iter()
-            .map(|(name, target)| {
+            .map(|(name, route)| {
                 // The PROVEN overlays are the posture source (what a dialer actually faces), the same rule the
                 // wire catalog reads off the raw request: a name is open iff the node gate is open OR it was
                 // proven into the SAFE public overlay OR into the UNSAFE raw-stream overlay, else it is gated
@@ -991,7 +1120,7 @@ impl Exposer {
                 // The amplifier caveat is handler-declared, so it is resolved THROUGH the target's handler,
                 // never a name match: only a registered handler can be an amplifier; a forward or a raw
                 // stream never is (they carry no responder the handler owns).
-                let amplifier = match target {
+                let amplifier = match &route.target {
                     Target::Handler(scheme) => self
                         .registry
                         .get(scheme)
@@ -1004,7 +1133,7 @@ impl Exposer {
                 // The raw source a banner names in its unsafe warning is tightbeam's to declare (it owns
                 // raw-stream resolution): a raw stream carries its resolved absolute path / stdin marker, a
                 // handler or a forward has no raw source to warn about.
-                let raw_source = match target {
+                let raw_source = match &route.target {
                     Target::RawStream(stream) => Some(stream.raw_source()),
                     // An `echo:` reflector has no raw source to warn about: it exposes no path and no piped
                     // stdin, only the caller's own returned bytes.
@@ -1013,7 +1142,7 @@ impl Exposer {
                 ManifestEntry {
                     name: name.clone(),
                     posture,
-                    kind: target.kind(),
+                    kind: route.target.kind(),
                     amplifier,
                     raw_source,
                 }
@@ -1250,7 +1379,23 @@ where
         }
     };
 
-    match services.get(service.as_str()) {
+    // The member floor (delib-54): a route declared `Access::Member` at registration is checked ONCE here,
+    // after `admit` and before every `Response::Ok` below, so the check covers every dispatch arm and can
+    // still be a WIRE refusal; a handler-side check would run post-`Ok` and the client would read a stopped
+    // "success". The witness is BORROWED for `is_member` (`&self`) and stays owned for the single move into
+    // the handler, and the refusal is the SAME payload-free class a gate miss gives: the wire never learns
+    // that a route is member-only (no member-vs-slip oracle). The lookup is hoisted so the floor and the
+    // dispatch below read the same resolved route.
+    let route = services.get(service.as_str());
+    if route.is_some_and(|route| route.access == Access::Member) && !admitted.is_member() {
+        tracing::warn!(%peer, service = %service, "refused: member-only route");
+        return Response::Refused(Refusal::NotAdmitted)
+            .write(&mut writer)
+            .await
+            .map_err(Into::into);
+    }
+
+    match route.map(|route| &route.target) {
         // tightbeam's own primitive: connect the local socket and splice raw bytes to it.
         Some(Target::Forward(addr)) => {
             Response::Ok.write(&mut writer).await?;
@@ -1459,7 +1604,7 @@ fn admit(
 /// service is exposed, return that one, so a single-service node needs no named service. Otherwise return
 /// the request unchanged (a multi-service node keeps it, to fail later with the "unknown service; this node
 /// exposes: …" hint rather than guessing which one was meant).
-fn resolve_single_service(requested: Service, services: &HashMap<String, Target>) -> Service {
+fn resolve_single_service(requested: Service, services: &HashMap<String, Route>) -> Service {
     if services.contains_key(requested.as_str()) || services.len() != 1 {
         return requested;
     }
@@ -1959,10 +2104,10 @@ mod tests {
     use tokio::io::AsyncReadExt as _;
 
     use super::{
-        AllEnabled, BoxRead, BoxWrite, Exposer, Handler, Posture, PublicRequest, PublicServices,
-        PublicUnsafeRequest, RAW_STREAM_OPEN_PERMITS, RawSource, Registry, Semaphore,
-        ServiceCatalog, ServiceEntry, Services, Target, TargetKind, resolve_single_service,
-        serve_request,
+        Access, AllEnabled, BoxRead, BoxWrite, Exposer, Handler, Posture, PublicRequest,
+        PublicServices, PublicUnsafeRequest, RAW_STREAM_OPEN_PERMITS, RawSource, Registry, Route,
+        Semaphore, ServiceCatalog, ServiceEntry, Services, Target, TargetKind,
+        resolve_single_service, serve_request,
     };
     use crate::open_policy::{Never, OptIn};
     use crate::raw_stream::RawStream;
@@ -2148,7 +2293,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             name.to_owned(),
-            Target::RawStream(RawStream::from_reader(reader)),
+            Route::family(Target::RawStream(RawStream::from_reader(reader))),
         );
         Services(map)
     }
@@ -2159,7 +2304,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             name.to_owned(),
-            Target::RawStream(RawStream::lossy_from_reader(reader)),
+            Route::family(Target::RawStream(RawStream::lossy_from_reader(reader))),
         );
         Services(map)
     }
@@ -2204,6 +2349,21 @@ mod tests {
         );
     }
 
+    /// A duplicate name is refused by the same policy `with_handler` and `Registry::extend` apply: a silent
+    /// overwrite would drop the first target (and could move a member floor off the route it was declared on).
+    #[test]
+    fn a_duplicate_service_name_is_refused_by_parse() {
+        let Err(err) =
+            Services::parse(&["web=127.0.0.1:80".to_owned(), "web=127.0.0.1:81".to_owned()])
+        else {
+            panic!("a duplicate name must be refused, never silently overwritten");
+        };
+        assert!(
+            err.to_string().contains("already defined"),
+            "the refusal names the duplicate: {err}"
+        );
+    }
+
     #[test]
     fn real_targets_parse() {
         for entry in [
@@ -2228,10 +2388,10 @@ mod tests {
         // Pin it so a future refactor cannot regress the routing into an unguarded shape.
         for entry in ["pipe=file:/tmp/beam", "named=fifo:/tmp/beam"] {
             let Services(parsed) = services(&[entry]);
-            let target = parsed.values().next().expect("one service parsed");
+            let route = parsed.values().next().expect("one service parsed");
             assert!(
-                matches!(target, super::Target::RawStream(_)),
-                "{entry} must resolve to Target::RawStream, got {target:?}"
+                matches!(&route.target, super::Target::RawStream(_)),
+                "{entry} must resolve to Target::RawStream, got {route:?}"
             );
         }
         // A bare `file:`/`fifo:` with no path is NOT a handler: it fails loudly at parse.
@@ -2255,10 +2415,10 @@ mod tests {
         // `echo:` is the zero-arg built-in reflector, NEVER a `Target::Handler("echo")` (which no registry
         // holds) nor a forward. Pin the routing so it stays a first-class built-in.
         let Services(parsed) = services(&["demo=echo:"]);
-        let target = parsed.values().next().expect("one service parsed");
+        let route = parsed.values().next().expect("one service parsed");
         assert!(
-            matches!(target, super::Target::Echo),
-            "`echo:` must resolve to Target::Echo, got {target:?}"
+            matches!(&route.target, super::Target::Echo),
+            "`echo:` must resolve to Target::Echo, got {route:?}"
         );
         // `echo:` takes no argument and tolerates no `+lossy` (it is not a raw-stream source): both are refused
         // at parse, loudly at expose.
@@ -2273,10 +2433,10 @@ mod tests {
         // `+lossy` opts a live single-writer source into fan-out; it is legal ONLY on `stdin:`/`fifo:`.
         for entry in ["cam=stdin:+lossy", "cam=fifo:/tmp/cam+lossy"] {
             let Services(parsed) = services(&[entry]);
-            let target = parsed.values().next().expect("one service parsed");
+            let route = parsed.values().next().expect("one service parsed");
             assert!(
-                matches!(target, Target::RawStream(_)),
-                "{entry} must resolve to a raw-stream fan-out target, got {target:?}"
+                matches!(&route.target, Target::RawStream(_)),
+                "{entry} must resolve to a raw-stream fan-out target, got {route:?}"
             );
         }
         // On any OTHER scheme `+lossy` is refused at PARSE with a teaching message: a `file:` (static bytes,
@@ -2323,9 +2483,9 @@ mod tests {
         // names one handler the registry holds, not a `host.port`-shaped forward.
         for entry in ["status=control.status:", "restart=control.restart:"] {
             let Services(parsed) = services(&[entry]);
-            let target = parsed.values().next().expect("one service parsed");
-            let super::Target::Handler(scheme) = target else {
-                panic!("{entry} must resolve to Target::Handler, got {target:?}");
+            let route = parsed.values().next().expect("one service parsed");
+            let super::Target::Handler(scheme) = &route.target else {
+                panic!("{entry} must resolve to Target::Handler, got {route:?}");
             };
             assert!(
                 scheme.contains('.'),
@@ -2358,6 +2518,108 @@ mod tests {
             )
             .is_ok(),
             "an open gate over a plain forward is allowed"
+        );
+    }
+
+    /// Access is opt-in per route: every parsed route defaults to [`Access::Family`] (the gate alone
+    /// decides), and `member_only` flips exactly the named route to [`Access::Member`].
+    #[test]
+    fn routes_default_to_family_and_member_only_flips_the_named_route() {
+        let parsed = services(&["web=127.0.0.1:80", "locked=locked:"]);
+        let Services(routes) = &parsed;
+        assert!(
+            routes.values().all(|route| route.access == Access::Family),
+            "parsed routes default to the gate-alone floor"
+        );
+        let parsed = parsed.member_only("locked").expect("`locked` is served");
+        let Services(routes) = &parsed;
+        assert_eq!(routes["web"].access, Access::Family);
+        assert_eq!(routes["locked"].access, Access::Member);
+    }
+
+    /// A member-only route under a node-wide open gate is a DEAD route: an open gate proves nothing about a
+    /// peer, so its only witness is a slip and the floor would refuse every dialer. Refused at the door, not
+    /// served as a route that answers no one.
+    #[test]
+    fn a_member_only_route_under_an_open_gate_is_refused_at_construction() {
+        let services = services(&["web=127.0.0.1:80"])
+            .member_only("web")
+            .expect("`web` is served");
+        let Err(error) = super::Exposer::new(
+            services,
+            super::Registry::new(),
+            Gate::Open,
+            PublicUnsafeRequest::none(),
+        ) else {
+            panic!("a member-only route under an open gate must be refused at construction");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("member-only") && message.contains("web"),
+            "the refusal names the route and the contradiction: {message:?}"
+        );
+    }
+
+    /// A member-only route named public is contradictory: the public overlay admits through `Gate::Open`,
+    /// whose only witness is a slip, so the route would refuse every dialer while the catalog renders it
+    /// `Open` (a posture lie). Refused where the overlay is proven.
+    #[test]
+    fn a_member_only_route_named_public_is_refused_at_construction() {
+        let services = services(&["web=127.0.0.1:80"])
+            .member_only("web")
+            .expect("`web` is served");
+        let assembled = super::Exposer::new(
+            services,
+            super::Registry::new(),
+            family_gate("member-public"),
+            PublicUnsafeRequest::none(),
+        )
+        .expect("a member-only route under a rooted gate assembles");
+        let Err(error) = assembled.with_public(PublicRequest::new(["web".to_owned()])) else {
+            panic!("a member-only route must not be opened to everyone");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("member-only") && message.contains("web"),
+            "the refusal names the route and the contradiction: {message:?}"
+        );
+    }
+
+    /// A member-only raw stream named in the unsafe overlay is the same dead route as the safe public case,
+    /// and the same posture lie: the opened stream admits through `Gate::Open` (a slip), so the floor would
+    /// refuse every dialer while the manifest renders it `Open`.
+    #[test]
+    fn a_member_only_raw_stream_named_public_unsafe_is_refused_at_construction() {
+        let path = std::env::temp_dir().join("tb-member-unsafe");
+        let entry = format!("logs=file:{}", path.display());
+        let services = services(&[&entry])
+            .member_only("logs")
+            .expect("`logs` is served");
+        let Err(error) = super::Exposer::new(
+            services,
+            super::Registry::new(),
+            family_gate("member-unsafe"),
+            PublicUnsafeRequest::new(["logs".to_owned()]),
+        ) else {
+            panic!("a member-only raw stream in the unsafe set must be refused at construction");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("member-only") && message.contains("logs"),
+            "the refusal names the route and the contradiction: {message:?}"
+        );
+    }
+
+    /// Marking a name the node does not serve is a caller error, exactly like a duplicate in `with_handler`:
+    /// a silent no-op would leave the operator believing a floor exists that does not.
+    #[test]
+    fn member_only_refuses_a_name_the_node_does_not_serve() {
+        let Err(error) = services(&["web=127.0.0.1:80"]).member_only("nope") else {
+            panic!("marking an unserved name must be refused");
+        };
+        assert!(
+            error.to_string().contains("no service named"),
+            "the refusal teaches the served list: {error}"
         );
     }
 
@@ -2603,10 +2865,10 @@ mod tests {
         // `Target::Handler("stdin")` (which the bare-scheme arm would produce and no registry would hold).
         // (Under `cargo test` fd 0 is not a tty, so the parse-time TTY refusal does not fire.)
         let Services(parsed) = services(&["cam=stdin:"]);
-        let target = parsed.values().next().expect("one service parsed");
+        let route = parsed.values().next().expect("one service parsed");
         assert!(
-            matches!(target, Target::RawStream(_)),
-            "`stdin:` must resolve to Target::RawStream, got {target:?}"
+            matches!(&route.target, Target::RawStream(_)),
+            "`stdin:` must resolve to Target::RawStream, got {route:?}"
         );
     }
 
@@ -3241,11 +3503,15 @@ mod tests {
                 let mut map = HashMap::new();
                 map.insert(
                     "ssh".to_owned(),
-                    Target::RawStream(RawStream::from_reader(Box::new(&b"secret"[..]))),
+                    Route::family(Target::RawStream(RawStream::from_reader(Box::new(
+                        &b"secret"[..],
+                    )))),
                 );
                 map.insert(
                     "web".to_owned(),
-                    Target::RawStream(RawStream::from_reader(Box::new(&b"secret"[..]))),
+                    Route::family(Target::RawStream(RawStream::from_reader(Box::new(
+                        &b"secret"[..],
+                    )))),
                 );
                 let services = Services(map);
 
@@ -3349,11 +3615,15 @@ mod tests {
                 let mut map = HashMap::new();
                 map.insert(
                     "cam".to_owned(),
-                    Target::RawStream(RawStream::from_reader(Box::new(&b"x"[..]))),
+                    Route::family(Target::RawStream(RawStream::from_reader(Box::new(
+                        &b"x"[..],
+                    )))),
                 );
                 map.insert(
                     "mic".to_owned(),
-                    Target::RawStream(RawStream::from_reader(Box::new(&b"x"[..]))),
+                    Route::family(Target::RawStream(RawStream::from_reader(Box::new(
+                        &b"x"[..],
+                    )))),
                 );
                 let exposer = Exposer {
                     services: Services(map),
@@ -3578,6 +3848,94 @@ mod tests {
             .await;
     }
 
+    /// The member floor (delib-54), end to end at the tunnel level: a route declared member-only serves a
+    /// whole-node member (the witness is borrowed for the check and then moved once into the handler, so the
+    /// single-use guarantee survives), and refuses a delegated slip for the SAME route and a tokenless
+    /// stranger with the SAME uniform class a gate miss gives. The echo route proves the floor covers a
+    /// non-handler dispatch arm too: the check precedes the whole dispatch match.
+    #[tokio::test]
+    async fn a_member_only_route_serves_a_member_and_uniformly_refuses_a_slip_and_a_stranger() {
+        use crate::identity::AsVerifyKey as _;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let signet = nauthy::Identity::from_secret(&[7u8; 32]).expect("valid secret");
+                let gate = Gate::rooted(
+                    signet.verifying_key(),
+                    nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-member-floor")),
+                );
+                let services = services(&["locked=locked:", "reflect=echo:"])
+                    .member_only("locked")
+                    .expect("`locked` is served")
+                    .member_only("reflect")
+                    .expect("`reflect` is served");
+                let registry = Registry::new().with("locked", OpenNoop);
+                let exposer = Exposer::new(services, registry, gate, PublicUnsafeRequest::none())
+                    .expect("a member-only route under a rooted gate assembles");
+
+                let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
+                let exposer_id = exposer_node.node_id();
+                tokio::task::spawn_local(async move {
+                    exposer
+                        .run(&exposer_node, super::CancellationToken::new())
+                        .await
+                        .expect("runs");
+                });
+
+                // A whole-node member: a badge the signet signed, bound to the member's proven mem id.
+                let member = Node::new(MemTransport::bind(), NoDiscovery);
+                let badge = signet
+                    .mint_member(
+                        member.node_id().verify_key(),
+                        nauthy::Request::expires_in(core::time::Duration::from_secs(300)),
+                    )
+                    .expect("mint a member badge")
+                    .link()
+                    .expect("link");
+                let session = member.connect(exposer_id).await.expect("connect");
+                for name in ["locked", "reflect"] {
+                    ServiceStream::open_with(&session, name, Some(badge.clone()))
+                        .await
+                        .expect("a member badge passes the member floor");
+                }
+
+                // A delegated slip for `locked`: the gate's OWN ruling admits it (the slip grants the
+                // service to this device), and the route floor turns that admission into the uniform refusal
+                // a gate miss gives. A tokenless stranger gets the same refusal.
+                let delegate = Node::new(MemTransport::bind(), NoDiscovery);
+                let slip = signet
+                    .mint_bound(
+                        &svc("locked"),
+                        delegate.node_id().verify_key(),
+                        nauthy::Request::expires_in(core::time::Duration::from_secs(300)),
+                    )
+                    .expect("mint a bound slip")
+                    .link()
+                    .expect("link");
+                let session = delegate.connect(exposer_id).await.expect("connect");
+                let Err(slip_refused) =
+                    ServiceStream::open_with(&session, "locked", Some(slip)).await
+                else {
+                    panic!("a slip must not pass a member-only route");
+                };
+                assert_eq!(
+                    slip_refused,
+                    bifrost::Refusal::NotAdmitted,
+                    "the floor refuses with the uniform payload-free class"
+                );
+                let session = delegate.connect(exposer_id).await.expect("connect");
+                let Err(stranger_refused) = ServiceStream::open(&session, "locked").await else {
+                    panic!("a tokenless stranger must not pass the gate");
+                };
+                assert_eq!(
+                    stranger_refused, slip_refused,
+                    "a slip refusal is wire-identical to a gate miss (no member-only oracle)"
+                );
+            })
+            .await;
+    }
+
     /// `with_public` is the wall (BLOCKER-2): it refuses a `Never` handler named public with a teaching error
     /// (leading with the fix, never leaking the marker names), refuses a name the node does not serve, and
     /// REDIRECTS a raw stream named in the SAFE overlay toward the unsafe overlay (a distinct message from the
@@ -3708,7 +4066,11 @@ mod tests {
             .expect("base parses")
             .with_handler("pub", "fetch_0")
             .expect("a direct synthetic handler is constructible");
-        let Some(Target::Handler(scheme)) = map.get("pub") else {
+        let Some(Route {
+            target: Target::Handler(scheme),
+            ..
+        }) = map.get("pub")
+        else {
             panic!("`pub` must map to the synthetic handler target");
         };
         assert_eq!(
