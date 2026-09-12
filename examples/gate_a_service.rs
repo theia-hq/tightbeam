@@ -3,7 +3,7 @@
 //! The companion to [`reach_by_key`](../reach_by_key/index.html): that one admits
 //! anyone who reaches the key ([`Gate::Open`](nauthy::Gate::Open)); this one admits only a caller holding a
 //! `sheer:` capability the exposer's identity signed. The exposer stands its service behind a *signet gate*
-//! (its own key); the owner [`mint_link`](tightbeam::tunnel::mint_link)s a capability granting one service;
+//! (its own key); the owner [`Link::mint`](nauthy::Link::mint)s a capability granting one service;
 //! a connector presents it. No allowlist, no server in the delegation loop: the exposer verifies the signed
 //! chain offline.
 //!
@@ -25,7 +25,7 @@ use std::path::PathBuf;
 
 use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
-use nauthy::{FileDenylist, Identity, Service};
+use nauthy::{FileDenylist, Identity, Link, Service};
 use tightbeam::identity::AsNodeId as _;
 use tightbeam::tunnel::{self, CancellationToken, Connector, Exposer, Registry, Services};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -95,7 +95,7 @@ async fn run() -> eyre::Result<()> {
     //    the signing identity but no network. The link IS the grant, a `sheer:<node-id>.<token>` string you
     //    can hand to whoever should reach the service.
     let ssh = "ssh".parse::<Service>()?;
-    let link = tunnel::mint_link(&identity, &ssh, Duration::from_secs(3600), false)?;
+    let link = Link::mint(&identity, &ssh, Duration::from_secs(3600))?.seal()?;
 
     // 5. The consumer reaches the service and PRESENTS the link, binding it to a free local port so anything
     //    that connects to that port is tunnelled to the gated echo service on the other node. Over mem it
@@ -106,7 +106,7 @@ async fn run() -> eyre::Result<()> {
     drop(probe);
     tokio::task::spawn_local(async move {
         if let Err(e) = async {
-            Connector::to_node(exposer_key, ssh.to_string(), Some(link))
+            Connector::to_node(exposer_key, ssh, Some(link))
                 .preflight(&consumer, local_port)
                 .await?
                 .run()

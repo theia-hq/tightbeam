@@ -10,9 +10,8 @@
 //! (its own devices and their delegates), else an open gate for anyone. A named service is a
 //! [`Handler`](tunnel::Handler) a caller injects into a
 //! [`Registry`](tunnel::Registry); tightbeam knows only the contract, never what a handler does, and
-//! ships none of its own. [`mint_link`](tunnel::mint_link) / [`narrow_link`](tunnel::narrow_link) /
-//! [`revoke_into`](tunnel::revoke_into) mint, narrow, and revoke the `sheer:` capabilities the gate
-//! honors, all offline.
+//! ships none of its own. [`Link`](nauthy::Link) mints, narrows, and revokes the `sheer:` capabilities the
+//! gate honors, all offline.
 //!
 //! The tunnel core lives in [`tunnel`]; the wire frames in [`protocol`]. A command-line tool can be built
 //! on this library; this crate also ships a `tightbeam` binary (`src/bin/tightbeam/`), a thin bridge over

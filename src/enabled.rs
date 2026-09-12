@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Instant, SystemTime};
 
+use nauthy::Service;
 use tokio::io::AsyncReadExt as _;
 
 /// The enable/disable oracle the exposer consults per inbound stream, right where it consults the gate.
@@ -34,7 +35,7 @@ use tokio::io::AsyncReadExt as _;
 pub trait EnabledServices {
     /// Whether the named service is currently enabled (servable). A service the operator has disabled returns
     /// `false`; every other name returns `true`. The exposer refuses a stream for a name this reports `false`.
-    fn is_enabled(&self, service: &str) -> bool;
+    fn is_enabled(&self, service: &Service) -> bool;
 }
 
 /// Every service is enabled: the default when a caller wires no disabled-list, so a node that never toggles
@@ -46,7 +47,7 @@ pub trait EnabledServices {
 pub struct AllEnabled;
 
 impl EnabledServices for AllEnabled {
-    fn is_enabled(&self, _service: &str) -> bool {
+    fn is_enabled(&self, _service: &Service) -> bool {
         true
     }
 }
@@ -71,7 +72,7 @@ pub struct FileDisabledList {
 /// loaded), and the last moment we stat'd the file. The length pairs with mtime so a change within one coarse
 /// mtime tick is still seen: an edit that keeps the byte count identical is rare, and the mtime moves on it.
 struct State {
-    disabled: HashSet<String>,
+    disabled: HashSet<Service>,
     stamp: Option<(SystemTime, u64)>,
     last_stat: Option<Instant>,
 }
@@ -108,7 +109,7 @@ impl FileDisabledList {
     /// Refreshes from disk first if the file changed since the last read, so a `disable` (or a later `enable`)
     /// written by another process is honored by a long-running exposer without a restart. The stat is
     /// debounced (see `STAT_DEBOUNCE`); the file is re-read only when it actually changed.
-    pub fn is_enabled(&self, service: &str) -> bool {
+    pub fn is_enabled(&self, service: &Service) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         self.refresh(&mut state);
         !state.disabled.contains(service)
@@ -152,7 +153,7 @@ impl FileDisabledList {
 }
 
 impl EnabledServices for FileDisabledList {
-    fn is_enabled(&self, service: &str) -> bool {
+    fn is_enabled(&self, service: &Service) -> bool {
         FileDisabledList::is_enabled(self, service)
     }
 }
@@ -163,7 +164,7 @@ impl EnabledServices for FileDisabledList {
 #[allow(clippy::std_instead_of_core)]
 async fn read_names(
     path: &Path,
-) -> Result<(HashSet<String>, Option<(SystemTime, u64)>), DisabledListError> {
+) -> Result<(HashSet<Service>, Option<(SystemTime, u64)>), DisabledListError> {
     // Open ONCE and take both the bytes and the stamp from that handle (`read_names_from`). Reading the
     // path and then stat-ing the path again is the defect this closes: a writer that replaces the file
     // between the two calls made the old contents wear the new file's (mtime, len), so every later
@@ -203,7 +204,7 @@ async fn open_readonly(path: &Path) -> std::io::Result<tokio::fs::File> {
 /// trusting a stale stamp.
 async fn read_names_from(
     file: &mut tokio::fs::File,
-) -> Result<(HashSet<String>, Option<(SystemTime, u64)>), DisabledListError> {
+) -> Result<(HashSet<Service>, Option<(SystemTime, u64)>), DisabledListError> {
     let mut text = String::new();
     file.read_to_string(&mut text)
         .await
@@ -217,14 +218,16 @@ async fn read_names_from(
     Ok((names, stamp))
 }
 
-/// Decode a disabled-list file body into a set of service names: one trimmed, non-empty name per line. There
-/// is no parse failure mode (any name is a valid thing to disable; a name the node does not serve is a
-/// serve-side no-op), so this is total, unlike the denylist's hex-id decode.
-fn parse_names(text: &str) -> HashSet<String> {
+/// Decode a disabled-list file body into a set of service names: one trimmed, non-empty name per line. A
+/// line that is not a valid [`Service`] name is dropped: a served route's name is always a `Service`, so a
+/// malformed line could never match one, and dropping it keeps this total (no parse failure mode). A name
+/// the node does not serve is likewise a serve-side no-op, unlike the denylist's hex-id decode which can
+/// refuse a corrupt line.
+fn parse_names(text: &str) -> HashSet<Service> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(str::to_owned)
+        .filter_map(|line| line.parse::<Service>().ok())
         .collect()
 }
 

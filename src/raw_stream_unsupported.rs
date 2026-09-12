@@ -70,7 +70,7 @@ impl RawStream {
         if is_stdin_a_tty() {
             eyre::bail!(
                 "stdin: has no pipe to read: fd 0 is a terminal, so it would consume your keystrokes. \
-                 Pipe a producer in, e.g. `ffmpeg ... | tightbeam expose cam=stdin:`"
+                 pipe a producer in instead of serving a terminal"
             );
         }
         let reader: BoxRead = Box::new(tokio::io::stdin());

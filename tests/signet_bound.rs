@@ -16,7 +16,7 @@ use core::time::Duration;
 
 use bifrost::{NoDiscovery, Node, NodeId};
 use bifrost_mem::MemTransport;
-use nauthy::{FileDenylist, Identity, Service};
+use nauthy::{FileDenylist, Identity, Link, Service};
 use tightbeam::identity::AsVerifyKey as _;
 use tightbeam::tunnel::{self, CancellationToken, Connector, Exposer, Services};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -65,7 +65,7 @@ async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership()
 
             // The slip work issues for the whole hire fleet `X`: valid at WORK's root, naming `X` as the
             // fleet whose devices may use it. Sealed and inert alone (it grants nothing without a fleet badge).
-            let slip = tunnel::mint_signet_link(
+            let slip = Link::mint_signet(
                 &work,
                 &web,
                 Identity::from_secret(&HIRE_SECRET).unwrap().verifying_key(),
@@ -84,8 +84,14 @@ async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership()
                 .unwrap()
                 .link()
                 .unwrap();
-            let echoed =
-                connect_and_echo(device, exposer_id, "web", &slip, Some(&fleet_badge)).await;
+            let echoed = connect_and_echo(
+                device,
+                exposer_id,
+                "web",
+                slip.as_str(),
+                Some(fleet_badge.as_str()),
+            )
+            .await;
             assert_eq!(
                 echoed.as_deref(),
                 Some(&b"a hire reaching work"[..]),
@@ -95,7 +101,7 @@ async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership()
             // (b) SLIP ALONE: drop slot 2. The slip is inert on the plain path and the signet-bound arm has
             // no badge to verify, so the gate refuses and the port never binds.
             let no_badge = Node::new(MemTransport::bind(), NoDiscovery);
-            let refused = connect_and_echo(no_badge, exposer_id, "web", &slip, None).await;
+            let refused = connect_and_echo(no_badge, exposer_id, "web", slip.as_str(), None).await;
             assert_eq!(refused, None, "the slip alone (no fleet badge) is refused");
 
             // (c) WRONG FLEET: present a badge under `Y`, a signet the slip does NOT name. Its root does not
@@ -110,8 +116,14 @@ async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership()
                 .unwrap()
                 .link()
                 .unwrap();
-            let refused =
-                connect_and_echo(stray, exposer_id, "web", &slip, Some(&wrong_badge)).await;
+            let refused = connect_and_echo(
+                stray,
+                exposer_id,
+                "web",
+                slip.as_str(),
+                Some(wrong_badge.as_str()),
+            )
+            .await;
             assert_eq!(refused, None, "a badge under the wrong fleet Y is refused");
         })
         .await;
@@ -129,9 +141,9 @@ async fn connect_and_echo(
     badge: Option<&str>,
 ) -> Option<Vec<u8>> {
     let port = free_port().await;
-    let service = service.to_owned();
-    let slip = slip.to_owned();
-    let badge = badge.map(str::to_owned);
+    let service = service.parse::<Service>().unwrap();
+    let slip = slip.parse::<Link>().unwrap();
+    let badge = badge.map(|text| text.parse::<Link>().unwrap());
     tokio::task::spawn_local(async move {
         let mut connector = Connector::to_node(exposer, service, Some(slip));
         if let Some(badge) = badge {

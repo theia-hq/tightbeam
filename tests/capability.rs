@@ -14,7 +14,7 @@ use core::time::Duration;
 
 use bifrost::{NoDiscovery, Node, NodeId};
 use bifrost_mem::MemTransport;
-use nauthy::{FileDenylist, Identity, Service};
+use nauthy::{FileDenylist, Identity, Link, Service};
 use tightbeam::tunnel::{self, CancellationToken, Connector, Exposer, Services};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -60,7 +60,7 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
                 .unwrap();
 
             // A valid ssh cap reaches the echo service through the tunnel.
-            let echoed = connect_and_echo(exposer_id, "ssh", Some(&valid)).await;
+            let echoed = connect_and_echo(exposer_id, "ssh", Some(valid.as_str())).await;
             assert_eq!(echoed.as_deref(), Some(&b"through a capability"[..]));
 
             // No cap presented: refused, so the local listener accepts but the pipe never completes.
@@ -76,7 +76,7 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
                 .unwrap()
                 .link()
                 .unwrap();
-            let wrong = connect_and_echo(exposer_id, "ssh", Some(&wrong)).await;
+            let wrong = connect_and_echo(exposer_id, "ssh", Some(wrong.as_str())).await;
             assert_eq!(wrong, None, "a wrong-service cap must be refused");
         })
         .await;
@@ -111,8 +111,8 @@ async fn connect_and_echo(
 ) -> Option<Vec<u8>> {
     let port = free_port().await;
     let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-    let service = service.to_owned();
-    let present = capability.map(str::to_owned);
+    let service = service.parse::<Service>().unwrap();
+    let present = capability.map(|text| text.parse::<Link>().unwrap());
     tokio::task::spawn_local(async move {
         // A refused connector fails at `preflight` (before the port binds), so the client below never
         // connects and the helper returns `None`; an admitted one binds and forwards.

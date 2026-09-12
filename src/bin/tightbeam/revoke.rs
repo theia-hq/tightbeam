@@ -1,7 +1,7 @@
 //! `tightbeam revoke`: revoke a `sheer:` capability so this node refuses it, offline and at once.
 
 use clap::Args;
-use nauthy::FileDenylist;
+use nauthy::{FileDenylist, Link};
 use tightbeam::config::revoked_path;
 
 /// Revoke a `sheer:` capability link so this node refuses it from now on.
@@ -21,10 +21,11 @@ pub struct RevokeCmd {
 impl RevokeCmd {
     /// Add the cap's revocation id to the persisted denylist.
     pub async fn run(self) -> eyre::Result<()> {
-        // The adapter opens tightbeam's own denylist and passes it by ref to the core, which never reads
+        let link = self.link.parse::<Link>()?;
+        // The adapter opens tightbeam's own denylist and passes it by ref to the link, which never reads
         // a config path.
         let mut denylist = FileDenylist::load(revoked_path()?).await?;
-        tightbeam::tunnel::revoke_into(&mut denylist, &self.link).await?;
+        link.revoke(&mut denylist).await?;
         println!("revoked ({})", denylist.path().display());
         Ok(())
     }

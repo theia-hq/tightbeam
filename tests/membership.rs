@@ -18,7 +18,7 @@ use core::time::Duration;
 
 use bifrost::{NoDiscovery, Node, NodeId};
 use bifrost_mem::MemTransport;
-use nauthy::{FileDenylist, Identity};
+use nauthy::{FileDenylist, Identity, Link, Service};
 use tightbeam::identity::AsVerifyKey as _;
 use tightbeam::tunnel::{self, CancellationToken, Connector, Exposer, Services};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -69,7 +69,7 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             // The bound device presents its badge and reaches `web`, though the badge names no service:
             // membership is whole-node admission. This is a member device reaching a gated service by
             // MEMBERSHIP alone.
-            let echoed = connect_and_echo(device, exposer_id, "web", Some(&device_badge)).await;
+            let echoed = connect_and_echo(device, exposer_id, "web", Some(device_badge.as_str())).await;
             assert_eq!(
                 echoed.as_deref(),
                 Some(&b"i am a member"[..]),
@@ -88,7 +88,8 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
                 .link()
                 .unwrap();
             let impostor = Node::new(MemTransport::bind(), NoDiscovery);
-            let refused = connect_and_echo(impostor, exposer_id, "web", Some(&foreign_badge)).await;
+            let refused =
+                connect_and_echo(impostor, exposer_id, "web", Some(foreign_badge.as_str())).await;
             assert_eq!(
                 refused, None,
                 "a badge bound to another device must be refused when a different device presents it"
@@ -126,7 +127,7 @@ async fn a_refused_forward_fails_at_preflight_with_the_reason() {
             // `Ok(PortForward)` a caller would have already printed "forwarding …" over.
             let stranger = Node::new(MemTransport::bind(), NoDiscovery);
             let port = free_port().await;
-            let refused = Connector::to_node(exposer_id, "web".to_owned(), None)
+            let refused = Connector::to_node(exposer_id, "web".parse().unwrap(), None)
                 .preflight(&stranger, port)
                 .await;
             let error = refused
@@ -179,8 +180,8 @@ async fn connect_and_echo(
     badge: Option<&str>,
 ) -> Option<Vec<u8>> {
     let port = free_port().await;
-    let service = service.to_owned();
-    let present = badge.map(str::to_owned);
+    let service = service.parse::<Service>().unwrap();
+    let present = badge.map(|text| text.parse::<Link>().unwrap());
     tokio::task::spawn_local(async move {
         // A refused connector fails at `preflight` (before the port binds), so the client below never
         // connects and the helper returns `None`; an admitted one binds and forwards.

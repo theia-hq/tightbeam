@@ -82,7 +82,7 @@ async fn run() -> eyre::Result<()> {
     drop(probe);
     tokio::task::spawn_local(async move {
         if let Err(e) = async {
-            Connector::to_node(exposer_key, "default".to_owned(), None)
+            Connector::to_node(exposer_key, "default".parse()?, None)
                 .preflight(&consumer, local_port)
                 .await?
                 .run()
