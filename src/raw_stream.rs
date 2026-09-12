@@ -1,5 +1,5 @@
 //! The raw-stream forward: source an already-open byte stream and splice it toward the peer. The sources
-//! share one shape, so `expose` treats them all as a read-only [`crate::tunnel::Target::RawStream`]
+//! share one shape, so `expose` treats them all as a read-only `crate::tunnel::Target::RawStream`
 //! (inheriting the source-only splice and the public-gate refusal):
 //!
 //! - `file:<path>` / `fifo:<path>`: open an OS object the operator named on disk. Its input is an

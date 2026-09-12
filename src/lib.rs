@@ -8,10 +8,10 @@
 //!
 //! Who may connect is decided by the [`nauthy`] crate's authorization gate: by default the node's signet
 //! (its own devices and their delegates), else an open gate for anyone. A named service is a
-//! [`Handler`](tunnel::Handler) a caller injects into a
-//! [`Registry`](tunnel::Registry); tightbeam knows only the contract, never what a handler does, and
-//! ships none of its own. [`Link`](nauthy::Link) mints, narrows, and revokes the `sheer:` capabilities the
-//! gate honors, all offline.
+//! [`Handler`](tunnel::Handler) a caller binds to a name on a
+//! [`Router`](tunnel::Router); tightbeam knows only the contract, never what a handler does, and
+//! ships only its own built-ins (`echo:`, local forwards, raw streams). [`Link`](nauthy::Link) mints,
+//! narrows, and revokes the `sheer:` capabilities the gate honors, all offline.
 //!
 //! The tunnel core lives in [`tunnel`]; the wire frames in [`protocol`]. A command-line tool can be built
 //! on this library; this crate also ships a `tightbeam` binary (`src/bin/tightbeam/`), a thin bridge over
@@ -22,6 +22,7 @@
 //! `tokio::spawn`, because the bifrost interface's futures are not `Send`-bounded. This keeps the library
 //! generic over any transport; see DECISIONS.md for the trade-off.
 
+pub mod builtins;
 pub mod config;
 pub mod duration;
 pub mod enabled;

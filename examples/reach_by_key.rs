@@ -20,7 +20,7 @@ use core::time::Duration;
 use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
 use nauthy::Gate;
-use tightbeam::tunnel::{CancellationToken, Connector, Exposer, Registry, Services};
+use tightbeam::tunnel::{CancellationToken, Connector, Router};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -57,17 +57,16 @@ async fn run() -> eyre::Result<()> {
 
     // 3. The exposer forwards every admitted overlay stream to the local echo service. `Gate::Open` admits
     //    anyone who reaches the key; in production you pass a signet gate so only your own devices and the
-    //    delegates you signed get in. `Registry::new()` is empty because a raw forward needs no named
-    //    handler; you inject `Handler`s (a keyless shell, an HTTP fetcher) for named services.
-    let services = Services::parse(&[format!("echo={echo_addr}")])?;
+    //    delegates you signed get in. One `Router` call binds the `echo` name to the built-in local forward,
+    //    and the whole node is proven at `.expose()`.
     tokio::task::spawn_local(async move {
-        if let Err(e) = Exposer::new(
-            services,
-            Registry::new(),
-            Gate::Open,
-            tightbeam::tunnel::PublicUnsafeRequest::none(),
-        )?
-        .run(&exposer, CancellationToken::new())
+        if let Err(e) = async {
+            Router::new(Gate::Open)
+                .forward("echo".parse()?, &echo_addr.to_string())?
+                .expose()?
+                .run(&exposer, CancellationToken::new())
+                .await
+        }
         .await
         {
             eprintln!("exposer stopped: {e}");

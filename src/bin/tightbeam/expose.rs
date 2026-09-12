@@ -6,18 +6,17 @@
 
 use bifrost::{Node, NodeId, Session, Transport};
 use clap::Args;
-use nauthy::FileDenylist;
+use nauthy::{FileDenylist, Service};
 use tightbeam::tunnel::{
-    self, CancellationToken, Exposer, ManifestEntry, Posture, PublicUnsafeRequest, RawSource,
-    Registry, Services, TargetKind,
+    self, CancellationToken, ManifestEntry, Posture, RawSource, Router, TargetKind,
 };
 
 /// Expose a local service to peers.
 ///
 /// tightbeam's binary is a thin demo of the tunnel: it forwards the raw primitives (`host:port` /
 /// `unix:<path>`, and the raw-stream `file:<path>` / `fifo:<path>` that source a path's bytes to the peer)
-/// only. A named handler service (a bare `<name>:` scheme) lives in its own crate that a richer consumer
-/// injects, so it is not served here.
+/// only. A named handler service is bound by value in a richer consumer (swoosh, or your own embedder), so
+/// it is not served here.
 ///
 /// Authorization is a property of the node, not a per-expose choice: by default a service is gated to this
 /// node's signet (set once when the node adopts an identity), admitting the owner's own devices (membership
@@ -64,10 +63,9 @@ impl ExposeCmd {
     /// opens, else a family gate on the signet, else a loud error), print tightbeam's OWN banner, and run the
     /// exposer. The core prints nothing; the banner is this CLI's to own.
     ///
-    /// tightbeam's binary is a thin demo of the tunnel: it exposes only the raw-forward primitive
-    /// (`host:port` / `unix:<path>`), so it hands the exposer an EMPTY registry and names no service crate. A
-    /// handler service (a bare `<name>:` scheme) lives in its own crate that a richer consumer injects; a bare
-    /// scheme here resolves to a handler no registry holds and is refused loudly at [`Exposer::new`].
+    /// tightbeam's binary is a thin demo of the tunnel: it exposes only the raw primitives (`host:port` /
+    /// `unix:<path>` / `file:` / `fifo:` / `stdin:`), so it binds no handler of its own and names no service
+    /// crate. A bare `<name>:` scheme is a teaching error: a richer consumer binds a handler by value.
     pub async fn run<T: Transport, D: bifrost::Discovery>(
         self,
         node: &Node<T, D>,
@@ -78,7 +76,6 @@ impl ExposeCmd {
         <T::Session as Session>::Write: Send + 'static,
         <T::Session as Session>::Read: Send + 'static,
     {
-        let services = Services::parse(&self.services)?;
         // Build the gate before announcing readiness. This thin demo has no auto-added `control.*` services,
         // so its `--public` stays a whole-node opt-out (a deliberate `Gate::Open` BASE); a richer consumer
         // (swoosh) opens individual services per-service instead. An unprovisioned node with NO `--public`
@@ -88,20 +85,28 @@ impl ExposeCmd {
         } else {
             tunnel::resolve_gate(signet, denylist)?
         };
-        // The core assembles the exposer over an empty registry (tightbeam ships no handler of its own), so a
-        // named-service scheme is refused at construction, and only raw forwards are served. The unsafe
-        // raw-stream opt-in set is proven here: a raw stream under the whole-node open gate is refused unless
-        // named in --public-unsafe. The bin is the ONLY place the flag string becomes the name set.
-        let exposer = Exposer::new(
-            services.clone(),
-            Registry::new(),
-            gate,
-            PublicUnsafeRequest::new(self.public_unsafe.clone()),
-        )?;
+        // Assemble the one route table: the `name=addr` grammar absorbs the raw primitives (a local forward,
+        // or a `file:`/`fifo:`/`stdin:` raw-stream source; a bare `<scheme>:` is a teaching error now that
+        // handlers bind by value). The bin is the ONLY place the `--public-unsafe` flag string becomes the
+        // typed name set. `.expose()` is the one proof door: a raw stream under the whole-node open gate is
+        // refused unless named in `--public-unsafe`, and everything else is proven open-safe.
+        let router = Router::new(gate).parse(&self.services)?;
+        let router = if self.public_unsafe.is_empty() {
+            router
+        } else {
+            let names = self
+                .public_unsafe
+                .iter()
+                .map(|name| name.parse::<Service>())
+                .collect::<Result<Vec<_>, _>>()?;
+            router.public_unsafe(names)
+        };
+        let names: Vec<String> = router.names().map(str::to_owned).collect();
+        let exposer = router.expose()?;
         if !self.quiet {
             expose_banner(
                 node.node_id(),
-                services.names(),
+                names.iter().map(String::as_str),
                 &gate_description(&self, signet),
             );
             // The manifest declares which raw streams read Open (proven unsafe) and their resolved absolute

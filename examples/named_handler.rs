@@ -1,10 +1,11 @@
-//! Serve a NAMED service by injecting your own handler, and reach it by name.
+//! Serve a NAMED service by writing your own handler, and reach it by name.
 //!
 //! The companion to `reach_by_key` (a raw forward) and `gate_a_service` (the
-//! gate). Here the node serves a NAMED service: you write a [`Handler`](tightbeam::tunnel::Handler),
-//! register it under a scheme name, and tightbeam hands every admitted stream for that name to your code.
-//! tightbeam knows only the contract, never what the handler does: a keyless shell, an HTTP fetch, and this
-//! toy "shout" service are all the same shape. This is the library's extension point.
+//! gate). Here the node serves a NAMED service: you write a [`Handler`](tightbeam::tunnel::Handler), bind it
+//! to a name with one [`Router`](tightbeam::tunnel::Router) call, and tightbeam hands every admitted stream
+//! for that name to your code. tightbeam knows only the contract, never what the handler does: a keyless
+//! shell, an HTTP fetch, and this toy "shout" service are all the same shape. This is the library's
+//! extension point.
 //!
 //! ```sh
 //! cargo run --example named_handler
@@ -17,30 +18,31 @@ use core::time::Duration;
 
 use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
-use nauthy::{Admitted, Gate};
+use nauthy::{Gate, Service};
 use tightbeam::open_policy::OptIn;
 use tightbeam::tunnel::{
-    BoxRead, BoxWrite, CancellationToken, Connector, Exposer, Handler, Registry, Services,
+    BoxRead, BoxWrite, CancellationToken, Connector, Handler, Router, ServeError, Served,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
 /// A named handler: code that consumes ONE admitted stream. This one upper-cases every chunk it receives and
-/// writes it back. It gets the gate's `Admitted` witness BY VALUE (proof this peer passed the gate), so it can
-/// never run for a peer the gate turned away. `type Public = OptIn` marks it legitimately public (safe to
-/// expose openly if the operator opts in); a service that is remote code execution (a shell) names
-/// `type Public = Never`, which refuses an open gate at `Exposer::new`.
+/// writes it back. It gets a [`Served<Self>`](tightbeam::tunnel::Served) proof BY VALUE (it carries the
+/// gate's single-use witness), so it can never run for a peer the gate turned away.
+/// `type Exposure = OptIn` marks it legitimately public (safe to expose openly if the operator opts in); a
+/// service that is remote code execution (a shell) names `type Exposure = Never`, which refuses an open
+/// gate when the proof is prepared.
 struct Shout;
 
 impl Handler for Shout {
-    type Public = OptIn;
+    type Exposure = OptIn;
 
     async fn serve(
         &self,
-        _admitted: Admitted,
+        _served: Served<Self>,
         mut writer: BoxWrite,
         mut reader: BoxRead,
-    ) -> eyre::Result<()> {
+    ) -> Result<(), ServeError> {
         let mut buf = [0u8; 1024];
         loop {
             let read = reader.read(&mut buf).await?;
@@ -62,33 +64,23 @@ async fn main() -> eyre::Result<()> {
 }
 
 async fn run() -> eyre::Result<()> {
-    // 1. Register the `Shout` handler (see its definition above) under the `shout` scheme.
-    let registry = Registry::new().with("shout", Shout);
-
-    // 2. Two overlay nodes, and expose the `shout` service under the exposer's key. `shout=shout:` names a
-    //    service `shout` served by the `shout` handler registered above.
+    // 1. Two overlay nodes, and expose the `shout` service under the exposer's key. One call binds the name
+    //    to the handler VALUE: no registry, no scheme string.
     let exposer = Node::new(MemTransport::bind(), NoDiscovery);
     let exposer_key = exposer.node_id();
     let consumer = Node::new(MemTransport::bind(), NoDiscovery);
     println!("serving the shout service on key {exposer_key}");
 
-    let services = Services::parse(&["shout=shout:".to_owned()])?;
+    let shout: Service = "shout".parse()?;
+    let serving = Router::new(Gate::Open).service(shout, Shout)?.expose()?;
     tokio::task::spawn_local(async move {
-        if let Err(e) = Exposer::new(
-            services,
-            registry,
-            Gate::Open,
-            tightbeam::tunnel::PublicUnsafeRequest::none(),
-        )?
-        .run(&exposer, CancellationToken::new())
-        .await
-        {
+        if let Err(e) = serving.run(&exposer, CancellationToken::new()).await {
             eprintln!("exposer stopped: {e}");
         }
         Ok::<_, eyre::Error>(())
     });
 
-    // 3. Reach the `shout` service BY NAME from the other node, bound to a local port.
+    // 2. Reach the `shout` service BY NAME from the other node, bound to a local port.
     let probe = TcpListener::bind("127.0.0.1:0").await?;
     let port = probe.local_addr()?.port();
     drop(probe);
@@ -106,7 +98,7 @@ async fn run() -> eyre::Result<()> {
         }
     });
 
-    // 4. Send a line through the tunnel and watch the handler shout it back.
+    // 3. Send a line through the tunnel and watch the handler shout it back.
     let mut client = None;
     for _ in 0..100 {
         if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)).await {

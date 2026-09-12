@@ -18,7 +18,7 @@ use bifrost::{NoDiscovery, Node, NodeId};
 use bifrost_mem::MemTransport;
 use nauthy::{FileDenylist, Identity, Link, Service};
 use tightbeam::identity::AsVerifyKey as _;
-use tightbeam::tunnel::{self, CancellationToken, Connector, Exposer, Services};
+use tightbeam::tunnel::{self, CancellationToken, Connector, Router};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -45,18 +45,15 @@ async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership()
             // second trusted root.
             let work_signet = NodeId::from_ed25519_secret(&WORK_SECRET);
             tokio::task::spawn_local(async move {
-                let services = Services::parse(&[format!("web={echo_addr}")]).unwrap();
                 let gate = tunnel::resolve_gate(Some(work_signet), empty_denylist().await).unwrap();
-                Exposer::new(
-                    services,
-                    tightbeam::tunnel::Registry::new(),
-                    gate,
-                    tightbeam::tunnel::PublicUnsafeRequest::none(),
-                )
-                .unwrap()
-                .run(&exposer, CancellationToken::new())
-                .await
-                .unwrap();
+                Router::new(gate)
+                    .parse(&[format!("web={echo_addr}")])
+                    .unwrap()
+                    .expose()
+                    .unwrap()
+                    .run(&exposer, CancellationToken::new())
+                    .await
+                    .unwrap();
             });
 
             let work = Identity::from_secret(&WORK_SECRET).unwrap();
