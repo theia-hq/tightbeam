@@ -968,6 +968,14 @@ impl RootedAdmitted {
     pub fn is_member(&self) -> bool {
         self.admitted.is_member()
     }
+
+    /// Consume the rooted proof back into the gate witness it wraps: the transitional seam for an engine
+    /// that still takes the untyped [`Admitted`] (today's `sshh::serve`). No widening is possible: this
+    /// type is minted only by [`Served::into_rooted`], which refuses an open witness, so the witness
+    /// handed on is rooted by construction. Deleted when the engine takes `RootedAdmitted` directly.
+    pub fn into_admitted(self) -> Admitted {
+        self.admitted
+    }
 }
 
 /// Resolve the exposer's node BASE gate, in ONE place so every embedder applies the SAME policy: a family
@@ -4554,6 +4562,18 @@ mod tests {
         assert!(
             matches!(open, Err(ServeError::OpenAdmission)),
             "an open witness cannot narrow to a rooted token"
+        );
+        // The transitional conversion hands the rooted witness on to an engine that still takes the
+        // untyped `Admitted` (today's `sshh::serve`); only a rooted proof can produce one.
+        let admitted = Served::<GatedNoop>::mint(witness(true))
+            .expect("rooted mints")
+            .into_rooted()
+            .expect("a rooted witness narrows")
+            .into_admitted();
+        assert_eq!(
+            admitted.peer(),
+            bifrost::NodeId::from_ed25519_secret(&[9u8; 32]).verify_key(),
+            "the transitional conversion preserves the admitted peer"
         );
     }
 
