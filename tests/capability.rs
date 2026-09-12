@@ -15,7 +15,7 @@ use core::time::Duration;
 use bifrost::{NoDiscovery, Node, NodeId};
 use bifrost_mem::MemTransport;
 use nauthy::{FileDenylist, Identity, Link, Service};
-use tightbeam::tunnel::{self, CancellationToken, Connector, Exposer, Services};
+use tightbeam::tunnel::{self, CancellationToken, Connector, Router};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -36,18 +36,15 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
             // rooted at that key (badges or slips), which is what these cap tests present.
             let signet = NodeId::from_ed25519_secret(&EXPOSER_SECRET);
             tokio::task::spawn_local(async move {
-                let services = Services::parse(&[format!("ssh={echo_addr}")]).unwrap();
                 let gate = tunnel::resolve_gate(Some(signet), empty_denylist().await).unwrap();
-                Exposer::new(
-                    services,
-                    tightbeam::tunnel::Registry::new(),
-                    gate,
-                    tightbeam::tunnel::PublicUnsafeRequest::none(),
-                )
-                .unwrap()
-                .run(&exposer, CancellationToken::new())
-                .await
-                .unwrap();
+                Router::new(gate)
+                    .parse(&[format!("ssh={echo_addr}")])
+                    .unwrap()
+                    .expose()
+                    .unwrap()
+                    .run(&exposer, CancellationToken::new())
+                    .await
+                    .unwrap();
             });
 
             // A cap for ssh, valid for an hour, minted by the exposer's identity.

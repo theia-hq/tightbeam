@@ -5,7 +5,7 @@ use core::time::Duration;
 use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
 use nauthy::Gate;
-use tightbeam::tunnel::{CancellationToken, Connector, Exposer, Services};
+use tightbeam::tunnel::{CancellationToken, Connector, Router};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
 
@@ -43,17 +43,14 @@ async fn tunnels_to_a_unix_socket() {
 
             let service = format!("sock=unix:{}", sock.display());
             tokio::task::spawn_local(async move {
-                let services = Services::parse(&[service]).unwrap();
-                Exposer::new(
-                    services,
-                    tightbeam::tunnel::Registry::new(),
-                    Gate::Open,
-                    tightbeam::tunnel::PublicUnsafeRequest::none(),
-                )
-                .unwrap()
-                .run(&exposer, CancellationToken::new())
-                .await
-                .unwrap();
+                Router::new(Gate::Open)
+                    .parse(&[service])
+                    .unwrap()
+                    .expose()
+                    .unwrap()
+                    .run(&exposer, CancellationToken::new())
+                    .await
+                    .unwrap();
             });
             tokio::task::spawn_local(async move {
                 Connector::to_node(exposer_id, "default".parse().unwrap(), None)

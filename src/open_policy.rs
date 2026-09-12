@@ -13,9 +13,9 @@
 //! value can be forged and named where a marker type is expected. Both properties make "a keyless service
 //! mislabeled open" a compile error, not a runtime hope.
 //!
-//! [`Handler`](crate::tunnel::Handler) names one of these markers as its `type Public: PublicUse`, and
-//! [`Exposer::new`](crate::tunnel::Exposer::new) reads the erased `OPEN_SAFE` once to refuse an open gate over
-//! a [`Never`] handler.
+//! [`Handler`](crate::tunnel::Handler) names one of these markers as its `type Exposure: PublicUse`, and
+//! the proof is prepared on the serve path: a `Never` handler refuses an open witness before any
+//! `Response::Ok` (see [`Served`](crate::tunnel::Served)).
 //!
 //! The seal is necessary, so it is guarded by a compile-fail probe: a downstream marker is REJECTED
 //! because the `sealed::Sealed` supertrait it would need is private and unnameable. This doc-test fails to
@@ -81,6 +81,28 @@ impl PublicUse for OptIn {
 
 impl sealed::Sealed for Never {}
 impl sealed::Sealed for OptIn {}
+
+/// The one-way conversion relation between exposure ceilings, read by
+/// [`Served::delegate`](crate::tunnel::Served::delegate) as a method bound: an outer handler may hand its
+/// proof inward only to an inner whose ceiling is compatible with its own.
+///
+/// The two impls say exactly:
+/// - [`Never`] is compatible with every inner (a rooted proof may reach anything; a `Never` outer can only
+///   ever hold a rooted witness), and
+/// - [`OptIn`] is compatible only with [`OptIn`] (an open witness may reach an open-permitting inner, never
+///   a [`Never`] one).
+///
+/// There is deliberately NO `Compatible<Never> for OptIn`: the widening case is not a runtime refusal, it is
+/// a compile error at the wrapper's `delegate` call, so a lying `OptIn` wrapper cannot even name a `Never`
+/// inner. The relation is sealed the same way [`PublicUse`] is, so a downstream crate cannot add the missing
+/// widening impl. The reflexive-and-widening pair (rather than a blanket `impl<Inner: PublicUse>
+/// Compatible<Inner> for Never` beside the reflexive impl) is coherence-clean: the blanket overlaps the
+/// reflexive impl at `Compatible<Never> for Never` (E0119), while `impl Compatible<OptIn> for Never` does
+/// not.
+pub trait Compatible<Inner: PublicUse>: PublicUse {}
+
+impl<T: PublicUse> Compatible<T> for T {}
+impl Compatible<OptIn> for Never {}
 
 /// Seals [`PublicUse`]: a downstream crate cannot name `sealed::Sealed` (the module is private), so it cannot
 /// implement `PublicUse` for a type of its own. The marker set is closed to the two in this module, which is

@@ -3,7 +3,7 @@ use core::time::Duration;
 use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
 use nauthy::Gate;
-use tightbeam::tunnel::{CancellationToken, Connector, Exposer, Services};
+use tightbeam::tunnel::{CancellationToken, Connector, Router};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -43,17 +43,14 @@ async fn tunnels_tcp_over_bifrost() {
             // Drive the tunnel core directly (no CLI, no banner): an open gate needs no identity or signet,
             // so any peer reaching the key is served (this test exercises the tunnel path, not authorization).
             tokio::task::spawn_local(async move {
-                let services = Services::parse(&[format!("echo={echo_addr}")]).unwrap();
-                Exposer::new(
-                    services,
-                    tightbeam::tunnel::Registry::new(),
-                    Gate::Open,
-                    tightbeam::tunnel::PublicUnsafeRequest::none(),
-                )
-                .unwrap()
-                .run(&exposer, CancellationToken::new())
-                .await
-                .unwrap();
+                Router::new(Gate::Open)
+                    .parse(&[format!("echo={echo_addr}")])
+                    .unwrap()
+                    .expose()
+                    .unwrap()
+                    .run(&exposer, CancellationToken::new())
+                    .await
+                    .unwrap();
             });
             tokio::task::spawn_local(async move {
                 Connector::to_node(exposer_id, "default".parse().unwrap(), None)

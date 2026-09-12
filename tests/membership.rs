@@ -20,7 +20,7 @@ use bifrost::{NoDiscovery, Node, NodeId};
 use bifrost_mem::MemTransport;
 use nauthy::{FileDenylist, Identity, Link, Service};
 use tightbeam::identity::AsVerifyKey as _;
-use tightbeam::tunnel::{self, CancellationToken, Connector, Exposer, Services};
+use tightbeam::tunnel::{self, CancellationToken, Connector, Router};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -42,9 +42,11 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             // prove a membership badge is whole-node (any service), not a per-service slip.
             let signet = NodeId::from_ed25519_secret(&SIGNET_SECRET);
             tokio::task::spawn_local(async move {
-                let services = Services::parse(&[format!("web={echo_addr}")]).unwrap();
                 let gate = tunnel::resolve_gate(Some(signet), empty_denylist().await).unwrap();
-                Exposer::new(services, tightbeam::tunnel::Registry::new(), gate, tightbeam::tunnel::PublicUnsafeRequest::none())
+                Router::new(gate)
+                    .parse(&[format!("web={echo_addr}")])
+                    .unwrap()
+                    .expose()
                     .unwrap()
                     .run(&exposer, CancellationToken::new())
                     .await
@@ -113,9 +115,11 @@ async fn a_refused_forward_fails_at_preflight_with_the_reason() {
             // A family-gated node rooted at the signet: only a member is admitted.
             let signet = NodeId::from_ed25519_secret(&SIGNET_SECRET);
             tokio::task::spawn_local(async move {
-                let services = Services::parse(&[format!("web={echo_addr}")]).unwrap();
                 let gate = tunnel::resolve_gate(Some(signet), empty_denylist().await).unwrap();
-                Exposer::new(services, tightbeam::tunnel::Registry::new(), gate, tightbeam::tunnel::PublicUnsafeRequest::none())
+                Router::new(gate)
+                    .parse(&[format!("web={echo_addr}")])
+                    .unwrap()
+                    .expose()
                     .unwrap()
                     .run(&exposer, CancellationToken::new())
                     .await

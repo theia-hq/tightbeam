@@ -8,7 +8,7 @@ A machine exposes local services under its public key, each behind a gate. Anoth
 and passing the gate, reaches one service and gets a plain byte stream to it. Anything that speaks over a
 TCP port or a Unix socket rides it unchanged. No port forwarding, no VPN, no public IP.
 
-tightbeam is a Rust library you embed. You build an `Exposer` to serve services behind a gate, or a
+tightbeam is a Rust library you embed. You build a `Router` to serve services behind a gate, or a
 `Connector` to reach one and get a stream back. It ships only its own built-ins (`echo:`, forwards, raw
 streams) and prints nothing: the program that embeds it supplies the other services, the identity, and
 the output. The keyed connection underneath is [bifrost](https://github.com/theia-hq/bifrost)'s; who may
@@ -65,65 +65,68 @@ any protocol generic over a bifrost session runs over the tunnel unchanged.
 
 ## Serve services behind a gate
 
-An `Exposer` accepts overlay sessions from permitted peers and forwards each inbound stream to the service
-it names. You build it from three things: the services to publish, a `Registry` of handlers for the named
-ones, and the `Gate` that decides who may reach them.
+A [`Router`](src/tunnel.rs) is one route table: bind each served name to a handler, a local forward, a
+raw-stream source, or the built-in loopback reflector, then prove the whole node once with `.expose()`. The
+proved [`Exposer`](src/tunnel.rs) accepts overlay sessions from permitted peers and forwards each inbound
+stream to the service it names.
 
 ```rust
-use nauthy::FileDenylist;
-use tightbeam::tunnel::{self, CancellationToken, Exposer, PublicUnsafeRequest, Registry, Services};
+use tightbeam::tunnel::{self, CancellationToken, Router};
 
-// `name=addr` entries. A `host:port` or `unix:<path>` is a raw forward tightbeam splices itself;
-// a bare `<name>:` scheme names a handler you register (see below).
-let services = Services::parse(&["web=127.0.0.1:8080".into(), "shell=sh:".into()])?;
-
-// The gate is the node's family authority, rooted at its signet (its own devices and their
-// delegates). An unprovisioned node fails loud here rather than falling open. The caller loads the
-// denylist from wherever it persists revocations and passes it in.
-let gate = tunnel::resolve_gate(Some(signet), denylist)?;
-
-// The fourth argument is the UNSAFE raw-stream opt-in set: raw byte sources (`file:`/`fifo:`/`stdin:`)
-// have no authorization of their own, so under an open gate they are refused unless the operator
-// knowingly names them here. `PublicUnsafeRequest::none()` opts nothing in.
-let exposer = Exposer::new(services, registry, gate, PublicUnsafeRequest::none())?;
+// `echo` is the built-in loopback reflector: it opens no host resource, so it is the safe public demo.
+// `forward` is the built-in local forward. A `handler` you wrote binds the same way (see below).
+let gate = tunnel::resolve_gate(Some(signet), denylist)?;   // family gate on the node's signet
+let exposer = Router::new(gate)
+    .echo("demo".parse()?)?
+    .forward("web".parse()?, "127.0.0.1:8080")?
+    .expose()?;
 exposer.run(&node, CancellationToken::new()).await?;   // runs until cancelled; prints nothing
 ```
 
-`Exposer::new` is a fully-gated node: every service faces the family gate. Opening a legitimate service to
-strangers is a deliberate second step, `Exposer::with_public(PublicRequest::new([...]))`, which proves each
-named service is exposed and safe to open before the node serves it. A handler with no authorization of its
-own (a keyless shell) can never be opened this way, and a raw byte source is redirected to the distinct,
-louder unsafe opt-in (`PublicUnsafeRequest`, the fourth `new` argument). The `CancellationToken` is the
-node's teardown handle: a caller may hold a clone and fire it to stop the accept loop.
+`Router::new(gate)` is a fully-gated node: every route faces the family gate. Opening a legitimate service
+to strangers is a deliberate second step, `.public(names)` (a safe handler opened per service), which
+`.expose()` proves before the node serves it. A handler with no authorization of its own (a keyless shell)
+can never be opened this way, and a raw byte source (`file:`/`fifo:`/`stdin:`) is redirected to the
+distinct, louder `.public_unsafe(names)` opt-in. `.parse(&["web=127.0.0.1:8080".into()])` absorbs the
+`name=addr` grammar; a bare `<name>:` no longer resolves, since handlers bind by value. The
+`CancellationToken` is the node's teardown handle: a caller may hold a clone and fire it to stop the accept
+loop.
 
 ## Inject a named service
 
-A raw forward (a `host:port` or `unix:<path>`) tightbeam splices on its own. Anything else is a `Handler`
-you register: a name maps to code that consumes one admitted stream. tightbeam knows only that contract,
-never what a handler does, and ships none of its own.
+tightbeam knows only the [`Handler`](src/tunnel.rs) contract, never what a handler does. A handler names its
+`Exposure` ceiling as a type (`Never` for a keyless shell, `OptIn` for a legitimately public responder),
+declares its `Metering` if it bounds callers, and serves one admitted stream from the `Served<Self>` proof
+the gate prepared for it.
 
 ```rust
-use nauthy::Admitted;
 use tightbeam::open_policy::Never;
-use tightbeam::tunnel::{BoxRead, BoxWrite, Handler, Registry};
+use tightbeam::tunnel::{BoxRead, BoxWrite, Handler, ServeError, Served};
 
 struct Shell;
 
 impl Handler for Shell {
-    // Whether this handler may EVER face a stranger is a compile-time property, stated once as a
-    // type. A keyless shell is remote code execution, so it names `Never`: an open gate over it is
-    // refused at `Exposer::new`. A legitimately public responder names `OptIn` instead. There is no
-    // default and no runtime flag, so "a keyless service mislabeled open" does not compile.
-    type Public = Never;
+    // Whether this handler may EVER face a stranger is a compile-time property, stated once as a type. A
+    // keyless shell is remote code execution, so it names `Never`: an open gate over it is refused when
+    // the proof is prepared. A legitimately public responder names `OptIn`. There is no default and no
+    // runtime flag, so "a keyless service mislabeled open" does not compile.
+    type Exposure = Never;
 
-    async fn serve(&self, admitted: Admitted, writer: BoxWrite, reader: BoxRead) -> eyre::Result<()> {
-        // `admitted` is the gate's single-use witness, moved in by value: this code cannot run for a
-        // peer the gate did not admit. "Authorize before serve" is a precondition the compiler enforces.
-        run_shell(admitted, writer, reader).await
+    async fn serve(
+        &self,
+        served: Served<Self>,
+        writer: BoxWrite,
+        reader: BoxRead,
+    ) -> Result<(), ServeError> {
+        // `served` carries the gate's single-use witness: this code cannot run for a peer the gate did
+        // not admit. An engine whose safety rests on a ROOT-verified peer narrows it with
+        // `served.into_rooted()?` (an open witness is refused).
+        let rooted = served.into_rooted()?;
+        run_shell(rooted, writer, reader)
     }
 }
 
-let registry = Registry::new().with("sh", Shell);
+let exposer = Router::new(gate).service("sh".parse()?, Shell)?.expose()?;
 ```
 
 ## Hand out an expiring key
@@ -162,13 +165,14 @@ the host's involvement. Revoking cuts it off at once; short expiry backs that up
 A forward carries bytes. The program on each end does not know the overlay is there. The service on the host
 is one of:
 
-- a `host:port` or `unix:<path>`, spliced to a local address: tightbeam's own raw forward;
+- a `host:port` or `unix:<path>`, spliced to a local address: the built-in `Forward` service;
 - a `file:<path>` or `fifo:<path>` (a path's raw bytes sourced to the peer), or `stdin:` (whatever a
   producer pipes in). A `stdin:` or `fifo:` source serves ONE consumer by default; `+lossy` opts it into
   fan-out to many, dropping bytes for any consumer that falls behind (a live feed, never exact bytes: a
   dropped byte in a `tar` is silent corruption, so `+lossy` is refused on any other scheme and under an open
   gate);
-- a named `Handler` you injected (a shell, or any code that consumes one admitted stream).
+- a named `Handler` you bound with `.service(name, handler)` (a shell, or any code that consumes one
+  admitted stream).
 
 ## The wire
 

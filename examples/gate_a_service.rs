@@ -27,7 +27,7 @@ use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
 use nauthy::{FileDenylist, Identity, Link, Service};
 use tightbeam::identity::AsNodeId as _;
-use tightbeam::tunnel::{self, CancellationToken, Connector, Exposer, Registry, Services};
+use tightbeam::tunnel::{self, CancellationToken, Connector, Router};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -68,7 +68,6 @@ async fn run() -> eyre::Result<()> {
     //    capability this identity signed (for this service, unexpired) is admitted. `resolve_gate(..)`
     //    is the same policy every embedder applies: not-public means a family gate on the signet, and an
     //    empty denylist admits everything not yet revoked.
-    let services = Services::parse(&[format!("ssh={echo_addr}")])?;
     // Nothing is revoked yet, so an empty denylist. A real node loads this from where it persists
     // revocations (`FileDenylist::load`); the empty set admits everything not yet revoked.
     // `identity.verifying_key()` is nauthy's `VerifyKey`; `.node_id()` is the `AsNodeId` bridge to bifrost's
@@ -77,13 +76,13 @@ async fn run() -> eyre::Result<()> {
     let signet = identity.verifying_key().node_id();
     let gate = tunnel::resolve_gate(Some(signet), FileDenylist::empty(PathBuf::new()))?;
     tokio::task::spawn_local(async move {
-        if let Err(e) = Exposer::new(
-            services,
-            Registry::new(),
-            gate,
-            tightbeam::tunnel::PublicUnsafeRequest::none(),
-        )?
-        .run(&exposer, CancellationToken::new())
+        if let Err(e) = async {
+            Router::new(gate)
+                .forward("ssh".parse()?, &echo_addr.to_string())?
+                .expose()?
+                .run(&exposer, CancellationToken::new())
+                .await
+        }
         .await
         {
             eprintln!("exposer stopped: {e}");
