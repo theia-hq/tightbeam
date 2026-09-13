@@ -1,3 +1,10 @@
+[workspace]
+# One repo, two crates: the tunnel library and the lean handler contract it dispatches. A workspace makes
+# `tightbeam-handler` resolvable as a git dependency of its own (a consumer pins the contract without taking
+# the tunnel's heavy tree); the contract's manifest is `tightbeam-handler/Cargo.toml`.
+members = ["tightbeam-handler"]
+resolver = "3"
+
 [package]
 publish = false  # git-only for now, not published to crates.io
 name = "tightbeam"
@@ -16,6 +23,9 @@ bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "a464d18a11ff8e4d
 bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "a464d18a11ff8e4de1ba5d63d33c1cf9111c5b04" }
 bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "a464d18a11ff8e4de1ba5d63d33c1cf9111c5b04" }
 nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "c714e1bcd189e08c937254b4dc858f8b0f41d7f4" }
+# The handler contract, in-tree beside its only dispatcher. A path dep (not a git self-dep): the workspace
+# member resolves within this checkout, and the package stays separately pinnable by a consumer.
+tightbeam-handler = { path = "tightbeam-handler" }
 
 clap = { version = "4", features = ["derive", "env"] }
 eyre = "0.6"
@@ -37,13 +47,16 @@ zeroize = { version = "1", features = ["derive"] }
 [dev-dependencies]
 bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "a464d18a11ff8e4de1ba5d63d33c1cf9111c5b04" }
 
-[lints.clippy]
+[lints]
+workspace = true
+
+[workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
 wildcard_imports = "deny"
 std_instead_of_core = "warn"
 
-[lints.rust]
+[workspace.lints.rust]
 unused_must_use = "deny"
 
 # Ship a lean release binary: strip symbols, whole-program LTO, single codegen unit. Halves the artifact
