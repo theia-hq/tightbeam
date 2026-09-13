@@ -5,8 +5,9 @@
 //! handler, with no forgettable default. The marker names the LEGITIMACY question (delib-37's S6 predicate:
 //! "no legitimate public USE"), never the auth mechanism: [`Never`] = a keyless shell no operator may serve
 //! to strangers, [`OptIn`] = legitimate to serve publicly IF the operator opts in. It carries its whole
-//! payload as [`PublicUse::OPEN_SAFE`], a private const an assembler reads once at construction to refuse an
-//! open gate over a [`Never`] handler.
+//! payload as [`PublicUse::OPEN_SAFE`], a const the type carries: readable by any consumer, implementable
+//! only by the two sealed markers here. An assembler reads it once at construction to refuse an open gate
+//! over a [`Never`] handler.
 //!
 //! The marker is SEALED (a private supertrait): only the two markers here implement it, so a downstream
 //! crate cannot add a third, more-permissive variant. The markers are UNINHABITED (`enum Never {}`), so no
@@ -41,11 +42,11 @@
 /// If in doubt, or if your handler does no auth of its own, pick [`Never`]: the gate then authenticates for
 /// you, and the worst case is a service that is gated when it could have been public, never a keyless service
 /// served open by accident.
-pub trait PublicUse: sealed::Sealed {
+pub trait PublicUse: sealed::Sealed + Send + Sync + 'static {
     /// Whether serving this handler to an unauthenticated stranger is ever legitimate: `Never = false`,
-    /// `OptIn = true`. Private (the whole point of the marker is that the answer is the TYPE, not a bool a
-    /// caller passes); an assembler reads it once at construction to refuse an open gate over a `Never`
-    /// handler.
+    /// `OptIn = true`. The type carries the answer, never a bool a caller passes; the const is readable by
+    /// any consumer, but only the two sealed markers can implement it. An assembler reads it once at
+    /// construction to refuse an open gate over a [`Never`] handler.
     const OPEN_SAFE: bool;
 }
 
@@ -93,10 +94,10 @@ impl sealed::Sealed for OptIn {}
 /// - [`OptIn`] is compatible only with [`OptIn`] (an open witness may reach an open-permitting inner, never
 ///   a [`Never`] one).
 ///
-/// There is deliberately NO `Compatible<Never> for OptIn`: the widening case is not a runtime refusal, it is
-/// a compile error at the wrapper's `delegate` call, so a lying `OptIn` wrapper cannot even name a `Never`
+/// There is deliberately NO `Compatible<Never> for OptIn`: the laundering case is not a runtime refusal, it
+/// is a compile error at the wrapper's `delegate` call, so a lying `OptIn` wrapper cannot even name a `Never`
 /// inner. The relation is sealed the same way [`PublicUse`] is, so a downstream crate cannot add the missing
-/// widening impl. The reflexive-and-widening pair (rather than a blanket `impl<Inner: PublicUse>
+/// laundering impl. The reflexive-and-widening pair (rather than a blanket `impl<Inner: PublicUse>
 /// Compatible<Inner> for Never` beside the reflexive impl) is coherence-clean: the blanket overlaps the
 /// reflexive impl at `Compatible<Never> for Never` (E0119), while `impl Compatible<OptIn> for Never` does
 /// not.

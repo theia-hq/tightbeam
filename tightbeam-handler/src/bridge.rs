@@ -59,6 +59,7 @@ type BoxServe<'a> = Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send +
 
 /// The frozen post-success serve step, opaque to a dispatcher: run [`serve`](Prepared::serve) with the
 /// stream halves and await the handler's future.
+#[must_use = "a prepared serve step serves nothing until `Prepared::serve` runs"]
 pub struct Prepared<'a> {
     serve: Box<PreparedRun<'a>>,
 }

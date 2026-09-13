@@ -49,8 +49,9 @@ mod refusal_tag {
 }
 
 impl Request {
-    /// Write the request to the stream.
-    pub async fn write<W: io::AsyncWrite + Unpin>(&self, writer: &mut W) -> io::Result<()> {
+    /// Write the raw request frame to the stream, unchecked. Crate-internal: every credential-bearing
+    /// path goes through [`write_checked`](Self::write_checked).
+    pub(crate) async fn write<W: io::AsyncWrite + Unpin>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(&MAGIC).await?;
         write_str(writer, &self.service).await?;
         write_opt(writer, self.capability.as_deref()).await?;
@@ -63,9 +64,10 @@ impl Request {
     /// capability or a membership badge is written only when `S`'s declared profile proves the peer
     /// ([`PeerProof::Proven`](bifrost::PeerProof::Proven) or
     /// [`InProcess`](bifrost::PeerProof::InProcess)); otherwise nothing is written and the refusal names
-    /// the declared profile. A request that carries no credential is the plain [`write`](Self::write).
-    /// The profile is read from the session TYPE, never a caller-supplied value, so no caller can assert
-    /// a proof the session did not declare.
+    /// the declared profile. A request that carries no credential takes the plain, unchecked `write` path.
+    /// The profile is read from the session type the caller names (`S`), never from a value passed in:
+    /// `S` is the caller's type parameter, so naming the session actually written to is the caller's
+    /// obligation, and no [`Security`](bifrost::Security) value can be supplied.
     pub async fn write_checked<S, W>(&self, writer: &mut W) -> Result<(), RequestWriteError>
     where
         S: Session,
@@ -103,7 +105,7 @@ impl Request {
 
 /// Why a checked request write did not finish.
 ///
-/// Either the frame itself failed (an I/O error, the plain [`write`](Request::write) failing), or the
+/// Either the frame itself failed (an I/O error in the plain `write`), or the
 /// request was refused before any byte because it presents a credential over a transport that does not
 /// prove the peer ([`TransportInsecure`]).
 #[derive(Debug, thiserror::Error)]

@@ -1,13 +1,20 @@
 //! The serving-proof wall: the mint refuses an open witness for a `Never` handler, delegation preserves
-//! the witness and re-applies the target ceiling, and `into_rooted` is the one narrowing seam.
+//! the witness and re-applies the target ceiling, `into_rooted` is the one narrowing seam, and the erased
+//! bridge refuses at `prepare` before any success and serves only through the prepared step.
 //!
 //! The mint is crate-private, so these proofs are only reachable from inside this crate: an outside crate
 //! consumes a proof through the erased bridge, pinned by the compile-fail doc tests on [`Served`].
 
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::{Context, Waker};
 use core::time::Duration;
+use std::sync::Arc;
 
+use bifrost_core::Refusal;
 use nauthy::{Gate, ProvenPeer, Service};
+use tokio::io::{empty, sink};
 
+use crate::bridge::ErasedHandler as _;
 use crate::contract::{RootedAdmitted, ServeError, Served};
 use crate::open_policy::{Never, OptIn};
 use crate::{BoxRead, BoxWrite, Handler};
@@ -42,6 +49,24 @@ impl Handler for OpenNoop {
         _writer: BoxWrite,
         _reader: BoxRead,
     ) -> Result<(), ServeError> {
+        Ok(())
+    }
+}
+
+/// An OPEN handler that records that it ran: the bridge's prepared serve step must actually drive the
+/// handler body, not just mint a type-level token.
+struct ObservedNoop(Arc<AtomicBool>);
+
+impl Handler for ObservedNoop {
+    type Exposure = OptIn;
+
+    async fn serve(
+        &self,
+        _served: Served<Self>,
+        _writer: BoxWrite,
+        _reader: BoxRead,
+    ) -> Result<(), ServeError> {
+        self.0.store(true, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -89,10 +114,54 @@ fn a_rooted_witness_mints_a_never_proof_and_an_open_one_does_not() {
     );
 }
 
+/// The erased bridge's `prepare`, the dispatcher's pre-success seam: an open witness is refused for a
+/// `Never` handler before any success can exist (no `Prepared` is minted), a rooted witness mints, and an
+/// open witness mints an `OptIn` handler's proof. The wire-level ordering (no `Response::Ok` before this
+/// call returns `Ok`) is pinned in tightbeam's `serve_request` test.
+#[test]
+fn the_bridge_refuses_an_open_witness_for_never_before_minting() {
+    let gated = GatedNoop;
+    assert!(
+        matches!(gated.prepare(witness(false)), Err(Refusal::NotAdmitted)),
+        "an open witness is refused before any success"
+    );
+    assert!(
+        gated.prepare(witness(true)).is_ok(),
+        "a rooted witness mints a Never proof"
+    );
+    assert!(
+        OpenNoop.prepare(witness(false)).is_ok(),
+        "an open witness mints an OptIn proof"
+    );
+}
+
+/// `Prepared::serve` runs the frozen handler for the one stream: the bridge's proof drives the handler body.
+#[test]
+fn prepared_serve_runs_the_frozen_handler() {
+    let ran = Arc::new(AtomicBool::new(false));
+    let handler = ObservedNoop(Arc::clone(&ran));
+    let prepared = handler
+        .prepare(witness(false))
+        .expect("an open witness mints an OptIn proof");
+    // The no-op handler has no await before its body, so one poll with a no-op waker runs it to completion;
+    // the contract stays runtime-free.
+    let mut serve = Box::pin(prepared.serve(Box::new(sink()), Box::new(empty())));
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    assert!(
+        serve.as_mut().poll(&mut context).is_ready(),
+        "the no-op handler's serve completes in one poll"
+    );
+    assert!(
+        ran.load(Ordering::SeqCst),
+        "Prepared::serve ran the handler body"
+    );
+}
+
 /// Delegation preserves the witness and re-applies the target ceiling: a rooted `Never` proof delegates
 /// both to another `Never` inner (reflexive) and to an `OptIn` inner (widening); an open `OptIn` proof
-/// delegates only to an `OptIn` inner. The `OptIn -> Never` widening is a compile error, pinned by the
-/// `Served` doc test.
+/// delegates only to an `OptIn` inner. The `OptIn -> Never` laundering delegation is a compile error, pinned
+/// by the `Served` doc test.
 #[test]
 fn delegation_preserves_the_witness_and_the_ceiling() {
     let rooted = Served::<GatedNoop>::mint(witness(true)).expect("rooted mints");

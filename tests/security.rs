@@ -11,6 +11,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 
 use bifrost::{
@@ -133,11 +134,18 @@ async fn a_gated_dial_over_an_announced_transport_refuses_before_any_write() {
                 .unwrap();
 
             let port = free_port().await;
-            let error = Connector::to_node(peer_id, "web".parse().unwrap(), Some(badge))
-                .preflight(&consumer, port)
-                .await
-                .err()
-                .expect("an announced transport must refuse a credential dial");
+            // Bound the dial: under a predicate regression the credential write would succeed and
+            // `preflight` would await a `Response` from the never-accepted peer forever. The timeout turns
+            // that hang into a fast failure at the assertion below.
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                Connector::to_node(peer_id, "web".parse().unwrap(), Some(badge))
+                    .preflight(&consumer, port),
+            )
+            .await
+            .expect("the refusal must return, not hang")
+            .err()
+            .expect("an announced transport must refuse a credential dial");
             assert!(
                 matches!(
                     error.downcast_ref::<RequestWriteError>(),
@@ -348,9 +356,15 @@ async fn free_port() -> u16 {
     port
 }
 
-/// An empty revocation denylist: these tests exercise the profile rule, not revocation.
+/// An empty revocation denylist: these tests exercise the profile rule, not revocation. The path is unique
+/// per call, so the tests that run concurrently cannot share (and race on) one file.
 async fn empty_denylist() -> FileDenylist {
-    let path = std::env::temp_dir().join(format!("tightbeam-security-{}", std::process::id()));
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "tightbeam-security-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     let _ = std::fs::remove_file(&path);
     FileDenylist::load(path).await.unwrap()
 }
