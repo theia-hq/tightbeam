@@ -7,18 +7,21 @@
 //! prints its own banner, and drives this core. Everything here already speaks `bifrost` and `nauthy`, never
 //! clap or a store.
 
-use core::future::Future;
-use core::marker::PhantomData;
 use core::time::Duration;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bifrost::{ConnInfo, Discovery, Node, NodeId, Refusal, RefusalDetail, Session, Transport};
 use futures::StreamExt as _;
-use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use nauthy::{
-    Admission, Admitted, Cap, FileDenylist, Gate, Link, Origin, ProvenPeer, Service, VerifyKey,
+use nauthy::{Admitted, Cap, FileDenylist, Gate, Link, ProvenPeer, Service};
+use tightbeam_handler::bridge::ErasedHandler;
+// The handler contract lives in the lean `tightbeam-handler` crate (delib-56 verdict 13), re-exported here
+// unchanged so every existing `tightbeam::tunnel::*` path keeps working, and a service implements the
+// contract without taking this crate's tree. The erased bridge is imported, not re-exported: `Target` stores
+// it privately and it is not part of the author-facing surface.
+pub use tightbeam_handler::{
+    BoxRead, BoxWrite, Handler, Metering, RootedAdmitted, ServeError, Served,
 };
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
@@ -29,7 +32,6 @@ pub use tokio_util::sync::CancellationToken;
 
 use crate::enabled::{AllEnabled, EnabledServices};
 use crate::identity::{AsNodeId as _, AsVerifyKey as _};
-use crate::open_policy::{Compatible, PublicUse};
 use crate::protocol::{Request, Response};
 use crate::raw_stream::RawStream;
 use crate::{pipe_stdio_bridge, splice, splice_halves};
@@ -103,7 +105,7 @@ impl Target {
     /// function over [`Target`], resolved THROUGH the target rather than off its served name, so an alias
     /// cannot be opened by naming it: the target's own posture decides, never the name.
     ///
-    /// The TYPE guarantee (the sealed, uninhabited [`PublicUse`] marker erased to
+    /// The TYPE guarantee (the sealed, uninhabited [`PublicUse`](crate::open_policy::PublicUse) marker erased to
     /// [`ErasedHandler::open_safe`]) covers [`Handler`](Target::Handler): a `Never` handler (a keyless
     /// shell) reads `false`, an `OptIn` handler `true`. A [`RawStream`](Target::RawStream) has no auth of
     /// its own and is one keystroke from a secret, so it is NOT openable here; it opens only through the
@@ -145,7 +147,7 @@ pub enum TargetKind {
 
 /// A route's access class: what the gate must have proven beyond admission. Declared where the route is
 /// registered ([`Services::member_only`]), never on the handler: a handler's compile-time marker
-/// ([`Handler::Public`]) says what the CODE may face, while access is a property of the NAME a caller
+/// ([`Handler::Exposure`]) says what the CODE may face, while access is a property of the NAME a caller
 /// reaches. Per-route is also the only axis that lets two names bound to one handler carry different
 /// floors, and it keeps a handler impl from growing a fourth mandatory item (the cold-author bar).
 ///
@@ -470,7 +472,7 @@ impl Services {
 /// This is the EFFECTIVE posture a dialer would experience today, read off the node's gate: an [`Gate::Open`]
 /// node serves every service to anyone, so each is [`Open`](Posture::Open); any other gate requires a member
 /// badge, so each is [`Gated`](Posture::Gated). It is not the handler's compile-time open-safety CEILING
-/// (`type Public`): a service that COULD be public still reports `Gated` on a gated node, because
+/// (`type Exposure`): a service that COULD be public still reports `Gated` on a gated node, because
 /// that is what a caller actually faces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Posture {
@@ -667,315 +669,6 @@ fn take_u16(bytes: &[u8], cursor: &mut usize) -> eyre::Result<u16> {
 /// Read a big-endian `u32` at `cursor`, advancing it.
 fn take_u32(bytes: &[u8], cursor: &mut usize) -> eyre::Result<u32> {
     Ok(u32::from_be_bytes(take_array::<4>(bytes, cursor)?))
-}
-
-/// A boxed writer half handed to a handler (the accepted stream is already `Send + 'static`, so boxing it
-/// as a trait object is a small per-stream allocation, invisible next to the splice it feeds).
-pub type BoxWrite = Box<dyn io::AsyncWrite + Unpin + Send>;
-/// A boxed reader half handed to a handler.
-pub type BoxRead = Box<dyn io::AsyncRead + Unpin + Send>;
-
-/// What a service handler declares about its responder-side rate limit: whether it bounds what a caller may
-/// consume, or answers any caller with no bound.
-///
-/// A handler property, read from its constructor config at [`Handler::metering`] and rendered by a caller's
-/// readiness manifest. It is a CAVEAT a banner narrates, never a security gate: an open service whose handler
-/// is [`Unmetered`](Metering::Unmetered) lets an anonymous stranger drain the node's uplink, so the banner
-/// says so where the danger is. The default is [`Unmetered`](Metering::Unmetered) (the fail-loud direction: a
-/// handler that does not state a bound warns when opened), and a handler that enforces one overrides it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Metering {
-    /// The handler bounds what one caller (or all callers) may consume before it refuses, or cannot answer
-    /// with more than it receives (a symmetric reflector).
-    Metered,
-    /// The handler answers any caller with no responder-side bound, so an OPEN one is drainable.
-    Unmetered,
-}
-
-/// Why a handler stopped serving one admitted stream. Typed (`thiserror`), library vocabulary; a binary
-/// consumer maps it to `eyre` at its verb edge.
-#[derive(Debug, thiserror::Error)]
-pub enum ServeError {
-    /// The gate (or a proof's ceiling) refused the request. The typed [`bifrost::Refusal`] classification
-    /// travels unchanged, so a caller matches it instead of parsing text.
-    #[error(transparent)]
-    Refused(#[from] Refusal),
-    /// A rooted witness is required for this serving proof, but the gate admitted by an open policy.
-    /// Produced only by [`Served::into_rooted`], for an engine whose safety precondition is a verified peer.
-    #[error("this service requires a rooted admission")]
-    OpenAdmission,
-    /// The stream failed at the transport level.
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-}
-
-/// A service handler: what to DO with one admitted stream. The tunnel knows only this CONTRACT (a name maps
-/// to a thing that consumes an admitted stream), never what a handler does; a caller that depends on the
-/// service crates implements it. The handler receives a [`Served<Self>`](Served) proof by value: it carries
-/// the gate's single-use [`Admitted`] witness, so "authorize before serve" is a compile-time precondition,
-/// plus the stream halves for ONE stream.
-///
-/// Whether the handler may EVER face an unauthenticated stranger is a COMPILE-TIME property, stated once as
-/// the associated [`type Exposure`](Handler::Exposure): a keyless shell names
-/// [`Never`](crate::open_policy::Never) (an open gate over it is refused when the proof is prepared), a
-/// legitimately-public responder names [`OptIn`](crate::open_policy::OptIn). There is no default and no
-/// runtime bool: omitting the choice does not compile, and the marker is sealed + uninhabited, so "a keyless
-/// service mislabeled open" is unrepresentable rather than a guarded default (delib-37).
-///
-/// The `serve` future is `+ Send`: the exposer is `tokio::spawn`ed on a multi-thread runtime and holds the
-/// boxed serve future across `.await`, so it must be `Send` (delib-32 r2, compiler-forced). Authors may still
-/// write a plain `async fn serve` whose body is `Send`; on the pinned toolchain that coerces to the `+ Send`
-/// RPITIT bound at the impl site with no `trait_variant` needed. `where Self: Sized` is compiler-forced by
-/// [`Served<Self>`](Served).
-pub trait Handler: Send + Sync + 'static {
-    /// This handler's open-safety CEILING, stated as a type (no default, so the author MUST pick one of
-    /// [`Never`](crate::open_policy::Never) / [`OptIn`](crate::open_policy::OptIn)). Erased to a frozen
-    /// `const bool` at the [`ErasedHandler`] bridge, read once when the proof is prepared, to refuse an open
-    /// witness for a [`Never`](crate::open_policy::Never) handler.
-    type Exposure: PublicUse;
-
-    /// The responder-side rate limit this handler enforces, read from its constructor config so a banner
-    /// renders the running policy rather than a frozen flag. The default is [`Metering::Unmetered`]: a
-    /// handler that does not state a bound is narrated as unbounded when opened, the fail-loud direction.
-    /// Erased to [`ErasedHandler::metering`] and read when the exposer builds its readiness
-    /// [`manifest`](Exposer::manifest).
-    fn metering(&self) -> Metering {
-        Metering::Unmetered
-    }
-
-    /// Serve ONE admitted stream: the handler-bound [`Served<Self>`](Served) proof (carrying the gate's
-    /// single-use witness) and the stream halves.
-    fn serve(
-        &self,
-        served: Served<Self>,
-        writer: BoxWrite,
-        reader: BoxRead,
-    ) -> impl Future<Output = Result<(), ServeError>> + Send
-    where
-        Self: Sized;
-}
-
-/// The object-safe, stored-in-the-route view of a [`Handler`]: the associated `Exposure` marker is erased
-/// here to a `const bool` ([`open_safe`](ErasedHandler::open_safe)) and the RPITIT `serve` future is boxed
-/// ([`BoxFuture`], `Send`-bearing), so heterogeneous handlers (a [`Never`](crate::open_policy::Never) and an
-/// [`OptIn`](crate::open_policy::OptIn) handler) share ONE `Arc<dyn ErasedHandler>` storage type. The marker
-/// never enters these signatures, so it does its job at the impl-site type-check and then vanishes into the
-/// object's frozen `open_safe()` answer (delib-37: this is why the associated type, not a generic, survives
-/// erasure).
-///
-/// The bridge is split so the ceiling refusal lands BEFORE `Response::Ok`: [`prepare`](Self::prepare) is
-/// monomorphized on the concrete `H`, mints the handler-bound [`Served<H>`](Served) (refusing an open
-/// witness for a `Never` handler), and freezes the serve step into an opaque [`Prepared`] closure. Dispatch
-/// runs `prepare`, writes `Ok` only on `Ok`, then runs the prepared closure. The closure captures the typed
-/// proof, so no safe in-crate code can reach back through `Prepared` and re-pair the witness.
-trait ErasedHandler: Send + Sync {
-    /// The erased open-safety ceiling: `<H::Exposure as PublicUse>::OPEN_SAFE`, read before `Response::Ok`.
-    fn open_safe(&self) -> bool;
-    /// The erased responder-side metering: `Handler::metering`, read when the exposer builds its manifest.
-    fn metering(&self) -> Metering;
-    /// The pre-`Ok` half: mint the handler-bound proof and freeze the post-`Ok` serve into a [`Prepared`].
-    /// A refusal here is a payload-free [`Refusal`] the caller can write to the wire before any success.
-    fn prepare<'a>(&'a self, admitted: Admitted) -> Result<Prepared<'a>, Refusal>;
-}
-
-/// The frozen post-`Ok` serve step: the handler's typed proof and the erased serve future, captured in one
-/// opaque closure. Private fields, no accessor back to the [`Admitted`] witness, so safe code in this crate
-/// cannot re-pair the witness with another handler's serve (the laundering the closure form exists to close).
-type PreparedRun<'a> =
-    dyn FnOnce(BoxWrite, BoxRead) -> BoxFuture<'a, Result<(), ServeError>> + Send + 'a;
-
-pub(crate) struct Prepared<'a> {
-    serve: Box<PreparedRun<'a>>,
-}
-
-impl<'a> Prepared<'a> {
-    /// Run the frozen serve step for ONE stream, borrowing the handler for `'a`.
-    pub(crate) fn serve(
-        self,
-        writer: BoxWrite,
-        reader: BoxRead,
-    ) -> BoxFuture<'a, Result<(), ServeError>> {
-        (self.serve)(writer, reader)
-    }
-}
-
-impl<H: Handler> ErasedHandler for H {
-    fn open_safe(&self) -> bool {
-        <H::Exposure as PublicUse>::OPEN_SAFE
-    }
-
-    fn metering(&self) -> Metering {
-        Handler::metering(self)
-    }
-
-    fn prepare<'a>(&'a self, admitted: Admitted) -> Result<Prepared<'a>, Refusal> {
-        let served = Served::<H>::mint(admitted)?;
-        Ok(Prepared {
-            serve: Box::new(move |writer, reader| {
-                Box::pin(Handler::serve(self, served, writer, reader))
-            }),
-        })
-    }
-}
-
-/// A serving proof for the concrete handler `H`, carrying the gate's single-use [`Admitted`] witness.
-///
-/// Private fields, no public constructor, `!Clone`/`!Copy`: the only mint is the crate-private
-/// [`mint`](Served::mint), reached by the erased bridge's `prepare` (for the registered `H`) and by the
-/// bounded [`delegate`](Served::delegate) conversion. It binds the proof to the HANDLER TYPE (never to a
-/// service or a stream): the same handler under two names shares the type, and the proof still carries one
-/// per-stream witness.
-///
-/// The proof is minted only when the handler's ceiling allows the witness: an `OptIn` handler accepts an
-/// open witness, a `Never` handler requires a rooted one ([`Origin::Rooted`]). That refusal happens before
-/// `Response::Ok` because `prepare` is monomorphized on the concrete `H`.
-///
-/// A widening delegation is a compile error, not a runtime refusal: `delegate` requires
-/// `H::Exposure: Compatible<I::Exposure>`, and `OptIn` is not compatible with `Never`.
-///
-/// ```compile_fail
-/// use tightbeam::open_policy::{Never, OptIn};
-/// use tightbeam::tunnel::{Handler, Served};
-///
-/// struct Outer;
-/// struct Shell;
-///
-/// impl Handler for Outer {
-///     type Exposure = OptIn;
-///     async fn serve(
-///         &self,
-///         _served: Served<Self>,
-///         _writer: tightbeam::tunnel::BoxWrite,
-///         _reader: tightbeam::tunnel::BoxRead,
-///     ) -> Result<(), tightbeam::tunnel::ServeError> {
-///         Ok(())
-///     }
-/// }
-///
-/// impl Handler for Shell {
-///     type Exposure = Never;
-///     async fn serve(
-///         &self,
-///         _served: Served<Self>,
-///         _writer: tightbeam::tunnel::BoxWrite,
-///         _reader: tightbeam::tunnel::BoxRead,
-///     ) -> Result<(), tightbeam::tunnel::ServeError> {
-///         Ok(())
-///     }
-/// }
-///
-/// // An `OptIn` proof cannot be delegated into a `Never` inner: E0277 `OptIn: Compatible<Never>`.
-/// fn launder(served: Served<Outer>) {
-///     let _ = served.delegate::<Shell>();
-/// }
-/// ```
-///
-/// ```compile_fail
-/// use tightbeam::tunnel::Served;
-///
-/// // The proof has private fields: an external crate cannot construct one (E0603/E0451).
-/// fn forge<H: tightbeam::tunnel::Handler>() -> Served<H> {
-///     Served::mint(todo!()).unwrap()
-/// }
-/// ```
-#[must_use = "a Served proof is single-use; serve the one stream it was prepared for"]
-pub struct Served<H: Handler + ?Sized> {
-    admitted: Admitted,
-    /// `fn(&H)` keeps the auto traits independent of `H` while naming it; `?Sized` H needs an indirection,
-    /// and a function pointer is never called, only carried.
-    handler: PhantomData<fn(&H)>,
-}
-
-impl<H: Handler + ?Sized> Served<H> {
-    /// The only mint: crate-private, reached by the erased bridge's `prepare` (for the registered `H`) and
-    /// by [`delegate`](Served::delegate). Refuses an open witness for a `Never` handler, fail-closed.
-    fn mint(admitted: Admitted) -> Result<Self, Refusal> {
-        if !<H::Exposure as PublicUse>::OPEN_SAFE && !matches!(admitted.origin(), Origin::Rooted) {
-            return Err(Refusal::NotAdmitted);
-        }
-        Ok(Self {
-            admitted,
-            handler: PhantomData,
-        })
-    }
-
-    /// The verified identity the gate admitted: a fact the handler may read for per-caller policy.
-    pub fn peer(&self) -> VerifyKey {
-        self.admitted.peer()
-    }
-
-    /// By WHAT authority the gate admitted the peer (a whole-node member badge or a per-service slip).
-    pub fn kind(&self) -> Admission {
-        self.admitted.kind()
-    }
-
-    /// Whether the peer was admitted as a whole-node member. False on an open node.
-    pub fn is_member(&self) -> bool {
-        self.admitted.is_member()
-    }
-
-    /// How the gate minted the witness (rooted token ruling or an open admit).
-    pub fn origin(&self) -> Origin {
-        self.admitted.origin()
-    }
-
-    /// The one narrowing seam: hand the ROOTED witness to a proof-free engine. Fails with
-    /// [`ServeError::OpenAdmission`] when the gate admitted by an open policy, so an engine whose safety
-    /// precondition is a verified peer cannot be handed an open witness.
-    pub fn into_rooted(self) -> Result<RootedAdmitted, ServeError> {
-        if !matches!(self.admitted.origin(), Origin::Rooted) {
-            return Err(ServeError::OpenAdmission);
-        }
-        Ok(RootedAdmitted {
-            admitted: self.admitted,
-        })
-    }
-
-    /// Hand this proof inward to the inner handler `I`, preserving the witness and re-applying `I`'s
-    /// ceiling. The `Compatible` bound is the compile-time wall (an `OptIn` proof cannot name a `Never`
-    /// target); the re-mint is the fail-closed runtime backstop.
-    pub fn delegate<I>(self) -> Result<Served<I>, ServeError>
-    where
-        I: Handler,
-        H::Exposure: Compatible<I::Exposure>,
-    {
-        Served::<I>::mint(self.admitted).map_err(ServeError::from)
-    }
-}
-
-/// A gate witness narrowed to a ROOTED admission: the engine seam for a service whose safety precondition is
-/// that the gate verified a token (a keyless shell). Private field, no public constructor: the only mint is
-/// [`Served::into_rooted`], which consumes a handler-bound proof, so an engine that demands this type cannot
-/// be reached with an open witness.
-#[derive(Debug)]
-#[must_use = "a RootedAdmitted witness proves a rooted gate ruling; serve the one stream it authorized"]
-pub struct RootedAdmitted {
-    admitted: Admitted,
-}
-
-impl RootedAdmitted {
-    /// The verified identity the gate admitted.
-    pub fn peer(&self) -> VerifyKey {
-        self.admitted.peer()
-    }
-
-    /// By WHAT authority the gate admitted the peer.
-    pub fn kind(&self) -> Admission {
-        self.admitted.kind()
-    }
-
-    /// Whether the peer was admitted as a whole-node member.
-    pub fn is_member(&self) -> bool {
-        self.admitted.is_member()
-    }
-
-    /// Consume the rooted proof back into the gate witness it wraps: the transitional seam for an engine
-    /// that still takes the untyped [`Admitted`] (today's `sshh::serve`). No widening is possible: this
-    /// type is minted only by [`Served::into_rooted`], which refuses an open witness, so the witness
-    /// handed on is rooted by construction. Deleted when the engine takes `RootedAdmitted` directly.
-    pub fn into_admitted(self) -> Admitted {
-        self.admitted
-    }
 }
 
 /// Resolve the exposer's node BASE gate, in ONE place so every embedder applies the SAME policy: a family
@@ -2290,11 +1983,10 @@ mod tests {
 
     use super::{
         Access, AllEnabled, BoxRead, BoxWrite, Exposer, Handler, Metering, Posture, PublicRequest,
-        PublicServices, PublicUnsafeRequest, RAW_STREAM_OPEN_PERMITS, RawSource, RootedAdmitted,
-        Route, Router, Semaphore, ServeError, Served, ServiceCatalog, ServiceEntry, Services,
-        Target, TargetKind, resolve_single_service, serve_request,
+        PublicServices, PublicUnsafeRequest, RAW_STREAM_OPEN_PERMITS, RawSource, Route, Router,
+        Semaphore, ServeError, Served, ServiceCatalog, ServiceEntry, Services, Target, TargetKind,
+        resolve_single_service, serve_request,
     };
-    use crate::identity::AsVerifyKey as _;
     use crate::open_policy::{Never, OptIn};
     use crate::raw_stream::RawStream;
 
@@ -4438,142 +4130,6 @@ mod tests {
         assert!(
             !rendered.contains("refused: refused"),
             "the refusal render must never double the bare word: {rendered:?}"
-        );
-    }
-
-    /// Mint an [`Admitted`](nauthy::Admitted) witness through the only public mint (the gate), for the
-    /// proof tests below. `rooted` picks a rooted gate with a member badge vs an open gate.
-    fn witness(rooted: bool) -> nauthy::Admitted {
-        let peer = bifrost::NodeId::from_ed25519_secret(&[9u8; 32]);
-        let service = svc("locked");
-        if rooted {
-            let signet = nauthy::Identity::from_secret(&[7u8; 32]).expect("valid secret");
-            let badge = signet
-                .mint_member(
-                    peer.verify_key(),
-                    nauthy::Request::expires_in(core::time::Duration::from_secs(300)),
-                )
-                .expect("mint a member badge");
-            let gate = Gate::rooted(
-                signet.verifying_key(),
-                nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-witness-rooted")),
-            );
-            gate.admit_witnessed(
-                nauthy::ProvenPeer::from_handshake(peer.verify_key()),
-                Some(&badge),
-                &service,
-            )
-            .expect("a member badge admits")
-        } else {
-            Gate::Open
-                .admit_witnessed(
-                    nauthy::ProvenPeer::from_handshake(peer.verify_key()),
-                    None,
-                    &service,
-                )
-                .expect("an open gate admits anyone")
-        }
-    }
-
-    /// The exposure ceiling refuses PRE-`Ok`: an open witness cannot mint a `Never` handler's proof, so the
-    /// wire sees the uniform `Refused(NotAdmitted)` and never a success. The refusal is the same payload-free
-    /// class the gate gives a miss.
-    #[tokio::test]
-    async fn an_open_witness_is_refused_before_ok_for_a_never_handler() {
-        // Hand-build the serving context, bypassing the assembly interlock (which would refuse an open gate
-        // over a Never handler outright): this isolates the BRIDGE's prepare-time refusal on the serve path.
-        let serving = Arc::new(super::Serving {
-            gate: Gate::Open,
-            public: PublicServices::default(),
-            public_unsafe: PublicServices::default(),
-            services: Services(HashMap::new())
-                .with_handler("locked", GatedNoop)
-                .expect("`locked` binds"),
-            raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
-            enabled: Box::new(AllEnabled),
-        });
-        let (mut client, serve) = drive_open("locked", serving);
-        let (served, response) = tokio::join!(serve, crate::protocol::Response::read(&mut client));
-        served.expect("serve_request returns Ok after writing a refusal");
-        assert_eq!(
-            response.expect("the refusal frame reads"),
-            crate::protocol::Response::Refused(bifrost::Refusal::NotAdmitted),
-            "the ceiling refusal is the uniform payload-free class, written with no success"
-        );
-    }
-
-    /// The proof mint wall, in both directions: a rooted witness mints a `Never` handler's proof, an open
-    /// witness does not (fail-closed); an open witness still mints an `OptIn` handler's proof.
-    #[test]
-    fn a_rooted_witness_mints_a_never_proof_and_an_open_one_does_not() {
-        assert!(
-            Served::<GatedNoop>::mint(witness(true)).is_ok(),
-            "a rooted witness mints a Never handler's proof"
-        );
-        assert!(
-            Served::<GatedNoop>::mint(witness(false)).is_err(),
-            "an open witness cannot mint a Never handler's proof (fail-closed)"
-        );
-        assert!(
-            Served::<OpenNoop>::mint(witness(false)).is_ok(),
-            "an open witness mints an OptIn handler's proof"
-        );
-    }
-
-    /// Delegation preserves the witness and re-applies the target ceiling: a rooted `Never` proof delegates
-    /// both to another `Never` inner (reflexive) and to an `OptIn` inner (widening); an open `OptIn` proof
-    /// delegates only to an `OptIn` inner. The `OptIn -> Never` widening is a compile error, pinned by the
-    /// `Served` doc test.
-    #[test]
-    fn delegation_preserves_the_witness_and_the_ceiling() {
-        let rooted = Served::<GatedNoop>::mint(witness(true)).expect("rooted mints");
-        assert!(
-            rooted.delegate::<GatedNoop>().is_ok(),
-            "a rooted Never proof delegates to a Never inner (reflexive)"
-        );
-        let rooted = Served::<GatedNoop>::mint(witness(true)).expect("rooted mints");
-        assert!(
-            rooted.delegate::<OpenNoop>().is_ok(),
-            "a rooted Never proof delegates to an OptIn inner (widening)"
-        );
-        let open = Served::<OpenNoop>::mint(witness(false)).expect("open mints");
-        assert!(
-            open.delegate::<OpenNoop>().is_ok(),
-            "an open OptIn proof delegates to an OptIn inner"
-        );
-    }
-
-    /// The engine seam: `into_rooted` narrows a rooted proof to a [`RootedAdmitted`] and refuses an open one
-    /// with [`ServeError::OpenAdmission`], so a keyless engine that demands the token cannot be reached with
-    /// an open witness.
-    #[test]
-    fn into_rooted_narrows_a_rooted_proof_and_refuses_an_open_one() {
-        let rooted: RootedAdmitted = Served::<GatedNoop>::mint(witness(true))
-            .expect("rooted mints")
-            .into_rooted()
-            .expect("a rooted witness narrows");
-        assert_eq!(
-            rooted.peer(),
-            bifrost::NodeId::from_ed25519_secret(&[9u8; 32]).verify_key()
-        );
-        let open = Served::<OpenNoop>::mint(witness(false))
-            .expect("open mints")
-            .into_rooted();
-        assert!(
-            matches!(open, Err(ServeError::OpenAdmission)),
-            "an open witness cannot narrow to a rooted token"
-        );
-        // The transitional conversion hands the rooted witness on to an engine that still takes the
-        // untyped `Admitted` (today's `sshh::serve`); only a rooted proof can produce one.
-        let admitted = Served::<GatedNoop>::mint(witness(true))
-            .expect("rooted mints")
-            .into_rooted()
-            .expect("a rooted witness narrows")
-            .into_admitted();
-        assert_eq!(
-            admitted.peer(),
-            bifrost::NodeId::from_ed25519_secret(&[9u8; 32]).verify_key(),
-            "the transitional conversion preserves the admitted peer"
         );
     }
 
