@@ -16,9 +16,9 @@
 //! It uses bifrost's in-process transport so the two nodes talk without touching the network. One wrinkle
 //! that transport makes visible: over `MemTransport` the exposer's cap identity and its transport node id
 //! are DIFFERENT keys (mem hands out a synthetic id), so the connector dials the mem node id and presents
-//! the link with [`Connector::to_node`]. Over a real transport (iroh, quirk) the node binds UNDER the cap
-//! secret, so the two coincide and [`Connector::from_link`] both dials and presents from the link alone. The
-//! gate logic is identical either way.
+//! the link with [`PresentingConnector::to_node`]. Over a real transport (iroh, quirk) the node binds UNDER
+//! the cap secret, so the two coincide and [`PresentingConnector::from_link`] both dials and presents from
+//! the link alone. The gate logic is identical either way.
 
 use core::time::Duration;
 use std::path::PathBuf;
@@ -27,7 +27,7 @@ use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
 use nauthy::{FileDenylist, Identity, Link, Service};
 use tightbeam::identity::AsNodeId as _;
-use tightbeam::tunnel::{self, CancellationToken, Connector, Router};
+use tightbeam::tunnel::{self, CancellationToken, PresentingConnector, Router};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -98,14 +98,15 @@ async fn run() -> eyre::Result<()> {
 
     // 5. The consumer reaches the service and PRESENTS the link, binding it to a free local port so anything
     //    that connects to that port is tunnelled to the gated echo service on the other node. Over mem it
-    //    dials the node id and presents the link (`to_node`); over iroh a bare `Connector::from_link(&link,
-    //    ..)` would do both from the link alone (see the module docs).
+    //    dials the node id and presents the link (`to_node`); over iroh a bare `PresentingConnector::from_link(&link,
+    //    ..)` would do both from the link alone (see the module docs). The presenter requires a peer-proven
+    //    transport at compile time, so this example cannot be retargeted at an announced one by accident.
     let probe = TcpListener::bind("127.0.0.1:0").await?;
     let local_port = probe.local_addr()?.port();
     drop(probe);
     tokio::task::spawn_local(async move {
         if let Err(e) = async {
-            Connector::to_node(exposer_key, ssh, Some(link))
+            PresentingConnector::to_node(exposer_key, ssh, link)
                 .preflight(&consumer, local_port)
                 .await?
                 .run()

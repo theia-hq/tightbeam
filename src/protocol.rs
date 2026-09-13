@@ -1,9 +1,13 @@
 //! tightbeam's stream protocol: a small, versioned preamble on each bifrost stream that selects a
 //! service, optionally presents a capability, and reports whether it was reached, before the transparent
-//! byte pipe begins. Pure framing; the payload after it is raw bytes (the point of a tunnel).
+//! byte pipe begins. Pure framing; the payload after it is raw bytes (the point of a tunnel). The one
+//! guard on the write side is the checked writer: a credential frame is refused before any byte when the
+//! session's declared security does not prove the peer.
 
-use bifrost::{Refusal, RefusalDetail};
+use bifrost::{Refusal, RefusalDetail, SecurityProfile, Session};
 use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
+
+use crate::security::{TransportInsecure, peer_proven};
 
 /// Magic + version prefixing a request; a foreign or mismatched-version stream is rejected. `TB04` types
 /// the tag-1 response: a refusal code byte plus a bounded detail, replacing the free-form string. The
@@ -53,6 +57,35 @@ impl Request {
         write_opt(writer, self.membership.as_deref()).await
     }
 
+    /// Write the request, refusing a credential the session's declared security does not cover.
+    ///
+    /// The ONE checked writer every credential-bearing path goes through: a request that presents a
+    /// capability or a membership badge is written only when `S`'s declared profile proves the peer
+    /// ([`PeerProof::Proven`](bifrost::PeerProof::Proven) or
+    /// [`InProcess`](bifrost::PeerProof::InProcess)); otherwise nothing is written and the refusal names
+    /// the declared profile. A request that carries no credential is the plain [`write`](Self::write).
+    /// The profile is read from the session TYPE, never a caller-supplied value, so no caller can assert
+    /// a proof the session did not declare.
+    pub async fn write_checked<S, W>(&self, writer: &mut W) -> Result<(), RequestWriteError>
+    where
+        S: Session,
+        W: io::AsyncWrite + Unpin,
+    {
+        let security = <S::Security as SecurityProfile>::SECURITY;
+        if self.presents_credential() && !peer_proven(security) {
+            return Err(TransportInsecure {
+                declared: security.peer,
+            }
+            .into());
+        }
+        self.write(writer).await.map_err(Into::into)
+    }
+
+    /// Whether this request carries a credential: a capability link or a membership badge.
+    fn presents_credential(&self) -> bool {
+        self.capability.is_some() || self.membership.is_some()
+    }
+
     /// Read a request from the stream.
     pub async fn read<R: io::AsyncRead + Unpin>(reader: &mut R) -> io::Result<Self> {
         let mut magic = [0u8; 4];
@@ -66,6 +99,22 @@ impl Request {
             membership: read_opt(reader).await?,
         })
     }
+}
+
+/// Why a checked request write did not finish.
+///
+/// Either the frame itself failed (an I/O error, the plain [`write`](Request::write) failing), or the
+/// request was refused before any byte because it presents a credential over a transport that does not
+/// prove the peer ([`TransportInsecure`]).
+#[derive(Debug, thiserror::Error)]
+pub enum RequestWriteError {
+    /// The request presents a credential and the session's declared profile does not prove the peer.
+    /// Nothing was written.
+    #[error(transparent)]
+    Insecure(#[from] TransportInsecure),
+    /// The frame could not be written.
+    #[error("the request frame failed to write")]
+    Io(#[from] io::Error),
 }
 
 impl Response {
