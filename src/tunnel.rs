@@ -72,10 +72,13 @@ const MAX_STREAMS_PER_SESSION: usize = 256;
 const RAW_STREAM_OPEN_PERMITS: usize = 16;
 
 /// The maximum number of concurrent PUBLIC sessions (delib-49 G5): a session that has reached any opened
-/// service holds one permit until it closes. 32 keeps most of [`MAX_SESSIONS`] available to gated members,
-/// so a crowd of strangers cannot fill the shared session table and queue member dials behind it. The cap
-/// bounds occupation, not fairness: a dialer that keeps reconnecting can still hold all 32, which is the
-/// accepted loss (the public path is best-effort, never contracted).
+/// service holds one permit until it closes. This bounds what ADMITTED public dials can occupy: at most 32
+/// of [`MAX_SESSIONS`] sessions and [`PUBLIC_STREAM_PERMITS`] streams, so the public path cannot consume
+/// the whole table by itself. It reserves nothing: a session that never reaches an opened service (a gated
+/// or unknown request, or none) takes no permit, so a stranger can still hold the shared session table up
+/// to [`MAX_SESSIONS`] and make member dials queue at accept. That residual is the accepted loss, the same
+/// shape the round-3 re-spec accepted one layer up (a redialing occupier keeps the public semaphore full).
+/// The cap bounds occupation, not fairness: a dialer that keeps reconnecting can still hold all 32.
 const PUBLIC_SESSION_PERMITS: usize = 32;
 
 /// The maximum number of concurrent public streams (delib-49 G5), taken at the public-admit seam. Single
@@ -1615,13 +1618,12 @@ enum HostRefusal {
     /// The gate ruled: nauthy's typed cause.
     #[error(transparent)]
     Gate(nauthy::Refusal),
-    /// The public-path capacity (delib-49 G5) is reached: the node already serves its cap of public
-    /// sessions or concurrent public streams. The wire still gets the same payload-free
+    /// The public-path capacity (delib-49 G5) is reached: the node already serves its cap of ADMITTED
+    /// public sessions or concurrent public streams. The wire still gets the same payload-free
     /// `Refusal::NotAdmitted` a gate miss gives, so a saturation is indistinguishable from a refusal;
-    /// this cause is only the operator's log line.
-    #[error(
-        "public capacity reached ({cap}); refusing so gated members are not queued behind strangers"
-    )]
+    /// this cause is only the operator's log line. The shared session table is bounded separately by
+    /// [`MAX_SESSIONS`] and is outside this pool's claim.
+    #[error("public capacity reached ({cap}); refusing rather than queueing the admitted public dial")]
     PublicAtCapacity {
         /// Which pool is at its cap (`public sessions` / `public streams`).
         cap: &'static str,
