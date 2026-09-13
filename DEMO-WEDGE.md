@@ -63,5 +63,6 @@ impossible by construction. The crypto lives in the vetted `biscuit-auth` crate,
 
 ## Revocation
 
-Short expiry only, for v1. The `time()` check IS the revocation story; a link expires and stops working
-with no server to consult. A revocation-hint channel is a later design point, not built now.
+`tightbeam revoke <link>` records the link's id in this node's denylist, so the gate refuses it at once,
+for that link and everything attenuated from it. Short expiry backs that up, and the denylist is local and
+offline: no server to consult.

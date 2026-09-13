@@ -15,6 +15,7 @@ the output. The keyed connection underneath is [bifrost](https://github.com/thei
 pass a gate is [nauthy](https://github.com/theia-hq/nauthy)'s.
 
 > Experimental. Works for TCP over the iroh transport; not ready for production use.
+
 ## Add it as a dependency
 
 Git-only for now, not published to crates.io. Point at the repo:
@@ -25,8 +26,10 @@ tightbeam = { git = "https://github.com/theia-hq/tightbeam", tag = "v0.4.0" }
 ```
 
 A service crate that implements the contract without the rest of tightbeam can depend on
-`tightbeam-handler` directly (same repo, same tag): the `Handler` trait, the `Never`/`OptIn` markers, and
-the proofs, with no backends and no binary. `tightbeam` re-exports the same author-facing items.
+`tightbeam-handler` directly: the `Handler` trait, the `Never`/`OptIn` markers, and the proofs, with no
+backends and no binary. The crate is new since v0.4.0, so until the next release pin a git dependency on
+the repo (`tightbeam-handler = { git = "https://github.com/theia-hq/tightbeam" }`). `tightbeam`
+re-exports the same author-facing items at their original paths.
 
 You also depend on `bifrost` (to bind an overlay node) and `nauthy` (to build the gate and mint
 capabilities). Three runnable examples show the whole library, no network needed (`cargo run --example
@@ -43,19 +46,24 @@ capabilities). Three runnable examples show the whole library, no network needed
 
 A `Connector` reaches one exposed service on a peer and hands back a bidirectional stream. Build it from a
 node id (optionally presenting a capability token) or from a `sheer:` link that carries both the node to
-dial and the token.
+dial and the token. A dial that presents a credential has a compile-time-checked form,
+`PresentingConnector`: it requires the transport to prove the peer, so a credential over a transport that
+only announces the peer does not compile. The unbounded `Connector` carries the same rule at run time, for
+a transport chosen dynamically.
 
 ```rust
-use tightbeam::tunnel::Connector;
+use nauthy::Link;
+use tightbeam::tunnel::{Connector, PresentingConnector};
 
 // Reach `web` on a peer, bind it to local port 8080, forward every connection.
-let forward = Connector::to_node(peer_id, "web".into(), None)
+let forward = Connector::to_node(peer_id, "web".parse()?, None)
     .preflight(&node, 8080)   // proves the gate admits us before it returns
     .await?;
 forward.run().await?;
 
 // Or reach it via a capability link, which supplies the node and the token together.
-let forward = Connector::from_link("sheer:<node-id>.<token>", "web".into())?
+let link: Link = "sheer:<node-id>.<token>".parse()?;
+let forward = PresentingConnector::from_link(&link, "web".parse()?)
     .preflight(&node, 8080)
     .await?;
 ```
@@ -89,19 +97,24 @@ exposer.run(&node, CancellationToken::new()).await?;   // runs until cancelled; 
 
 `Router::new(gate)` is a fully-gated node: every route faces the family gate. Opening a legitimate service
 to strangers is a deliberate second step, `.public(names)` (a safe handler opened per service), which
-`.expose()` proves before the node serves it. A handler with no authorization of its own (a keyless shell)
-can never be opened this way, and a raw byte source (`file:`/`fifo:`/`stdin:`) is redirected to the
-distinct, louder `.public_unsafe(names)` opt-in. `.parse(&["web=127.0.0.1:8080".into()])` absorbs the
-`name=addr` grammar; a bare `<name>:` no longer resolves, since handlers bind by value. The
+`.expose()` proves before the node serves it. A handler that declares itself closed (`Never`: a keyless
+shell) is refused when the proof is prepared, and a raw byte source (`file:`/`fifo:`/`stdin:`) is
+redirected to the distinct, louder `.public_unsafe(names)` opt-in. `.parse(&["web=127.0.0.1:8080".into()])`
+absorbs the `name=addr` grammar; a bare `<name>:` no longer resolves, since handlers bind by value. The
 `CancellationToken` is the node's teardown handle: a caller may hold a clone and fire it to stop the accept
 loop.
+
+The exposer proves the transport as well: `Exposer::run` refuses to arm a rooted gate over a transport
+that does not prove the peer, and `Exposer::prove_security::<T>()` exposes the same check to a caller that
+announces readiness before `run`.
 
 ## Inject a named service
 
 tightbeam knows only the [`Handler`](src/tunnel.rs) contract, never what a handler does. A handler names its
 `Exposure` ceiling as a type (`Never` for a keyless shell, `OptIn` for a legitimately public responder),
 declares its `Metering` if it bounds callers, and serves one admitted stream from the `Served<Self>` proof
-the gate prepared for it.
+the gate prepared for it. The declaration is the author's: the marker prevents an omitted choice and a
+third variant, not a mislabeled one.
 
 ```rust
 use tightbeam::open_policy::Never;
@@ -112,8 +125,9 @@ struct Shell;
 impl Handler for Shell {
     // Whether this handler may EVER face a stranger is a compile-time property, stated once as a type. A
     // keyless shell is remote code execution, so it names `Never`: an open gate over it is refused when
-    // the proof is prepared. A legitimately public responder names `OptIn`. There is no default and no
-    // runtime flag, so "a keyless service mislabeled open" does not compile.
+    // the proof is prepared. A legitimately public responder names `OptIn`. The choice cannot be omitted
+    // and the marker set is sealed, so there is no default and no third marker; the declaration is the
+    // author's, and an `OptIn` service still takes a deliberate operator opt-in to reach a stranger.
     type Exposure = Never;
 
     async fn serve(
