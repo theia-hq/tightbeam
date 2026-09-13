@@ -11,7 +11,10 @@ use core::time::Duration;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use bifrost::{ConnInfo, Discovery, Node, NodeId, Refusal, RefusalDetail, Session, Transport};
+use bifrost::{
+    ConnInfo, Discovery, Node, NodeId, PeerProof, PeerProven, Refusal, RefusalDetail, Security,
+    SecurityProfile, Session, Transport,
+};
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
 use nauthy::{Admitted, Cap, FileDenylist, Gate, Link, ProvenPeer, Service};
@@ -34,6 +37,7 @@ use crate::enabled::{AllEnabled, EnabledServices};
 use crate::identity::{AsNodeId as _, AsVerifyKey as _};
 use crate::protocol::{Request, Response};
 use crate::raw_stream::RawStream;
+use crate::security::{peer_proven, proof_label};
 use crate::{pipe_stdio_bridge, splice, splice_halves};
 
 /// How long to wait for a `fifo:` WRITER before dropping the stream. The FIFO open itself is NONBLOCKING
@@ -1124,6 +1128,27 @@ impl Exposer {
         entries
     }
 
+    /// Refuse to arm this exposer over a transport that cannot prove the peer when its gate is rooted.
+    ///
+    /// The construction half of the transport-security rule: a rooted gate decides on a token BOUND to the
+    /// dialer's proven key, so a transport that does not prove the peer (an
+    /// [`Announced`](bifrost::Announced) profile) can never root-admit. A caller that announces readiness
+    /// (a banner, a bound socket) before [`run`](Self::run) should call this at the same point it proves
+    /// its routes, so the refusal precedes the announcement. [`run`](Self::run) calls it too, so the
+    /// invariant holds however the exposer is driven.
+    pub fn prove_security<T: Transport>(&self) -> eyre::Result<()> {
+        let security = <T::Security as SecurityProfile>::SECURITY;
+        if self.gate.wants_capability() && !peer_proven(security) {
+            eyre::bail!(
+                "this node gates on a signet, but the bound transport declares {} peer proof, so a gated \
+                 dial could never be admitted; bind a transport that proves the peer, or serve only \
+                 services you open to anyone",
+                proof_label(&security.peer)
+            );
+        }
+        Ok(())
+    }
+
     /// Accept overlay sessions from permitted peers and forward each inbound stream to its service. Runs
     /// until `cancel` fires, then stops accepting and returns gracefully; prints nothing (the caller printed
     /// its own readiness banner before calling).
@@ -1143,6 +1168,9 @@ impl Exposer {
         <T::Session as Session>::Write: Send + 'static,
         <T::Session as Session>::Read: Send + 'static,
     {
+        // Construction refusal, repeated at the arming point so it holds however the exposer is driven;
+        // a caller that announces readiness first should have called `prove_security` already.
+        self.prove_security::<T>()?;
         let Self {
             services,
             gate,
@@ -1213,13 +1241,39 @@ struct Serving {
     enabled: Box<dyn EnabledServices + Send + Sync>,
 }
 
+/// The peer a session attests: the `NodeId` the transport reports, with the security that transport
+/// declared for it.
+///
+/// The two travel together from [`serve_session`] (where both are read off the session) to admission
+/// (which rules on them), so a caller can never pair one session's key with another session's declared
+/// proof. A rooted gate may only act on this when `security` proves the key; the announced profile
+/// reports a key the peer chose, which is exactly why it cannot root-admit.
+#[derive(Clone, Copy)]
+struct SessionPeer {
+    node: NodeId,
+    security: Security,
+}
+
+impl core::fmt::Display for SessionPeer {
+    /// The peer's identity, for the per-stream log lines: the declared security is a transport-wide
+    /// fact, named in the admission refusal's own cause when it decides one.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.node)
+    }
+}
+
 /// Serve one accepted session: handle each inbound stream's service request under the gate.
 async fn serve_session<S: Session>(session: S, serving: Arc<Serving>) -> eyre::Result<()>
 where
     S::Write: Send + 'static,
     S::Read: Send + 'static,
 {
-    let peer = session.peer();
+    // Read the peer and its declared security ONCE off the session, and carry both to every stream's
+    // admission: a rooted gate may only rule on a peer the transport proves.
+    let peer = SessionPeer {
+        node: session.peer(),
+        security: <S::Security as SecurityProfile>::SECURITY,
+    };
     let mut pipes = FuturesUnordered::new();
     // Stop accepting new streams once `accept_bi` errors (the session is closing): drain the in-flight
     // pipes rather than reaping them with `?`, the same courtesy `connect` gives its local listener.
@@ -1258,7 +1312,7 @@ where
 /// capability) is a property of the stream: one session may carry several service requests, each gated on
 /// its own merits.
 async fn serve_request<W, R>(
-    peer: NodeId,
+    peer: SessionPeer,
     mut writer: W,
     mut reader: R,
     serving: Arc<Serving>,
@@ -1462,6 +1516,16 @@ enum HostRefusal {
     /// the wire still says only "not admitted".
     #[error("malformed capability")]
     MalformedCapability(#[source] nauthy::CapError),
+    /// The transport does not prove the peer, so a rooted gate cannot rule on the presented token: its
+    /// device binding would rest on a key the peer merely announced.
+    #[error(
+        "the transport does not prove the peer (declared: {}); a rooted gate cannot admit",
+        proof_label(.declared)
+    )]
+    PeerNotProven {
+        /// The peer-identity claim the session's transport declared.
+        declared: PeerProof,
+    },
     /// The gate ruled: nauthy's typed cause.
     #[error(transparent)]
     Gate(nauthy::Refusal),
@@ -1486,7 +1550,7 @@ fn admit(
     base: &Gate,
     public: &PublicServices,
     public_unsafe: &PublicServices,
-    peer: NodeId,
+    peer: SessionPeer,
     capability: Option<&str>,
     membership: Option<&str>,
     service: &Service,
@@ -1502,9 +1566,28 @@ fn admit(
     // the identical family path below.
     if public.contains(service.as_str()) || public_unsafe.contains(service.as_str()) {
         // An open service needs no badge, so the signet-bound membership slot is irrelevant on this path.
+        // The witness is `Origin::Open` with `Admission::Slip`: no token is ruled on and nothing about the
+        // peer is proven, so the `ProvenPeer` minted here carries no authority. That is what lets an
+        // announced transport keep serving a service the operator opened to anyone, while every gated
+        // route (below) refuses.
         return Gate::Open
-            .admit_witnessed(ProvenPeer::from_handshake(peer.verify_key()), None, service)
+            .admit_witnessed(
+                ProvenPeer::from_handshake(peer.node.verify_key()),
+                None,
+                service,
+            )
             .map_err(HostRefusal::from);
+    }
+    // A rooted gate rules on a token BOUND to the dialer's proven key, so it may only run when the
+    // transport's declared profile proves the peer: over an announced session a harvested badge is
+    // replayable and the binding would vouch for the impersonator. Refuse before minting a `ProvenPeer`
+    // or parsing the token. The wire gets the same uniform `NotAdmitted` a gate miss gives; only the
+    // node's own log names the declared profile. A genuinely open service was already admitted above,
+    // so public traffic over an announced transport is untouched.
+    if base.wants_capability() && !peer_proven(peer.security) {
+        return Err(HostRefusal::PeerNotProven {
+            declared: peer.security.peer,
+        });
     }
     // A MISS is EITHER a gated-present name OR a name the node does not serve at all: both take this
     // identical family path (the same cap parse, the same two ed25519 verifies, the same refusal), so a
@@ -1533,7 +1616,7 @@ fn admit(
     // Mint the transport-proven peer at admission: the `peer` NodeId reached here only via a
     // completed bifrost handshake (`serve_session` reads it from `Session::peer`), which proves the dialer
     // holds the secret behind it, exactly the precondition `ProvenPeer::from_handshake` marks.
-    let peer = ProvenPeer::from_handshake(peer.verify_key());
+    let peer = ProvenPeer::from_handshake(peer.node.verify_key());
     // Route the two-cap authority-bound path (a foreign slip AND the membership badge that vouches for the
     // dialer under the slip's foreign authority) through `admit_foreign_witnessed`; every other shape (a
     // membership badge, a plain/bearer/device slip, or no token) is the single-cap path. A `membership` is
@@ -1783,7 +1866,9 @@ impl Connector {
         // (the host tears its serving half down); every later per-connection stream presents the same
         // request to the same gate, so this one admission faithfully predicts theirs.
         let (mut writer, mut reader) = session.open_bi().await?;
-        request.write(&mut writer).await?;
+        // The checked writer: a request presenting a credential refuses here, before any byte, when the
+        // session's declared profile does not prove the peer.
+        request.write_checked::<T::Session, _>(&mut writer).await?;
         if let Response::Refused(refusal) = Response::read(&mut reader).await? {
             return Err(DialRefused {
                 dial: self.dial,
@@ -1809,7 +1894,7 @@ impl Connector {
     ) -> eyre::Result<()> {
         let session = node.connect(self.dial).await?;
         let (writer, reader) = session.open_bi().await?;
-        request_stdio(self.request(), writer, reader).await
+        request_stdio::<T::Session, _, _>(self.request(), writer, reader).await
     }
 
     /// Reach the peer and return a [`ServiceSession`]: a [`Session`] whose every `open_bi` first speaks
@@ -1827,6 +1912,125 @@ impl Connector {
             session,
             request: self.request(),
         })
+    }
+}
+
+/// A dial that presents a credential, in its compile-time-checked form.
+///
+/// Constructed with the credential it always presents: a [`Link`] in slot 1
+/// ([`to_node`](Self::to_node) or [`from_link`](Self::from_link)), optionally with a membership badge
+/// in slot 2 ([`with_membership`](Self::with_membership)). Every dial method requires the transport's
+/// declared profile to prove the peer (`T::Security: PeerProven`), so a credential over a
+/// self-announced transport is a compile error, never a runtime hope. The unbounded [`Connector`]
+/// carries the same rule at run time, for a transport chosen dynamically.
+///
+/// The announced profile is rejected where a proven peer is required:
+///
+/// ```compile_fail,E0277
+/// # use bifrost::{Addr, Announced, Error, Node, NodeId, NoDiscovery, Session, Transport};
+/// # use nauthy::{Link, Service};
+/// # use tightbeam::tunnel::PresentingConnector;
+/// #
+/// # struct AnnouncedTransport;
+/// # struct AnnouncedSession;
+/// #
+/// # impl Transport for AnnouncedTransport {
+/// #     type Security = Announced;
+/// #     type Session = AnnouncedSession;
+/// #     fn node_id(&self) -> NodeId { unimplemented!() }
+/// #     fn local_addr(&self) -> Addr { unimplemented!() }
+/// #     async fn connect(&self, _: Addr) -> Result<Self::Session, Error> { unimplemented!() }
+/// #     async fn accept(&self) -> Result<Self::Session, Error> { unimplemented!() }
+/// #     async fn close(&self) {}
+/// # }
+/// #
+/// # impl Session for AnnouncedSession {
+/// #     type Security = Announced;
+/// #     type Write = Vec<u8>;
+/// #     type Read = &'static [u8];
+/// #     fn peer(&self) -> NodeId { unimplemented!() }
+/// #     async fn open_bi(&self) -> Result<(Self::Write, Self::Read), Error> { unimplemented!() }
+/// #     async fn accept_bi(&self) -> Result<(Self::Write, Self::Read), Error> { unimplemented!() }
+/// #     async fn wait_closed(&self) {}
+/// # }
+/// #
+/// # fn dial(node: &Node<AnnouncedTransport, NoDiscovery>, link: &Link, service: Service) {
+/// // `Announced` does not implement `PeerProven`, so this does not compile:
+/// let _ = PresentingConnector::from_link(link, service).preflight(node, 0);
+/// # }
+/// ```
+pub struct PresentingConnector {
+    /// The credential-bearing dial this type vouches for; its slots are fixed at construction, so the
+    /// type cannot exist without a credential.
+    connector: Connector,
+}
+
+impl PresentingConnector {
+    /// Dial a raw node id, presenting `present` (slot 1). The compile-time twin of
+    /// [`Connector::to_node`] with a `Link` in `present`.
+    pub fn to_node(dial: NodeId, service: Service, present: Link) -> Self {
+        Self {
+            connector: Connector::to_node(dial, service, Some(present)),
+        }
+    }
+
+    /// Dial the node a `sheer:` link names, presenting the link (slot 1). The compile-time twin of
+    /// [`Connector::from_link`].
+    pub fn from_link(link: &Link, service: Service) -> Self {
+        Self {
+            connector: Connector::from_link(link, service),
+        }
+    }
+
+    /// Also present `badge` in slot 2 (the signet-bound AND); see
+    /// [`Connector::with_membership`].
+    #[must_use]
+    pub fn with_membership(mut self, badge: Link) -> Self {
+        self.connector = self.connector.with_membership(badge);
+        self
+    }
+
+    /// The node this connector dials.
+    pub fn dial(&self) -> NodeId {
+        self.connector.dial()
+    }
+
+    /// The service this connector requests.
+    pub fn service(&self) -> &Service {
+        self.connector.service()
+    }
+
+    /// Reach the peer, confirm the gate admits this connector, and bind the local port; see
+    /// [`Connector::preflight`].
+    pub async fn preflight<T: Transport, D: Discovery>(
+        self,
+        node: &Node<T, D>,
+        port: u16,
+    ) -> eyre::Result<PortForward<T::Session>>
+    where
+        T::Security: PeerProven,
+    {
+        self.connector.preflight(node, port).await
+    }
+
+    /// Reach the service over one stream and pipe it against this process's stdin/stdout; see
+    /// [`Connector::pipe_stdio`].
+    pub async fn pipe_stdio<T: Transport, D: Discovery>(self, node: &Node<T, D>) -> eyre::Result<()>
+    where
+        T::Security: PeerProven,
+    {
+        self.connector.pipe_stdio(node).await
+    }
+
+    /// Reach the peer and return a [`ServiceSession`]; see [`Connector::open_service`].
+    pub async fn open_service<T: Transport, D: Discovery>(
+        self,
+        node: &Node<T, D>,
+    ) -> eyre::Result<ServiceSession<T::Session>>
+    where
+        T::Security: PeerProven,
+    {
+        self.connector.open_service(node).await
     }
 }
 
@@ -1862,7 +2066,7 @@ impl<S: Session> PortForward<S> {
                             continue;
                         }
                     };
-                    pipes.push(request_service(self.request.clone(), tcp, writer, reader));
+                    pipes.push(request_service::<S, _, _>(self.request.clone(), tcp, writer, reader));
                 }
                 Some(result) = pipes.next(), if !pipes.is_empty() => {
                     if let Err(error) = result {
@@ -1893,6 +2097,9 @@ pub struct ServiceSession<S> {
 }
 
 impl<S: Session> Session for ServiceSession<S> {
+    // The wrapper carries the wrapped transport's declaration, so the security fact survives the
+    // wrapping: a caller holding a `ServiceSession` still knows what proved the peer.
+    type Security = S::Security;
     type Write = S::Write;
     type Read = S::Read;
 
@@ -1902,8 +2109,10 @@ impl<S: Session> Session for ServiceSession<S> {
 
     async fn open_bi(&self) -> Result<(Self::Write, Self::Read), bifrost::Error> {
         let (mut writer, mut reader) = self.session.open_bi().await?;
+        // The checked writer refuses a credential over a session whose declared profile does not prove
+        // the peer, before the request's first byte; the inner profile is the transport's own.
         self.request
-            .write(&mut writer)
+            .write_checked::<S, _>(&mut writer)
             .await
             .map_err(|error| bifrost::Error::Stream(Box::new(error)))?;
         match Response::read(&mut reader)
@@ -1935,17 +2144,21 @@ impl<S: Session> Session for ServiceSession<S> {
 }
 
 /// Open a stream to a service: send the request, and if the host accepts, pipe the connection.
-async fn request_service<W, R>(
+///
+/// Generic over the session so the checked writer can read the session's declared security profile; the
+/// caller names it, since the profile travels in the type and not in the stream halves.
+async fn request_service<S, W, R>(
     request: Request,
     tcp: TcpStream,
     mut writer: W,
     mut reader: R,
 ) -> eyre::Result<()>
 where
+    S: Session,
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
-    request.write(&mut writer).await?;
+    request.write_checked::<S, _>(&mut writer).await?;
     match Response::read(&mut reader).await? {
         Response::Ok => splice(tcp, writer, reader).await?,
         Response::Refused(refusal) => return Err(bifrost::Error::Refused(refusal).into()),
@@ -1958,12 +2171,13 @@ where
 /// [`request_service`], but the local ends are the process's own std streams, and the pump
 /// ([`pipe_stdio_bridge`]) returns when the PEER closes rather than waiting on a stdin that (at a terminal)
 /// never EOFs, so a reached command exits when the command does.
-async fn request_stdio<W, R>(request: Request, mut writer: W, mut reader: R) -> eyre::Result<()>
+async fn request_stdio<S, W, R>(request: Request, mut writer: W, mut reader: R) -> eyre::Result<()>
 where
+    S: Session,
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
-    request.write(&mut writer).await?;
+    request.write_checked::<S, _>(&mut writer).await?;
     match Response::read(&mut reader).await? {
         Response::Ok => pipe_stdio_bridge(writer, reader).await?,
         Response::Refused(refusal) => return Err(bifrost::Error::Refused(refusal).into()),
@@ -1976,7 +2190,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use bifrost::{NoDiscovery, Node};
+    use bifrost::{Announced, ChannelProtection, NoDiscovery, Node, NodeId, PeerProof, Session};
     use bifrost_mem::MemTransport;
     use nauthy::{Gate, Service};
     use tokio::io::AsyncReadExt as _;
@@ -1984,8 +2198,8 @@ mod tests {
     use super::{
         Access, AllEnabled, BoxRead, BoxWrite, Exposer, Handler, Metering, Posture, PublicRequest,
         PublicServices, PublicUnsafeRequest, RAW_STREAM_OPEN_PERMITS, RawSource, Route, Router,
-        Semaphore, ServeError, Served, ServiceCatalog, ServiceEntry, Services, Target, TargetKind,
-        resolve_single_service, serve_request,
+        Security, Semaphore, ServeError, Served, ServiceCatalog, ServiceEntry, Services,
+        SessionPeer, Target, TargetKind, resolve_single_service, serve_request,
     };
     use crate::open_policy::{Never, OptIn};
     use crate::raw_stream::RawStream;
@@ -3138,6 +3352,13 @@ mod tests {
         })
     }
 
+    /// The declared security the admission-core tests present by default: proven and sealed, what a real
+    /// handshake-backed transport declares. The announced-refusal test passes its own.
+    const PROVEN: Security = Security {
+        peer: PeerProof::Proven,
+        channel: ChannelProtection::Aead,
+    };
+
     /// Drive one `serve_request` for `service` against the shared `serving` context, and return the client's
     /// stream end plus the serving future. The serving future is returned UN-awaited so a caller can let it
     /// park (a never-written FIFO) or poll it for the refusal, and the returned reader carries the host's
@@ -3154,7 +3375,10 @@ mod tests {
         let (client_read, mut client_write) = tokio::io::split(client);
         let service = service.to_owned();
         // The peer id is only for the host's log line here; any valid NodeId does.
-        let peer = bifrost::NodeId::from_ed25519_secret(&[9u8; 32]);
+        let peer = SessionPeer {
+            node: bifrost::NodeId::from_ed25519_secret(&[9u8; 32]),
+            security: PROVEN,
+        };
         let serve = async move {
             crate::protocol::Request {
                 service: service.clone(),
@@ -3681,7 +3905,10 @@ mod tests {
             &gate,
             &public,
             &public_unsafe,
-            stranger,
+            SessionPeer {
+                node: stranger,
+                security: PROVEN,
+            },
             None,
             None,
             &svc("speed"),
@@ -3698,7 +3925,10 @@ mod tests {
             &gate,
             &public,
             &public_unsafe,
-            stranger,
+            SessionPeer {
+                node: stranger,
+                security: PROVEN,
+            },
             None,
             None,
             &svc("logs"),
@@ -3716,7 +3946,10 @@ mod tests {
                 &gate,
                 &public,
                 &public_unsafe,
-                stranger,
+                SessionPeer {
+                    node: stranger,
+                    security: PROVEN,
+                },
                 None,
                 None,
                 &svc("control.stop")
@@ -3729,7 +3962,10 @@ mod tests {
                 &gate,
                 &public,
                 &public_unsafe,
-                stranger,
+                SessionPeer {
+                    node: stranger,
+                    security: PROVEN,
+                },
                 None,
                 None,
                 &svc("nope")
@@ -3763,7 +3999,10 @@ mod tests {
             &gate,
             &public,
             &super::PublicServices::default(),
-            peer,
+            SessionPeer {
+                node: peer,
+                security: PROVEN,
+            },
             Some(badge.as_str()),
             Some("not a sheer link"),
             &svc("web"),
@@ -3772,6 +4011,171 @@ mod tests {
         assert!(
             admitted.is_member(),
             "a whole-node member badge admits as Member regardless of slot 2"
+        );
+    }
+
+    /// The peer-proof predicate at the admission seam: an announced session cannot root-admit, even
+    /// with a genuine member badge bound to the announced key. The badge verifies (it is the signet's
+    /// own signature); that is exactly the replay an announced transport enables, so the predicate
+    /// refuses before the ruling and the node's own log names the declared profile.
+    #[test]
+    fn an_announced_session_cannot_root_admit_a_valid_badge() {
+        use crate::identity::AsVerifyKey as _;
+
+        let announced = Security {
+            peer: PeerProof::Announced,
+            channel: ChannelProtection::Plain,
+        };
+        let signet = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
+        let gate = family_gate("announced");
+        let peer = bifrost::NodeId::from_ed25519_secret(&[5u8; 32]);
+        let badge = signet
+            .mint_member(
+                peer.verify_key(),
+                nauthy::Request::expires_in(core::time::Duration::from_secs(3600)),
+            )
+            .expect("mint member badge")
+            .link()
+            .expect("link");
+
+        // The same badge over a proven session IS admitted (the control): the refusal below is the
+        // profile, not the token.
+        assert!(
+            super::admit(
+                &gate,
+                &super::PublicServices::default(),
+                &super::PublicServices::default(),
+                SessionPeer {
+                    node: peer,
+                    security: PROVEN,
+                },
+                Some(badge.as_str()),
+                None,
+                &svc("web"),
+            )
+            .is_ok(),
+            "a valid member badge is admitted over a proven session"
+        );
+        let refused = super::admit(
+            &gate,
+            &super::PublicServices::default(),
+            &super::PublicServices::default(),
+            SessionPeer {
+                node: peer,
+                security: announced,
+            },
+            Some(badge.as_str()),
+            None,
+            &svc("web"),
+        )
+        .expect_err("an announced session cannot root-admit, even with a valid badge");
+        assert!(
+            matches!(
+                refused,
+                super::HostRefusal::PeerNotProven {
+                    declared: PeerProof::Announced
+                }
+            ),
+            "the local cause names the declared profile: {refused:?}"
+        );
+    }
+
+    /// An announced session that hands `serve_session` one pre-built stream: the session-level fixture
+    /// for the admission predicate, so the test drives the production path that reads the profile off
+    /// the session type, not the predicate in isolation.
+    struct AnnouncedSession {
+        peer: NodeId,
+        stream: tokio::sync::Mutex<
+            Option<(
+                tokio::io::WriteHalf<tokio::io::DuplexStream>,
+                tokio::io::ReadHalf<tokio::io::DuplexStream>,
+            )>,
+        >,
+    }
+
+    impl Session for AnnouncedSession {
+        type Security = Announced;
+        type Write = tokio::io::WriteHalf<tokio::io::DuplexStream>;
+        type Read = tokio::io::ReadHalf<tokio::io::DuplexStream>;
+
+        fn peer(&self) -> NodeId {
+            self.peer
+        }
+
+        async fn open_bi(&self) -> Result<(Self::Write, Self::Read), bifrost::Error> {
+            Err(bifrost::Error::Closed)
+        }
+
+        async fn accept_bi(&self) -> Result<(Self::Write, Self::Read), bifrost::Error> {
+            self.stream
+                .lock()
+                .await
+                .take()
+                .ok_or(bifrost::Error::Closed)
+        }
+
+        async fn wait_closed(&self) {}
+    }
+
+    /// The admission seam refuses an announced session even when the presented badge is genuine and
+    /// bound to the announced key: `serve_session` reads the session's declared profile, the predicate
+    /// refuses before any `ProvenPeer` is minted, and the wire gets the uniform `NotAdmitted` a gate
+    /// miss gives. The client writes the request with the RAW `Request::write` on purpose (a hostile or
+    /// legacy client bypasses the checked writer).
+    #[tokio::test]
+    async fn an_announced_session_is_refused_at_admission_with_the_uniform_answer() {
+        use crate::identity::AsVerifyKey as _;
+        use crate::protocol::{Request, Response};
+
+        let signet = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
+        let peer = bifrost::NodeId::from_ed25519_secret(&[5u8; 32]);
+        let badge = signet
+            .mint_member(
+                peer.verify_key(),
+                nauthy::Request::expires_in(core::time::Duration::from_secs(3600)),
+            )
+            .expect("mint member badge")
+            .link()
+            .expect("link");
+        let serving = std::sync::Arc::new(super::Serving {
+            gate: family_gate("announced-seam"),
+            public: PublicServices::default(),
+            public_unsafe: PublicServices::default(),
+            services: services(&["web=127.0.0.1:80"]),
+            raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
+            enabled: Box::new(AllEnabled),
+        });
+
+        let (client, server) = tokio::io::duplex(1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let session = AnnouncedSession {
+            peer,
+            stream: tokio::sync::Mutex::new(Some((server_write, server_read))),
+        };
+
+        let serve = super::serve_session(session, std::sync::Arc::clone(&serving));
+        let (response, served) = tokio::join!(
+            async {
+                Request {
+                    service: "web".to_owned(),
+                    capability: Some(badge.to_string()),
+                    membership: None,
+                }
+                .write(&mut client_write)
+                .await
+                .expect("write request");
+                Response::read(&mut client_read)
+                    .await
+                    .expect("read response")
+            },
+            serve
+        );
+        served.expect("the session drains after the refused stream");
+        assert_eq!(
+            response,
+            Response::Refused(bifrost::Refusal::NotAdmitted),
+            "an announced session gets the same payload-free refusal a gate miss gives"
         );
     }
 
