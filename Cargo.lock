@@ -3698,11 +3698,22 @@ dependencies = [
  "nauthy",
  "rand 0.8.8",
  "thiserror 2.0.20",
+ "tightbeam-handler",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
  "zeroize",
+]
+
+[[package]]
+name = "tightbeam-handler"
+version = "0.4.0"
+dependencies = [
+ "bifrost-core",
+ "nauthy",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
