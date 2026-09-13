@@ -8,7 +8,7 @@
 //! own policy needs a finer floor.
 //!
 //! Whether a handler may EVER face an unauthenticated stranger is a compile-time property, stated once as
-//! [`Handler::Exposure`](Handler::Exposure): [`Never`](open_policy::Never) for a service with no legitimate
+//! [`Handler::Exposure`]: [`Never`](open_policy::Never) for a service with no legitimate
 //! public use (a keyless shell), [`OptIn`](open_policy::OptIn) for one the operator may deliberately open.
 //! The markers are sealed and uninhabited, so the choice cannot be omitted, defaulted, or named by a third
 //! variant. [`Compatible`](open_policy::Compatible) is the one-way relation a proof conversion is bounded

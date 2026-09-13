@@ -15,8 +15,26 @@ so nothing user-facing is lost.
   the `Handler` trait, the `Never`/`OptIn` exposure markers, the serving proofs, and the erased dispatcher
   bridge. A service crate can depend on it directly, without tightbeam's backends or binary; tightbeam
   re-exports the same author-facing items at their original paths.
+- **`PresentingConnector`.** The credential-bearing dial in compile-time-checked form: every dial method
+  requires the transport's declared profile to prove the peer (`T::Security: PeerProven`), so presenting a
+  capability over a self-announced transport does not compile. The unbounded `Connector` carries the same
+  rule at run time.
+- **Member-only routes.** `Router::member_service` binds a route reachable only by a peer the gate admitted
+  as a whole-node member. The floor is checked once after admit and before any `Response::Ok`, and a miss
+  takes the same uniform refusal as a gate miss.
 
 ### Changed
+- **A credential moves only over a transport that proves the peer.** A request that presents a capability
+  or a membership badge is refused before its first byte when the session's declared profile does not prove
+  the peer; a rooted admission refuses such a session before minting a witness; and a rooted exposer
+  refuses to arm over one (`Exposer::prove_security`), so a gated node never serves over a transport that
+  only announces the peer. The default iroh transport is unaffected.
+- **The typed `Link` and `Service` surface.** The public API carries `Service` and typed `Link` values and
+  converts to raw text only at the request edge. The raw-string mint, narrow, and revoke free functions are
+  gone in favor of `nauthy::Link` methods, and `EnabledServices` keys on `Service`.
+- **`TB04`: the refusal crosses the wire typed.** A response is reached or refused, and a refusal is a
+  class plus a bounded detail instead of a free-form string, so a client matches the class rather than
+  parsing text. A `TB03` peer is not wire compatible: the two ends of one tunnel are one release.
 - **`type Exposure` replaces `type Public`.** A handler's open-safety ceiling is now named `Exposure`, the
   legitimacy ceiling ("may this ever face a stranger"), not `Public` ("is it public"). The marker values
   and the compile-time refusal are unchanged.
