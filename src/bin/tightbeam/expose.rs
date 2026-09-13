@@ -103,6 +103,11 @@ impl ExposeCmd {
         };
         let names: Vec<String> = router.names().map(str::to_owned).collect();
         let exposer = router.expose()?;
+        // Prove the transport can carry this gate BEFORE any ready output, mirroring swoosh's serve: a
+        // rooted gate over a transport that does not prove the peer refuses here, never after a banner
+        // the node cannot honor. The library's `run` re-checks, so the invariant holds however the
+        // exposer is driven.
+        exposer.prove_security::<T>()?;
         if !self.quiet {
             expose_banner(
                 node.node_id(),

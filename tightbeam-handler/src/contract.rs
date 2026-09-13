@@ -107,7 +107,7 @@ pub trait Handler: Send + Sync + 'static {
 /// open witness, a `Never` handler requires a rooted one ([`Origin::Rooted`](nauthy::Origin::Rooted)). That
 /// refusal happens before any success response because preparation is monomorphized on the concrete `H`.
 ///
-/// A widening delegation is a compile error, not a runtime refusal: `delegate` requires
+/// A laundering delegation is a compile error, not a runtime refusal: `delegate` requires
 /// `H::Exposure: Compatible<I::Exposure>`, and `OptIn` is not compatible with `Never`.
 ///
 /// ```compile_fail
@@ -176,7 +176,9 @@ impl<H: Handler + ?Sized> Served<H> {
         })
     }
 
-    /// The verified identity the gate admitted: a fact the handler may read for per-caller policy.
+    /// The identity the gate admitted: verified on a rooted route ([`origin`](Self::origin) is
+    /// [`Origin::Rooted`]), the key the peer announced on an open route ([`Origin::Open`]). A per-caller
+    /// policy that needs proof checks the origin first.
     pub fn peer(&self) -> VerifyKey {
         self.admitted.peer()
     }
@@ -247,7 +249,7 @@ impl RootedAdmitted {
     }
 
     /// Consume the rooted proof back into the gate witness it wraps: the transitional seam for an engine
-    /// that still takes the untyped [`Admitted`]. No widening is possible: this type is minted only by
+    /// that still takes the untyped [`Admitted`]. No authority is added: this type is minted only by
     /// [`Served::into_rooted`], which refuses an open witness, so the witness handed on is rooted by
     /// construction. Deleted when the engine takes `RootedAdmitted` directly.
     pub fn into_admitted(self) -> Admitted {

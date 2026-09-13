@@ -12,15 +12,16 @@
 //! public use (a keyless shell), [`OptIn`](open_policy::OptIn) for one the operator may deliberately open.
 //! The markers are sealed and uninhabited, so the choice cannot be omitted, defaulted, or named by a third
 //! variant. [`Compatible`](open_policy::Compatible) is the one-way relation a proof conversion is bounded
-//! by: a proof may narrow into a compatible inner handler, never widen.
+//! by: a proof may widen into a compatible inner handler (`Never` into `OptIn`), never launder into an
+//! incompatible one.
 //!
 //! This crate is deliberately lean: [`nauthy`] for the witness, `bifrost-core` for the typed refusal, and
-//! the stream-trait halves. It names no transport backend, no gate policy, and no dispatcher; [`tightbeam`]
-//! depends on it and re-exports every public item at its original path, so a service crate implements the
-//! contract without taking tightbeam's own non-optional backends and CLI tree.
+//! the stream-trait halves. It names no transport backend, no gate policy, and no dispatcher; `tightbeam`
+//! depends on it and re-exports every author-facing item at its original path, so a service crate
+//! implements the contract without taking tightbeam's own non-optional backends and CLI tree.
 //!
 //! The erased bridge in [`bridge`] is the dispatcher's view (heterogeneous storage plus the pre-`Ok`
-//! preparation split); a service author never names it.
+//! preparation split); a service author never names it, and it is not part of the re-exported set.
 
 pub mod bridge;
 mod contract;

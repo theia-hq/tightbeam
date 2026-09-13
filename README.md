@@ -24,6 +24,10 @@ Git-only for now, not published to crates.io. Point at the repo:
 tightbeam = { git = "https://github.com/theia-hq/tightbeam", tag = "v0.4.0" }
 ```
 
+A service crate that implements the contract without the rest of tightbeam can depend on
+`tightbeam-handler` directly (same repo, same tag): the `Handler` trait, the `Never`/`OptIn` markers, and
+the proofs, with no backends and no binary. `tightbeam` re-exports the same author-facing items.
+
 You also depend on `bifrost` (to bind an overlay node) and `nauthy` (to build the gate and mint
 capabilities). Three runnable examples show the whole library, no network needed (`cargo run --example
 <name>`):

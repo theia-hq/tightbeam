@@ -11,6 +11,15 @@ so nothing user-facing is lost.
   lets a consumer disable a served service live: the gate refuses a disabled service with the same uniform
   refusal a gate miss gives, fail-closed (a read error keeps the last-known set), restored on re-enable with
   no restart.
+- **The `tightbeam-handler` crate.** The handler contract now lives in its own lean crate in this repo:
+  the `Handler` trait, the `Never`/`OptIn` exposure markers, the serving proofs, and the erased dispatcher
+  bridge. A service crate can depend on it directly, without tightbeam's backends or binary; tightbeam
+  re-exports the same author-facing items at their original paths.
+
+### Changed
+- **`type Exposure` replaces `type Public`.** A handler's open-safety ceiling is now named `Exposure`, the
+  legitimacy ceiling ("may this ever face a stranger"), not `Public` ("is it public"). The marker values
+  and the compile-time refusal are unchanged.
 
 ## v0.4.0 - 2026-09-05
 

@@ -1132,17 +1132,19 @@ impl Exposer {
     ///
     /// The construction half of the transport-security rule: a rooted gate decides on a token BOUND to the
     /// dialer's proven key, so a transport that does not prove the peer (an
-    /// [`Announced`](bifrost::Announced) profile) can never root-admit. A caller that announces readiness
-    /// (a banner, a bound socket) before [`run`](Self::run) should call this at the same point it proves
-    /// its routes, so the refusal precedes the announcement. [`run`](Self::run) calls it too, so the
-    /// invariant holds however the exposer is driven.
+    /// [`Announced`](bifrost::Announced) profile) can never root-admit. `T` must be the transport the
+    /// exposer will serve: [`run`](Self::run) re-checks with its own `T`, so a mismatch still fails closed,
+    /// but at the arming point rather than here. A caller that announces readiness (a banner, a bound
+    /// socket) before [`run`](Self::run) should call this at the same point it proves its routes, so the
+    /// refusal precedes the announcement. [`run`](Self::run) calls it too, so the invariant holds however
+    /// the exposer is driven.
     pub fn prove_security<T: Transport>(&self) -> eyre::Result<()> {
         let security = <T::Security as SecurityProfile>::SECURITY;
         if self.gate.wants_capability() && !peer_proven(security) {
             eyre::bail!(
                 "this node gates on a signet, but the bound transport declares {} peer proof, so a gated \
-                 dial could never be admitted; bind a transport that proves the peer, or serve only \
-                 services you open to anyone",
+                 dial could never be admitted; bind a transport that proves the peer (the default iroh \
+                 transport does), or serve with an open gate (`Gate::Open`), which needs no peer proof",
                 proof_label(&security.peer)
             );
         }
@@ -1567,9 +1569,9 @@ fn admit(
     if public.contains(service.as_str()) || public_unsafe.contains(service.as_str()) {
         // An open service needs no badge, so the signet-bound membership slot is irrelevant on this path.
         // The witness is `Origin::Open` with `Admission::Slip`: no token is ruled on and nothing about the
-        // peer is proven, so the `ProvenPeer` minted here carries no authority. That is what lets an
-        // announced transport keep serving a service the operator opened to anyone, while every gated
-        // route (below) refuses.
+        // peer is verified, so the `ProvenPeer` minted here records the key the peer announced and carries
+        // no authority. That is what lets an announced transport keep serving a service the operator opened
+        // to anyone, while every gated route (below) refuses.
         return Gate::Open
             .admit_witnessed(
                 ProvenPeer::from_handshake(peer.node.verify_key()),
@@ -1613,9 +1615,9 @@ fn admit(
         },
         _ => None,
     };
-    // Mint the transport-proven peer at admission: the `peer` NodeId reached here only via a
-    // completed bifrost handshake (`serve_session` reads it from `Session::peer`), which proves the dialer
-    // holds the secret behind it, exactly the precondition `ProvenPeer::from_handshake` marks.
+    // Mint the peer the transport attested: the declared profile (a completed handshake for `Proven`,
+    // exact-by-construction for `InProcess`) is the transport's CLAIM, not a proof this seam re-derives.
+    // A rooted gate reaches here only past the predicate above; an open gate needs no peer proof at all.
     let peer = ProvenPeer::from_handshake(peer.node.verify_key());
     // Route the two-cap authority-bound path (a foreign slip AND the membership badge that vouches for the
     // dialer under the slip's foreign authority) through `admit_foreign_witnessed`; every other shape (a
@@ -1788,6 +1790,10 @@ pub struct DialRefused {
 /// [`Connector::to_node`] (a raw node id, optionally presenting a [`Link`]) or [`Connector::from_link`]
 /// (a `sheer:` link that supplies both the node and the token), then drives it with
 /// [`Connector::preflight`] (then [`PortForward::run`]) or [`Connector::pipe_stdio`].
+///
+/// This type is the path for a transport selected at run time, where no compile-time bound is possible;
+/// a caller whose transport type is fixed should prefer [`PresentingConnector`], which enforces the
+/// credential rule at compile time.
 pub struct Connector {
     dial: NodeId,
     service: Service,
@@ -1923,6 +1929,9 @@ impl Connector {
 /// declared profile to prove the peer (`T::Security: PeerProven`), so a credential over a
 /// self-announced transport is a compile error, never a runtime hope. The unbounded [`Connector`]
 /// carries the same rule at run time, for a transport chosen dynamically.
+///
+/// Prefer this type when the transport type is fixed; a transport selected at run time stays on
+/// [`Connector`], where the checked writer enforces the same rule.
 ///
 /// The announced profile is rejected where a proven peer is required:
 ///
@@ -3395,6 +3404,33 @@ mod tests {
             serve_request(peer, server_write, server_read, serving).await
         };
         (client_read, serve)
+    }
+
+    /// The exposure ceiling refuses PRE-`Ok`: an open witness cannot mint a `Never` handler's proof, so the
+    /// wire sees the uniform `Refused(NotAdmitted)` and never a success. This is the wire-level ordering pin
+    /// for the `serve_request` split: a refactor that hoists `Response::Ok` above `handler.prepare` fails here.
+    #[tokio::test]
+    async fn an_open_witness_is_refused_before_ok_for_a_never_handler() {
+        // Hand-build the serving context, bypassing the assembly interlock (which would refuse an open gate
+        // over a Never handler outright): this isolates the bridge's prepare-time refusal on the serve path.
+        let serving = Arc::new(super::Serving {
+            gate: Gate::Open,
+            public: PublicServices::default(),
+            public_unsafe: PublicServices::default(),
+            services: Services(HashMap::new())
+                .with_handler("locked", GatedNoop)
+                .expect("`locked` binds"),
+            raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
+            enabled: Box::new(AllEnabled),
+        });
+        let (mut client, serve) = drive_open("locked", serving);
+        let (served, response) = tokio::join!(serve, crate::protocol::Response::read(&mut client));
+        served.expect("serve_request returns Ok after writing a refusal");
+        assert_eq!(
+            response.expect("the refusal frame reads"),
+            crate::protocol::Response::Refused(bifrost::Refusal::NotAdmitted),
+            "the ceiling refusal is the uniform payload-free class, written with no success"
+        );
     }
 
     /// AVAILABILITY (Adversary A-1, delib 05, issue #25): a flood of never-written `fifo:` opens is bounded
