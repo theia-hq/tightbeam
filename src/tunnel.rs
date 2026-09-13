@@ -1623,7 +1623,9 @@ enum HostRefusal {
     /// `Refusal::NotAdmitted` a gate miss gives, so a saturation is indistinguishable from a refusal;
     /// this cause is only the operator's log line. The shared session table is bounded separately by
     /// [`MAX_SESSIONS`] and is outside this pool's claim.
-    #[error("public capacity reached ({cap}); refusing rather than queueing the admitted public dial")]
+    #[error(
+        "public capacity reached ({cap}); refusing rather than queueing the admitted public dial"
+    )]
     PublicAtCapacity {
         /// Which pool is at its cap (`public sessions` / `public streams`).
         cap: &'static str,
