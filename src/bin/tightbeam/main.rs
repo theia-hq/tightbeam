@@ -106,6 +106,9 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> eyre::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        // Diagnostics ride stderr, never stdout: `connect --to -` bridges the peer's bytes over stdout,
+        // so a log line there would corrupt the stream. Banners keep stdout.
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();

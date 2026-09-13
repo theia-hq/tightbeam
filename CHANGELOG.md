@@ -39,6 +39,11 @@ so nothing user-facing is lost.
   legitimacy ceiling ("may this ever face a stranger"), not `Public` ("is it public"). The marker values
   and the compile-time refusal are unchanged.
 
+### Fixed
+- **Diagnostics no longer ride stdout.** The binary's tracing subscriber writes to stderr, so a log line
+  cannot interleave with a verb's stdout: the `connect --to -` bridge carries the peer's bytes there
+  unbroken, and `tree` and banner output stay parseable.
+
 ## v0.4.0 - 2026-09-05
 
 ### New
