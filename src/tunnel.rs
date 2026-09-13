@@ -9,7 +9,7 @@
 
 use core::time::Duration;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use bifrost::{
     ConnInfo, Discovery, Node, NodeId, PeerProof, PeerProven, Refusal, RefusalDetail, Security,
@@ -28,7 +28,7 @@ pub use tightbeam_handler::{
 };
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 // Re-exported below: it is part of `Exposer::run`'s contract (the node's teardown authority), so a caller
 // reaches it through `tightbeam::tunnel` alongside `Exposer` rather than depending on tokio-util directly.
 pub use tokio_util::sync::CancellationToken;
@@ -70,6 +70,22 @@ const MAX_STREAMS_PER_SESSION: usize = 256;
 /// briefly held). Small because a legitimate node serves a handful of raw streams, never hundreds; a request
 /// over the cap is refused cleanly.
 const RAW_STREAM_OPEN_PERMITS: usize = 16;
+
+/// The maximum number of concurrent PUBLIC sessions (delib-49 G5): a session that has reached any opened
+/// service holds one permit until it closes. This bounds what ADMITTED public dials can occupy: at most 32
+/// of [`MAX_SESSIONS`] sessions and [`PUBLIC_STREAM_PERMITS`] streams, so the public path cannot consume
+/// the whole table by itself. It reserves nothing: a session that never reaches an opened service (a gated
+/// or unknown request, or none) takes no permit, so a stranger can still hold the shared session table up
+/// to [`MAX_SESSIONS`] and make member dials queue at accept. That residual is the accepted loss, the same
+/// shape the round-3 re-spec accepted one layer up (a redialing occupier keeps the public semaphore full).
+/// The cap bounds occupation, not fairness: a dialer that keeps reconnecting can still hold all 32.
+const PUBLIC_SESSION_PERMITS: usize = 32;
+
+/// The maximum number of concurrent public streams (delib-49 G5), taken at the public-admit seam. Single
+/// digits because one public stream is already a stranger's whole session of work; 4 bounds the aggregate
+/// public drain to four in-flight streams while leaving room for a handful of honest dials. Over the cap
+/// REFUSES (never queues): queuing would park one stranger's stream behind another's.
+const PUBLIC_STREAM_PERMITS: usize = 4;
 
 /// A forwarding target for one exposed service: either a named service handler, bound BY VALUE at
 /// registration, or tightbeam's own raw-stream source (a `file:`/`fifo:`/`stdin:` byte source spliced
@@ -1184,15 +1200,16 @@ impl Exposer {
         // cheap defense-in-depth: the nonblocking open cannot park a thread, so this bounds the fds held
         // mid-open, not a leak. See `RAW_STREAM_OPEN_PERMITS`.
         //
-        // The whole per-node serving context (gate + public overlay + services + the open pool + the
-        // enable/disable oracle) is bundled behind ONE `Arc` so each accepted session carries a single
-        // handle rather than a fistful of clones.
+        // The whole per-node serving context (gate + public overlays + services + the raw-stream open pool
+        // + the public capacity pools + the enable/disable oracle) is bundled behind ONE `Arc` so each
+        // accepted session carries a single handle rather than a fistful of clones.
         let serving = Arc::new(Serving {
             gate,
             public,
             public_unsafe,
             services,
             raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
+            public_pool: PublicPool::new(),
             enabled,
         });
         let mut sessions = FuturesUnordered::new();
@@ -1229,18 +1246,69 @@ impl Exposer {
 
 /// The per-node shared state every accepted session and inbound stream is served under: the node BASE
 /// [`Gate`], the two disjoint [`PublicServices`] overlays it composes with (the SAFE `public` and the UNSAFE
-/// raw-stream `public_unsafe`), the bound [`Services`] route table, and the raw-stream open permit pool.
-/// Assembled once in [`Exposer::run`] and shared by one `Arc` across every session/stream, so a serving
-/// future carries a single handle.
+/// raw-stream `public_unsafe`), the bound [`Services`] route table, the raw-stream open permit pool, and the
+/// public-path capacity pools. Assembled once in [`Exposer::run`] and shared by one `Arc` across every
+/// session/stream, so a serving future carries a single handle.
 struct Serving {
     gate: Gate,
     public: PublicServices,
     public_unsafe: PublicServices,
     services: Services,
     raw_stream_opens: Semaphore,
+    /// The public-path capacity (delib-49 G5): taken only at the public-admit seam, so a gated route never
+    /// consults it and non-public traffic is untouched.
+    public_pool: PublicPool,
     /// The live enable/disable oracle (delib-47), consulted per stream at admission, beside the gate: a
     /// disabled service is refused with the same indistinguishable refusal a gate miss gives.
     enabled: Box<dyn EnabledServices + Send + Sync>,
+}
+
+/// The node's public-path capacity (delib-49 G5): the two permit pools that bound what strangers can
+/// occupy. `sessions` holds one permit per session that has reached an opened service, until that session
+/// closes; `streams` holds one per public stream in flight. Both are taken ONLY at the public-admit seam
+/// ([`admit`]): a gated route never consults either pool.
+struct PublicPool {
+    /// One permit per public session (see [`PUBLIC_SESSION_PERMITS`]).
+    sessions: Arc<Semaphore>,
+    /// One permit per concurrent public stream (see [`PUBLIC_STREAM_PERMITS`]).
+    streams: Arc<Semaphore>,
+}
+
+impl PublicPool {
+    /// The production capacity: [`PUBLIC_SESSION_PERMITS`] public sessions, [`PUBLIC_STREAM_PERMITS`]
+    /// concurrent public streams.
+    fn new() -> Self {
+        Self {
+            sessions: Arc::new(Semaphore::new(PUBLIC_SESSION_PERMITS)),
+            streams: Arc::new(Semaphore::new(PUBLIC_STREAM_PERMITS)),
+        }
+    }
+}
+
+/// The per-session half of the public cap (delib-49 G5): the ONE public-session permit a session holds
+/// once it has been admitted to any opened service, held until the session closes and its last stream
+/// drops. A session that only ever dials gated routes never takes one: classification happens at the
+/// public-admit seam, so a member's session is invisible to the pool.
+#[derive(Default)]
+struct PublicSession {
+    /// `None` until the first public admit, then this session's permit. The lock is `std` with a
+    /// non-blocking `try_acquire` inside and never an await, so it can never park the admit path.
+    permit: std::sync::Mutex<Option<OwnedSemaphorePermit>>,
+}
+
+impl PublicSession {
+    /// Classify this session into the public pool, taking its permit on the first public admit. `Ok` when
+    /// the session already holds one or the pool has room; `Err` when the pool is at
+    /// [`PUBLIC_SESSION_PERMITS`] sessions.
+    fn enter(&self, sessions: &Arc<Semaphore>) -> Result<(), ()> {
+        let mut held = self.permit.lock().unwrap_or_else(PoisonError::into_inner);
+        if held.is_some() {
+            return Ok(());
+        }
+        let permit = Arc::clone(sessions).try_acquire_owned().map_err(|_| ())?;
+        *held = Some(permit);
+        Ok(())
+    }
 }
 
 /// The peer a session attests: the `NodeId` the transport reports, with the security that transport
@@ -1276,6 +1344,9 @@ where
         node: session.peer(),
         security: <S::Security as SecurityProfile>::SECURITY,
     };
+    // The per-session half of the public cap (delib-49 G5): created empty, classified by the first stream
+    // that reaches an opened service, and dropped with the session (which releases its permit, if any).
+    let public_session = Arc::new(PublicSession::default());
     let mut pipes = FuturesUnordered::new();
     // Stop accepting new streams once `accept_bi` errors (the session is closing): drain the in-flight
     // pipes rather than reaping them with `?`, the same courtesy `connect` gives its local listener.
@@ -1287,9 +1358,13 @@ where
             // buffer. A single peer cannot exhaust the node with unbounded concurrent streams.
             accepted = session.accept_bi(), if accepting && pipes.len() < MAX_STREAMS_PER_SESSION => {
                 match accepted {
-                    Ok((writer, reader)) => {
-                        pipes.push(serve_request(peer, writer, reader, Arc::clone(&serving)))
-                    }
+                    Ok((writer, reader)) => pipes.push(serve_request(
+                        peer,
+                        writer,
+                        reader,
+                        Arc::clone(&serving),
+                        Arc::clone(&public_session),
+                    )),
                     Err(error) => {
                         tracing::warn!(%peer, %error, "accept_bi failed; draining in-flight streams");
                         accepting = false;
@@ -1312,12 +1387,14 @@ where
 ///
 /// The gate decides per stream, not per session, because the requested service (and any presented
 /// capability) is a property of the stream: one session may carry several service requests, each gated on
-/// its own merits.
+/// its own merits. `public_session` is this session's half of the public cap (delib-49 G5): a stream that
+/// takes the public path classifies the session, and the permit it carries rides this future to the end.
 async fn serve_request<W, R>(
     peer: SessionPeer,
     mut writer: W,
     mut reader: R,
     serving: Arc<Serving>,
+    public_session: Arc<PublicSession>,
 ) -> eyre::Result<()>
 where
     W: io::AsyncWrite + Unpin + Send + 'static,
@@ -1329,6 +1406,7 @@ where
         public_unsafe,
         services,
         raw_stream_opens,
+        public_pool,
         enabled,
     } = &*serving;
     let Services(services) = services;
@@ -1379,10 +1457,18 @@ where
             .map_err(Into::into);
     }
 
+    // `admitted` carries the public-stream permit (when this is a public stream) for the WHOLE of this
+    // function: the permit field is never moved, so it drops when this stream ends, which is what releases
+    // the slot. Its witness is moved on below into `prepare`; the remaining permit field stays bound to the
+    // end of this scope.
     let admitted = match admit(
-        gate,
-        public,
-        public_unsafe,
+        Admission {
+            gate,
+            public,
+            public_unsafe,
+            pool: public_pool,
+        },
+        public_session.as_ref(),
         peer,
         request.capability.as_deref(),
         request.membership.as_deref(),
@@ -1390,11 +1476,12 @@ where
     ) {
         Ok(admitted) => admitted,
         Err(refusal) => {
-            // The full cause (malformed / missing / not-granted / revoked, the typed `HostRefusal`) is a
-            // LOCAL log line for the node's own operator. The WIRE gets one indistinguishable
-            // `Refusal::NotAdmitted`, so a not-admitted dialer cannot tell a stranger's `Missing` from a
-            // revoked holder's `Revoked`, nor confirm a service exists at all: no pre-authorization
-            // revocation or capability-enumeration oracle.
+            // The full cause (malformed / missing / not-granted / revoked / public capacity, the typed
+            // `HostRefusal`) is a LOCAL log line for the node's own operator. The WIRE gets one
+            // indistinguishable `Refusal::NotAdmitted`, so a not-admitted dialer cannot tell a stranger's
+            // `Missing` from a revoked holder's `Revoked`, nor confirm a service exists at all: no
+            // pre-authorization revocation or capability-enumeration oracle. A saturated public pool is
+            // wire-identical to a gate miss for the same reason.
             tracing::warn!(%peer, service = %service, %refusal, "refused");
             return Response::Refused(Refusal::NotAdmitted)
                 .write(&mut writer)
@@ -1411,7 +1498,7 @@ where
     // that a route is member-only (no member-vs-slip oracle). The lookup is hoisted so the floor and the
     // dispatch below read the same resolved route.
     let route = services.get(service.as_str());
-    if route.is_some_and(|route| route.access == Access::Member) && !admitted.is_member() {
+    if route.is_some_and(|route| route.access == Access::Member) && !admitted.witness.is_member() {
         tracing::warn!(%peer, service = %service, "refused: member-only route");
         return Response::Refused(Refusal::NotAdmitted)
             .write(&mut writer)
@@ -1465,7 +1552,7 @@ where
         // gate miss gives (no never-public oracle). The witness is moved into the proof by value (single-use),
         // so a handler can never run for an unauthorized peer; the guarantee holds only because the admit
         // (above) and this serve share one stream frame, never hoisted to session scope.
-        Some(Target::Handler(handler)) => match handler.prepare(admitted) {
+        Some(Target::Handler(handler)) => match handler.prepare(admitted.witness) {
             Ok(prepared) => {
                 Response::Ok.write(&mut writer).await?;
                 prepared.serve(Box::new(writer), Box::new(reader)).await?;
@@ -1531,6 +1618,18 @@ enum HostRefusal {
     /// The gate ruled: nauthy's typed cause.
     #[error(transparent)]
     Gate(nauthy::Refusal),
+    /// The public-path capacity (delib-49 G5) is reached: the node already serves its cap of ADMITTED
+    /// public sessions or concurrent public streams. The wire still gets the same payload-free
+    /// `Refusal::NotAdmitted` a gate miss gives, so a saturation is indistinguishable from a refusal;
+    /// this cause is only the operator's log line. The shared session table is bounded separately by
+    /// [`MAX_SESSIONS`] and is outside this pool's claim.
+    #[error(
+        "public capacity reached ({cap}); refusing rather than queueing the admitted public dial"
+    )]
+    PublicAtCapacity {
+        /// Which pool is at its cap (`public sessions` / `public streams`).
+        cap: &'static str,
+    },
 }
 
 impl From<nauthy::Refusal> for HostRefusal {
@@ -1539,24 +1638,53 @@ impl From<nauthy::Refusal> for HostRefusal {
     }
 }
 
+/// An admitted stream: the nauthy witness the dispatch consumes, plus the public-path permit (if any) this
+/// stream holds until it ends. The permit rides the binding through the whole of [`serve_request`], so a
+/// public stream keeps its slot for exactly its lifetime; a gated stream carries `None` and touches no
+/// public capacity.
+#[derive(Debug)]
+struct AdmittedStream {
+    witness: Admitted,
+    /// Held for the stream's lifetime; dropped when the binding leaves scope. Never read.
+    _stream_permit: Option<OwnedSemaphorePermit>,
+}
+
+/// The policy one stream's admission is ruled under: the node base [`Gate`], the two disjoint open
+/// overlays (the SAFE `public` and the UNSAFE raw-stream `public_unsafe`), and the public-path capacity
+/// pools. Borrowed from the serving context, so [`admit`] reads one handle and a session's permit can
+/// never be taken against another node's pools.
+#[derive(Clone, Copy)]
+struct Admission<'a> {
+    gate: &'a Gate,
+    public: &'a PublicServices,
+    public_unsafe: &'a PublicServices,
+    pool: &'a PublicPool,
+}
+
 /// Rule on a request under the node's per-service admission: the two disjoint open overlays (`public`, the
-/// safe one, and `public_unsafe`, the unsafe raw-stream one) composed with the `base` family gate, returning
-/// the [`Admitted`] witness on success or the typed [`HostRefusal`] for the node's OWN logs. A service
-/// the operator opened (a member of EITHER overlay) admits any reaching peer; every other service faces the
-/// `base` gate. The witness is required to reach a service handler, so "authorize before
+/// safe one, and `public_unsafe`, the unsafe raw-stream one) composed with the base family gate, returning
+/// the [`Admitted`] witness plus this stream's public permit (if any) on success, or the typed
+/// [`HostRefusal`] for the node's OWN logs. A service the operator opened (a member of EITHER overlay)
+/// admits any reaching peer under the public caps; every other service faces the base gate and touches no
+/// public capacity. The witness is required to reach a service handler, so "authorize before
 /// serve" is a compile-time precondition (see [`nauthy::Admitted`]). The refusal returned here NEVER crosses
 /// the wire (the caller sends the payload-free `Refusal::NotAdmitted` to a not-admitted dialer); it exists
 /// only so the operator can see WHY on their own `tracing` output. Distinguishing missing/not-granted/revoked
 /// to the wire would be a revocation + capability-enumeration oracle for an unauthorized peer (deliberation 18).
 fn admit(
-    base: &Gate,
-    public: &PublicServices,
-    public_unsafe: &PublicServices,
+    admission: Admission<'_>,
+    session: &PublicSession,
     peer: SessionPeer,
     capability: Option<&str>,
     membership: Option<&str>,
     service: &Service,
-) -> Result<Admitted, HostRefusal> {
+) -> Result<AdmittedStream, HostRefusal> {
+    let Admission {
+        gate: base,
+        public,
+        public_unsafe,
+        pool,
+    } = admission;
     // The ONLY branch admission takes on the service NAME is this open-set membership test, and it runs
     // BEFORE any dispatch (the `services.get` in `serve_request` is reached only past this admit). A HIT on
     // EITHER overlay is the sole fast/open path: the service was proven open at `with_public` (safe) or at
@@ -1572,13 +1700,33 @@ fn admit(
         // peer is verified, so the `ProvenPeer` minted here records the key the peer announced and carries
         // no authority. That is what lets an announced transport keep serving a service the operator opened
         // to anyone, while every gated route (below) refuses.
-        return Gate::Open
+        let witness = Gate::Open
             .admit_witnessed(
                 ProvenPeer::from_handshake(peer.node.verify_key()),
                 None,
                 service,
             )
-            .map_err(HostRefusal::from);
+            .map_err(HostRefusal::from)?;
+        // delib-49 G5, the ONE place the public caps are taken. A public stream first takes a
+        // public-stream permit (held for the stream's life) and then classifies its session (one
+        // public-session permit, held until the session closes). Past either cap the answer is a refusal
+        // BEFORE any `Response::Ok`, mapped by the caller to the same payload-free `NotAdmitted` a gate
+        // miss gives. Stream permit first: a session is only classified by a stream that actually runs, so
+        // a refused stream never burns a session slot. A gated route skips this block entirely.
+        let stream_permit = Arc::clone(&pool.streams).try_acquire_owned().map_err(|_| {
+            HostRefusal::PublicAtCapacity {
+                cap: "public streams",
+            }
+        })?;
+        session
+            .enter(&pool.sessions)
+            .map_err(|_| HostRefusal::PublicAtCapacity {
+                cap: "public sessions",
+            })?;
+        return Ok(AdmittedStream {
+            witness,
+            _stream_permit: Some(stream_permit),
+        });
     }
     // A rooted gate rules on a token BOUND to the dialer's proven key, so it may only run when the
     // transport's declared profile proves the peer: over an announced session a harvested badge is
@@ -1624,14 +1772,18 @@ fn admit(
     // membership badge, a plain/bearer/device slip, or no token) is the single-cap path. A `membership` is
     // `Some` only when slot 1 is an authority-bound slip and a badge parsed, so that pairing is the only
     // caller of the foreign twin.
-    match (cap.as_ref(), membership.as_ref()) {
+    let witness = match (cap.as_ref(), membership.as_ref()) {
         (Some(slip), Some(badge)) => base
             .admit_foreign_witnessed(peer, slip, badge, service)
             .map_err(HostRefusal::from),
         (presented, _) => base
             .admit_witnessed(peer, presented, service)
             .map_err(HostRefusal::from),
-    }
+    }?;
+    Ok(AdmittedStream {
+        witness,
+        _stream_permit: None,
+    })
 }
 
 /// Resolve the requested service against what is exposed: if it names no exposed service but exactly one
@@ -2205,10 +2357,11 @@ mod tests {
     use tokio::io::AsyncReadExt as _;
 
     use super::{
-        Access, AllEnabled, BoxRead, BoxWrite, Exposer, Handler, Metering, Posture, PublicRequest,
-        PublicServices, PublicUnsafeRequest, RAW_STREAM_OPEN_PERMITS, RawSource, Route, Router,
-        Security, Semaphore, ServeError, Served, ServiceCatalog, ServiceEntry, Services,
-        SessionPeer, Target, TargetKind, resolve_single_service, serve_request,
+        Access, Admission, AllEnabled, BoxRead, BoxWrite, Exposer, Handler, Metering, Posture,
+        PublicPool, PublicRequest, PublicServices, PublicSession, PublicUnsafeRequest,
+        RAW_STREAM_OPEN_PERMITS, RawSource, Route, Router, Security, Semaphore, ServeError, Served,
+        ServiceCatalog, ServiceEntry, Services, SessionPeer, Target, TargetKind,
+        resolve_single_service, serve_request,
     };
     use crate::open_policy::{Never, OptIn};
     use crate::raw_stream::RawStream;
@@ -2359,6 +2512,27 @@ mod tests {
             _writer: BoxWrite,
             _reader: BoxRead,
         ) -> Result<(), ServeError> {
+            Ok(())
+        }
+    }
+
+    /// A public handler that parks inside `serve` until a permit is added to `release`, so a
+    /// public-stream cap test can hold one stream's permit deterministically. `entered` signals the test
+    /// that the serve body is running, which is after the stream was admitted and its permit taken.
+    struct Parked {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<Semaphore>,
+    }
+    impl Handler for Parked {
+        type Exposure = OptIn;
+        async fn serve(
+            &self,
+            _served: Served<Self>,
+            _writer: BoxWrite,
+            _reader: BoxRead,
+        ) -> Result<(), ServeError> {
+            self.entered.notify_one();
+            let _permit = self.release.acquire().await;
             Ok(())
         }
     }
@@ -3357,6 +3531,7 @@ mod tests {
             public_unsafe: PublicServices::default(),
             services,
             raw_stream_opens: permits,
+            public_pool: PublicPool::new(),
             enabled: Box::new(AllEnabled),
         })
     }
@@ -3368,13 +3543,35 @@ mod tests {
         channel: ChannelProtection::Aead,
     };
 
-    /// Drive one `serve_request` for `service` against the shared `serving` context, and return the client's
-    /// stream end plus the serving future. The serving future is returned UN-awaited so a caller can let it
-    /// park (a never-written FIFO) or poll it for the refusal, and the returned reader carries the host's
-    /// `Response`. Uses `tokio::io::duplex` so no transport is needed.
+    /// Drive one `serve_request` for `service` against the shared `serving` context, with a fresh public
+    /// session and no token: the common shape, for tests that do not need to hold the session open or
+    /// present a capability. See [`drive_open_in`] for that.
     fn drive_open(
         service: &str,
         serving: std::sync::Arc<super::Serving>,
+    ) -> (
+        tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        impl core::future::Future<Output = eyre::Result<()>>,
+    ) {
+        drive_open_in(
+            service,
+            serving,
+            std::sync::Arc::new(PublicSession::default()),
+            None,
+        )
+    }
+
+    /// Drive one `serve_request` for `service` against the shared `serving` context under `session`, and
+    /// return the client's stream end plus the serving future. The serving future is returned un-awaited so
+    /// a caller can let it park (a never-written FIFO, a parked handler) or poll it for the refusal, and the
+    /// returned reader carries the host's `Response`. Uses `tokio::io::duplex` so no transport is needed.
+    /// The session is passed by `Arc` because the caller may hold it open (the public-session cap test) and
+    /// a spawned future must stay `'static`; `capability` lets a test dial as a member.
+    fn drive_open_in(
+        service: &str,
+        serving: std::sync::Arc<super::Serving>,
+        session: std::sync::Arc<PublicSession>,
+        capability: Option<String>,
     ) -> (
         tokio::io::ReadHalf<tokio::io::DuplexStream>,
         impl core::future::Future<Output = eyre::Result<()>>,
@@ -3391,7 +3588,7 @@ mod tests {
         let serve = async move {
             crate::protocol::Request {
                 service: service.clone(),
-                capability: None,
+                capability,
                 membership: None,
             }
             .write(&mut client_write)
@@ -3401,9 +3598,35 @@ mod tests {
             // (peer -> `io::sink()`) ends on this EOF, so a served stream can actually finish (otherwise the
             // splice's `try_join!` would wait forever for the client to hang up).
             drop(client_write);
-            serve_request(peer, server_write, server_read, serving).await
+            serve_request(peer, server_write, server_read, serving, session).await
         };
         (client_read, serve)
+    }
+
+    /// The admission core with an unconstrained public pool and a fresh session: the predicate tests care
+    /// about the ruling, not the caps (the cap tests build their own [`Admission`]).
+    fn admit(
+        gate: &Gate,
+        public: &PublicServices,
+        public_unsafe: &PublicServices,
+        peer: SessionPeer,
+        capability: Option<&str>,
+        membership: Option<&str>,
+        service: &Service,
+    ) -> Result<super::AdmittedStream, super::HostRefusal> {
+        super::admit(
+            Admission {
+                gate,
+                public,
+                public_unsafe,
+                pool: &PublicPool::new(),
+            },
+            &PublicSession::default(),
+            peer,
+            capability,
+            membership,
+            service,
+        )
     }
 
     /// The exposure ceiling refuses PRE-`Ok`: an open witness cannot mint a `Never` handler's proof, so the
@@ -3421,6 +3644,7 @@ mod tests {
                 .with_handler("locked", GatedNoop)
                 .expect("`locked` binds"),
             raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
+            public_pool: PublicPool::new(),
             enabled: Box::new(AllEnabled),
         });
         let (mut client, serve) = drive_open("locked", serving);
@@ -3431,6 +3655,200 @@ mod tests {
             crate::protocol::Response::Refused(bifrost::Refusal::NotAdmitted),
             "the ceiling refusal is the uniform payload-free class, written with no success"
         );
+    }
+
+    /// delib-49 G5, the anti-starvation property: with the public-session pool FULL, a gated member dial
+    /// on its own session is still admitted and served, because only the public-admit seam touches the
+    /// pool. The public dial over the cap gets the same payload-free `NotAdmitted` a gate miss gives, and
+    /// dropping the public session releases its slot for the next public dial.
+    #[tokio::test]
+    async fn a_saturated_public_pool_never_starves_a_gated_member() {
+        use crate::identity::AsVerifyKey as _;
+
+        let signet = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
+        let gate = Gate::rooted(
+            signet.verifying_key(),
+            nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-public-starvation")),
+        );
+        // The badge is bound to the peer `drive_open_in` dials as, so the rooted gate admits it.
+        let peer = bifrost::NodeId::from_ed25519_secret(&[9u8; 32]);
+        let badge = signet
+            .mint_member(
+                peer.verify_key(),
+                nauthy::Request::expires_in(core::time::Duration::from_secs(300)),
+            )
+            .expect("mint member badge")
+            .link()
+            .expect("link");
+
+        let services = Services(HashMap::new())
+            .with_handler("open", OpenNoop)
+            .expect("`open` binds")
+            .with_handler("web", OpenNoop)
+            .expect("`web` binds");
+        let serving = Arc::new(super::Serving {
+            gate,
+            public: PublicServices(["open".to_owned()].into_iter().collect()),
+            public_unsafe: PublicServices::default(),
+            services,
+            raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
+            public_pool: PublicPool {
+                sessions: Arc::new(Semaphore::new(1)),
+                streams: Arc::new(Semaphore::new(4)),
+            },
+            enabled: Box::new(AllEnabled),
+        });
+
+        // One public session reaches `open` and stays alive, holding the single public-session permit.
+        let holder = Arc::new(PublicSession::default());
+        let (mut holder_reader, holder_serve) =
+            drive_open_in("open", Arc::clone(&serving), Arc::clone(&holder), None);
+        let (served, response) = tokio::join!(
+            holder_serve,
+            crate::protocol::Response::read(&mut holder_reader)
+        );
+        served.expect("the serving future returns after the stream");
+        assert_eq!(
+            response.expect("the response reads"),
+            crate::protocol::Response::Ok,
+            "the first public dial is admitted"
+        );
+
+        // The pool is full: a second public session is refused at the seam, with the uniform wire class.
+        let stranger = Arc::new(PublicSession::default());
+        let (mut stranger_reader, stranger_serve) =
+            drive_open_in("open", Arc::clone(&serving), Arc::clone(&stranger), None);
+        let (served, response) = tokio::join!(
+            stranger_serve,
+            crate::protocol::Response::read(&mut stranger_reader)
+        );
+        served.expect("the serving future returns after the refusal");
+        assert_eq!(
+            response.expect("the response reads"),
+            crate::protocol::Response::Refused(bifrost::Refusal::NotAdmitted),
+            "a public dial over the session cap is refused with the uniform gate refusal"
+        );
+
+        // The anti-starvation property: a gated member dials its own session and is served while the
+        // public pool is full. Its session presents a real badge, so it never touches the public pool.
+        let member = Arc::new(PublicSession::default());
+        let (mut member_reader, member_serve) = drive_open_in(
+            "web",
+            Arc::clone(&serving),
+            Arc::clone(&member),
+            Some(badge.to_string()),
+        );
+        let (served, response) = tokio::join!(
+            member_serve,
+            crate::protocol::Response::read(&mut member_reader)
+        );
+        served.expect("the serving future returns after the member stream");
+        assert_eq!(
+            response.expect("the response reads"),
+            crate::protocol::Response::Ok,
+            "a gated member dial is served while the public pool is saturated"
+        );
+
+        // Close the public session: its permit returns to the pool, so the next public dial is admitted.
+        drop(holder);
+        let (mut fresh_reader, fresh_serve) = drive_open_in(
+            "open",
+            Arc::clone(&serving),
+            Arc::new(PublicSession::default()),
+            None,
+        );
+        let (served, response) = tokio::join!(
+            fresh_serve,
+            crate::protocol::Response::read(&mut fresh_reader)
+        );
+        served.expect("the serving future returns after the stream");
+        assert_eq!(
+            response.expect("the response reads"),
+            crate::protocol::Response::Ok,
+            "a closed public session releases its permit for the next public dial"
+        );
+    }
+
+    /// delib-49 G5, the public-stream cap: one parked public stream holds the single stream permit, so a
+    /// second public stream on the same (already classified) session is refused at the seam; releasing the
+    /// parked handler lets its stream end, drops the permit, and the next stream is admitted. Over-cap
+    /// refusal is the uniform wire class, written before any `Response::Ok`.
+    #[tokio::test]
+    async fn a_public_stream_over_the_cap_is_refused_and_released_when_it_ends() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+        let services = Services(HashMap::new())
+            .with_handler(
+                "park",
+                Parked {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                },
+            )
+            .expect("`park` binds");
+        let serving = Arc::new(super::Serving {
+            gate: Gate::Open,
+            public: PublicServices(["park".to_owned()].into_iter().collect()),
+            public_unsafe: PublicServices::default(),
+            services,
+            raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
+            public_pool: PublicPool {
+                sessions: Arc::new(Semaphore::new(4)),
+                streams: Arc::new(Semaphore::new(1)),
+            },
+            enabled: Box::new(AllEnabled),
+        });
+
+        // The first stream is admitted and parks in the handler, holding the one stream permit.
+        let session = Arc::new(PublicSession::default());
+        let (mut first_reader, first_serve) =
+            drive_open_in("park", Arc::clone(&serving), Arc::clone(&session), None);
+        let first = tokio::spawn(first_serve);
+        assert_eq!(
+            crate::protocol::Response::read(&mut first_reader)
+                .await
+                .expect("the response reads"),
+            crate::protocol::Response::Ok,
+            "the first public stream is admitted"
+        );
+        entered.notified().await;
+
+        // The cap is taken: a second public stream on the same session is refused, uniformly.
+        let (mut second_reader, second_serve) =
+            drive_open_in("park", Arc::clone(&serving), Arc::clone(&session), None);
+        let (served, response) = tokio::join!(
+            second_serve,
+            crate::protocol::Response::read(&mut second_reader)
+        );
+        served.expect("the serving future returns after the refusal");
+        assert_eq!(
+            response.expect("the response reads"),
+            crate::protocol::Response::Refused(bifrost::Refusal::NotAdmitted),
+            "a public stream over the cap is refused with the uniform gate refusal"
+        );
+
+        // Release the parked handler: the stream ends, its permit drops, and the next stream is admitted.
+        release.add_permits(1);
+        first
+            .await
+            .expect("the parked stream ends after its release")
+            .expect("the serve future returns Ok");
+        let (mut third_reader, third_serve) =
+            drive_open_in("park", Arc::clone(&serving), Arc::clone(&session), None);
+        let third = tokio::spawn(third_serve);
+        assert_eq!(
+            crate::protocol::Response::read(&mut third_reader)
+                .await
+                .expect("the response reads"),
+            crate::protocol::Response::Ok,
+            "a stream permit released by a finished stream admits the next public stream"
+        );
+        entered.notified().await;
+        release.add_permits(1);
+        third
+            .await
+            .expect("the second parked stream ends")
+            .expect("the serve future returns Ok");
     }
 
     /// AVAILABILITY (Adversary A-1, delib 05, issue #25): a flood of never-written `fifo:` opens is bounded
@@ -3588,6 +4006,7 @@ mod tests {
             public_unsafe: PublicServices::default(),
             services,
             raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
+            public_pool: PublicPool::new(),
             enabled: Box::new(enabled),
         });
 
@@ -3937,7 +4356,7 @@ mod tests {
 
         // HIT (safe overlay): the opened `speed` admits a tokenless stranger, and the witness is a Slip (an
         // opened service proves nothing about the peer), never a whole-node member.
-        let admitted = super::admit(
+        let admitted = admit(
             &gate,
             &public,
             &public_unsafe,
@@ -3951,13 +4370,13 @@ mod tests {
         )
         .expect("an opened service admits a stranger");
         assert!(
-            !admitted.is_member(),
+            !admitted.witness.is_member(),
             "an opened service admits as a Slip, never a whole-node member"
         );
 
         // HIT (unsafe overlay): a stranger reaching the unsafe-open raw stream is admitted the same way, also
         // as a Slip (§9 `an_unsafe_raw_stream_member_admits_a_stranger`).
-        let unsafe_admitted = super::admit(
+        let unsafe_admitted = admit(
             &gate,
             &public,
             &public_unsafe,
@@ -3971,14 +4390,14 @@ mod tests {
         )
         .expect("an unsafe-open raw stream admits a stranger");
         assert!(
-            !unsafe_admitted.is_member(),
+            !unsafe_admitted.witness.is_member(),
             "an unsafe-open raw stream admits as a Slip, never a whole-node member"
         );
 
         // MISS (gated-present): `control.stop` is served but NOT open on either overlay, so a stranger takes
         // the family path and is refused. MISS (absent): a name the node does not serve takes the SAME path.
         assert!(
-            super::admit(
+            admit(
                 &gate,
                 &public,
                 &public_unsafe,
@@ -3994,7 +4413,7 @@ mod tests {
             "a served-but-gated service is refused for a stranger (family path)"
         );
         assert!(
-            super::admit(
+            admit(
                 &gate,
                 &public,
                 &public_unsafe,
@@ -4031,7 +4450,7 @@ mod tests {
             .expect("mint member badge")
             .link()
             .expect("link");
-        let admitted = super::admit(
+        let admitted = admit(
             &gate,
             &public,
             &super::PublicServices::default(),
@@ -4045,7 +4464,7 @@ mod tests {
         )
         .expect("a member badge admits on slot 1 alone; garbage in slot 2 is ignored");
         assert!(
-            admitted.is_member(),
+            admitted.witness.is_member(),
             "a whole-node member badge admits as Member regardless of slot 2"
         );
     }
@@ -4077,7 +4496,7 @@ mod tests {
         // The same badge over a proven session IS admitted (the control): the refusal below is the
         // profile, not the token.
         assert!(
-            super::admit(
+            admit(
                 &gate,
                 &super::PublicServices::default(),
                 &super::PublicServices::default(),
@@ -4092,7 +4511,7 @@ mod tests {
             .is_ok(),
             "a valid member badge is admitted over a proven session"
         );
-        let refused = super::admit(
+        let refused = admit(
             &gate,
             &super::PublicServices::default(),
             &super::PublicServices::default(),
@@ -4179,6 +4598,7 @@ mod tests {
             public_unsafe: PublicServices::default(),
             services: services(&["web=127.0.0.1:80"]),
             raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
+            public_pool: PublicPool::new(),
             enabled: Box::new(AllEnabled),
         });
 
