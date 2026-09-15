@@ -42,6 +42,8 @@ capabilities). Three runnable examples show the whole library, no network needed
 - [`named_handler`](examples/named_handler.rs): inject your own `Handler` and reach it by name (the
   extension point every named service is built on).
 
+This page describes the default branch; the released docs are at the newest tag.
+
 ## Reach a service, get a stream
 
 A `Connector` reaches one exposed service on a peer and hands back a bidirectional stream. Build it from a
