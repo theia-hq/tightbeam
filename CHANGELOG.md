@@ -1,11 +1,22 @@
 # Changelog
 
-All notable changes to tightbeam, newest first. This first entry reaches back over the arc since v0.3.0,
-so nothing user-facing is lost.
+All notable changes to tightbeam, newest first.
 
-## Unreleased
+## v0.5.0
+
+One route table, a handler contract that carries its exposure as a type, and a refusal the client matches
+rather than parses.
 
 ### New
+- **The `Router` route table.** `Router::new(gate)` binds each served name to a handler (`.service`), the
+  loopback reflector (`.echo`), a local forward (`.forward`), or a raw-stream source (`.raw_stream`), then
+  proves the node once with `.expose()`; `.catalog()` reads back the served names and each route's
+  `Posture`. A handler serves the `Served<Self>` proof the gate prepared for it, which carries the
+  single-use admission witness and narrows to a rooted one with `into_rooted()`; `ServeError` reports a
+  served-stream failure and `Metering` declares a handler's own bound.
+- **The rooted-witness handoff.** `RootedAdmitted::into_admitted` hands a rooted proof back to the untyped
+  gate witness for a handler that does not take `RootedAdmitted` yet; only a rooted admission can produce
+  one, so the handoff cannot widen.
 - **The `EnabledServices` gate oracle.** A `Revocations`-shaped, mtime-watched trait (with a
   `FileDisabledList` impl and an `AllEnabled` default), overlaid on an `Exposer` via `with_enabled`, that
   lets a consumer disable a served service live: the gate refuses a disabled service with the same uniform
@@ -24,6 +35,13 @@ so nothing user-facing is lost.
   takes the same uniform refusal as a gate miss.
 
 ### Changed
+- **BREAKING: `Router` replaces the `Registry`/`Services` assembly, and the scheme indirection leaves the
+  public surface.** A route binds a handler by value or parses `name=target`; a bare `<name>:` no longer
+  resolves, and the binary refuses a bad entry before it prints its ready banner. `Echo` and `Forward` are
+  first-party handlers; `RawStream` stays a native target.
+- **The public path is bounded: 32 public sessions and 4 public streams.** The pool is taken where a
+  public session is admitted, refused past the cap with the same uniform refusal a gate miss gives, never
+  queued, and released on close, so a stranger flood cannot starve members.
 - **A credential moves only over a transport that proves the peer.** A request that presents a capability
   or a membership badge is refused before its first byte when the session's declared profile does not prove
   the peer; a rooted admission refuses such a session before minting a witness; and a rooted exposer
@@ -40,11 +58,15 @@ so nothing user-facing is lost.
   and the compile-time refusal are unchanged.
 
 ### Fixed
+- **The binary's identity file fails closed and writes atomically.** A present key file that does not
+  decode is an error, never silently replaced by a fresh key; the write stages a sibling temp, fsyncs, and
+  renames over the target, so a crash leaves the old key or the complete new one, and a group- or
+  world-readable file is refused.
 - **Diagnostics no longer ride stdout.** The binary's tracing subscriber writes to stderr, so a log line
   cannot interleave with a verb's stdout: the `connect --to -` bridge carries the peer's bytes there
   unbroken, and `tree` and banner output stay parseable.
 
-## v0.4.0 - 2026-09-05
+## v0.4.0
 
 ### New
 - **The `Handler` trait.** A named service is any type that consumes one admitted stream, injected through
