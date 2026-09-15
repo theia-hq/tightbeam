@@ -220,7 +220,7 @@ mints, shares, and revokes `sheer:` links. It registers no `Handler` of its own,
 shell, say) is something a library embedder adds in code. On its own the binary already covers forwarding,
 raw streams, and an ssh `ProxyCommand`.
 
-## The honest limit
+## The limit
 
 A capability is a bearer token: whoever holds an unexpired, un-revoked one gets that one service until it
 expires or you revoke it. A device-bound or signet-bound link narrows that (a copy alone grants no one), and
