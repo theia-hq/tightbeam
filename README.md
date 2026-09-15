@@ -100,7 +100,7 @@ to strangers is a deliberate second step, `.public(names)` (a safe handler opene
 `.expose()` proves before the node serves it. A handler that declares itself closed (`Never`: a keyless
 shell) is refused when the proof is prepared, and a raw byte source (`file:`/`fifo:`/`stdin:`) is
 redirected to the distinct, louder `.public_unsafe(names)` opt-in. `.parse(&["web=127.0.0.1:8080".into()])`
-absorbs the `name=addr` grammar; a bare `<name>:` no longer resolves, since handlers bind by value. The
+absorbs the `name=target` grammar; a bare `<name>:` no longer resolves, since handlers bind by value. The
 `CancellationToken` is the node's teardown handle: a caller may hold a clone and fire it to stop the accept
 loop.
 

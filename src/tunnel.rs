@@ -212,7 +212,7 @@ impl Route {
 struct Services(HashMap<String, Route>);
 
 impl Services {
-    /// Parse `name=addr` service entries into a fresh table; every entry must name its service. `echo:` is
+    /// Parse `name=target` service entries into a fresh table; every entry must name its service. `echo:` is
     /// the built-in loopback reflector, a `host:port` / `unix:<path>` a local forward, and `file:<path>` /
     /// `fifo:<path>` / `stdin:` a raw-stream source. A bare `<scheme>:` no longer resolves: handlers are
     /// bound by value through [`Router::service`], so the scheme namespace is a teaching error.
@@ -223,14 +223,14 @@ impl Services {
         Ok(services)
     }
 
-    /// Parse `name=addr` entries INTO this table (the [`Router::parse`] path): the same grammar and the same
+    /// Parse `name=target` entries INTO this table (the [`Router::parse`] path): the same grammar and the same
     /// one duplicate policy as every other bind, refused with a teaching message.
     fn extend_parse(&mut self, entries: &[String]) -> eyre::Result<()> {
         let Self(services) = self;
         for entry in entries {
             let Some((name, addr)) = entry.split_once('=') else {
                 eyre::bail!(
-                    "`{entry}` names no service. Every serve entry must be `name=addr`, e.g. \
+                    "`{entry}` names no service. Every serve entry must be `name=target`, e.g. \
                      `web=127.0.0.1:8080`, `logs=file:/var/log/app.log`"
                 );
             };
@@ -253,7 +253,7 @@ impl Services {
     }
 
     /// Add a handler-target service under `name`, bound to the handler VALUE (constructed directly rather
-    /// than through the addr grammar, so a caller holding per-service state, an origin scope, a sink
+    /// than through the target grammar, so a caller holding per-service state, an origin scope, a sink
     /// directory, binds one instance per served name and no scheme namespace is needed). The `name` is
     /// validated through the [`Service`] domain type; a duplicate `name` is refused. The Router wires the
     /// same insert through its typed verbs; this is the test-facing shape.
@@ -864,7 +864,7 @@ impl Router {
         self.bind(name, Target::RawStream(source), Access::Family)
     }
 
-    /// Absorb the `name=addr` serve grammar: `echo:` is the built-in reflector, a `host:port` /
+    /// Absorb the `name=target` serve grammar: `echo:` is the built-in reflector, a `host:port` /
     /// `unix:<path>` a local forward, and `file:<path>` / `fifo:<path>` / `stdin:` a raw-stream source. A
     /// bare `<scheme>:` is a teaching error: handlers are bound by value through
     /// [`service`](Self::service), so the scheme namespace does not survive the merge.
@@ -2686,12 +2686,12 @@ mod tests {
 
     #[test]
     fn a_bare_service_name_is_rejected_with_a_hint() {
-        // Every serve entry must be `name=addr`; a bare entry names no service and fails at parse.
+        // Every serve entry must be `name=target`; a bare entry names no service and fails at parse.
         let Err(err) = Services::parse(&["web".to_owned()]) else {
             panic!("bare `web` should be rejected, not served");
         };
         assert!(
-            err.to_string().contains("name=addr"),
+            err.to_string().contains("name=target"),
             "the error should teach the grammar: {err}"
         );
     }
@@ -2703,7 +2703,7 @@ mod tests {
             panic!("bare `ping:` should be rejected, not served");
         };
         assert!(
-            err.to_string().contains("name=addr"),
+            err.to_string().contains("name=target"),
             "the error should teach the grammar: {err}"
         );
     }
@@ -4133,7 +4133,7 @@ mod tests {
             dup.is_err(),
             "a second bind under one name must be refused, never silently overwrite"
         );
-        // A parsed `name=addr` entry colliding with a bound handler is the same policy at the same door.
+        // A parsed `name=target` entry colliding with a bound handler is the same policy at the same door.
         let through_parse = Router::new(Gate::Open)
             .service(svc("web"), OpenNoop)
             .expect("first bind")
@@ -4146,7 +4146,7 @@ mod tests {
         let Err(error) = Router::new(Gate::Open)
             .parse(&["web=127.0.0.1:80".to_owned(), "web=127.0.0.1:81".to_owned()])
         else {
-            panic!("a duplicate `name=addr` entry must be refused");
+            panic!("a duplicate `name=target` entry must be refused");
         };
         assert!(
             error.to_string().contains("already defined"),
@@ -4995,7 +4995,7 @@ mod tests {
 
     /// The Router's typed verbs bind one table and the one terminal proof: a bound handler, the built-in
     /// forward, and the built-in reflector all serve from one catalog after `.expose()`, and `parse` absorbs
-    /// the `name=addr` addresses alongside them.
+    /// the `name=target` entries alongside them.
     #[test]
     fn a_router_binds_every_verb_and_proves_at_expose() {
         let exposer = Router::new(Gate::Open)
@@ -5006,7 +5006,7 @@ mod tests {
             .echo(svc("demo"))
             .expect("echo binds")
             .parse(&["db=unix:/run/db.sock".to_owned()])
-            .expect("parse absorbs the addr grammar")
+            .expect("parse absorbs the target grammar")
             .expose()
             .expect("an open gate over OptIn handlers and forwards proves");
         let manifest = exposer.manifest();
