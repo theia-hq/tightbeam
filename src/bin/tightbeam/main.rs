@@ -132,14 +132,14 @@ async fn run() -> eyre::Result<()> {
             // Load tightbeam's own denylist here in the adapter and pass it as a value; the core takes the
             // loaded list, never a path (the same interface any richer consumer drives on its own store).
             let denylist = FileDenylist::load(revoked_path()?).await?;
-            let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
+            let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr, BindRole::Serving).await?;
             let outcome = run_until_signalled(cmd.run(&node, signet, denylist)).await;
             node.close().await;
             outcome
         }
         Command::Connect(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
-            let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr).await?;
+            let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr, BindRole::Dialing).await?;
             let outcome = run_until_signalled(cmd.run(&node)).await;
             node.close().await;
             outcome
@@ -160,6 +160,15 @@ async fn run_until_signalled(verb: impl Future<Output = eyre::Result<()>>) -> ey
     }
 }
 
+/// Which side of the conversation this bind serves: `expose` publishes the node's address record for
+/// dialers; `connect` only resolves and must not overwrite a live node's record with its own short-lived
+/// one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindRole {
+    Serving,
+    Dialing,
+}
+
 /// Bind the overlay node under the persisted secret. The one place a concrete transport is named;
 /// everything else speaks `bifrost`. Binding under the same secret the cap identity roots at is what
 /// makes a minted cap verify against the identity peers dial.
@@ -168,6 +177,7 @@ async fn bind_node(
     peers: Vec<Peer>,
     offline: bool,
     bind_addr: Option<SocketAddr>,
+    role: BindRole,
 ) -> eyre::Result<Node<Endpoint, Discovery>> {
     // Offline (implied by a fixed --bind-addr) binds iroh's minimal preset: no n0, no relays, reachable
     // only via the --peer hints below. Otherwise bind under n0 discovery, with hints as a direct-path
@@ -176,7 +186,10 @@ async fn bind_node(
         let addr = bind_addr.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
         Endpoint::bind_offline(secret.into_bytes(), addr).await?
     } else {
-        Endpoint::bind_with_secret(secret.into_bytes()).await?
+        match role {
+            BindRole::Serving => Endpoint::bind_reachable_with_secret(secret.into_bytes()).await?,
+            BindRole::Dialing => Endpoint::bind_dialing_with_secret(secret.into_bytes()).await?,
+        }
     };
     // Compose local discovery (--peer hints + LAN mDNS) so a nearby peer is reached directly; under n0
     // it keeps the internet as the fallback for a remote peer with no local hint.
