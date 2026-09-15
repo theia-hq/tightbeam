@@ -25,8 +25,8 @@ use tightbeam::tunnel::{
 /// anyone, unauthenticated.
 #[derive(Debug, Args)]
 pub struct ExposeCmd {
-    /// expose local services as `name=addr` (every entry must be `name=addr`)
-    #[arg(required = true, value_name = "name=addr")]
+    /// expose local services as `name=target`
+    #[arg(required = true, value_name = "name=target")]
     pub services: Vec<String>,
     /// open the WHOLE node to anyone, unauthenticated (the one opt-out from the signet)
     // CLI-Architect round-3 (Ruling 2): tightbeam's `--public` stays a whole-node BOOLEAN (the library
@@ -85,7 +85,7 @@ impl ExposeCmd {
         } else {
             tunnel::resolve_gate(signet, denylist)?
         };
-        // Assemble the one route table: the `name=addr` grammar absorbs the raw primitives (a local forward,
+        // Assemble the one route table: the `name=target` grammar absorbs the raw primitives (a local forward,
         // or a `file:`/`fifo:`/`stdin:` raw-stream source; a bare `<scheme>:` is a teaching error now that
         // handlers bind by value). The bin is the ONLY place the `--public-unsafe` flag string becomes the
         // typed name set. `.expose()` is the one proof door: a raw stream under the whole-node open gate is
