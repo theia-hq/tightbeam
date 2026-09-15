@@ -2,6 +2,15 @@
 
 All notable changes to tightbeam, newest first.
 
+## v0.5.1
+
+A dial-only `connect` no longer overwrites the address record a live `expose` node published.
+
+### Fixed
+- **The dialing bind publishes nothing.** `connect` binds under n0 discovery without the address-record
+  publisher, so a short-lived client process cannot replace a serving node's relay path with its own; the
+  role is chosen per verb (`expose` serves and publishes, `connect` dials and resolves only).
+
 ## v0.5.0
 
 One route table, a handler contract that carries its exposure as a type, and a refusal the client matches
