@@ -132,14 +132,28 @@ async fn run() -> eyre::Result<()> {
             // Load tightbeam's own denylist here in the adapter and pass it as a value; the core takes the
             // loaded list, never a path (the same interface any richer consumer drives on its own store).
             let denylist = FileDenylist::load(revoked_path()?).await?;
-            let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr, BindRole::Serving).await?;
+            let node = bind_node(
+                secret,
+                cli.peer,
+                cli.offline,
+                cli.bind_addr,
+                BindRole::Serving,
+            )
+            .await?;
             let outcome = run_until_signalled(cmd.run(&node, signet, denylist)).await;
             node.close().await;
             outcome
         }
         Command::Connect(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
-            let node = bind_node(secret, cli.peer, cli.offline, cli.bind_addr, BindRole::Dialing).await?;
+            let node = bind_node(
+                secret,
+                cli.peer,
+                cli.offline,
+                cli.bind_addr,
+                BindRole::Dialing,
+            )
+            .await?;
             let outcome = run_until_signalled(cmd.run(&node)).await;
             node.close().await;
             outcome
