@@ -2,6 +2,25 @@
 
 All notable changes to tightbeam, newest first.
 
+## Unreleased
+
+### Fixed
+- **A disabled service is checked after admission, not before.** The enabled oracle ran ahead of the
+  gate, so a stranger could tell a disabled name from a gated one by timing; it now runs after the gate
+  admits, and both refuse on the same uniform class.
+- **A `fifo:+lossy` source re-arms.** A failed first open (the path absent) left the source disarmed for
+  every later dial; it now retries the open on the next consumer, and a session whose pump has ended
+  re-opens the FIFO for the next one instead of refusing until restart. `stdin:+lossy` stays one
+  session, as documented.
+- **A lagging `+lossy` consumer is reported.** The host log warns once per lapse with the dropped-byte
+  count, and the shared ring evicts the slowest cursor before it grows, so a stalled reader cannot hold
+  bytes the feed has moved past.
+
+### Changed
+- **The public stream pool is pinned by test.** Four connected public streams fill the node-wide pool on
+  any mix of public services; the fifth is refused on the uniform class and a released slot admits the
+  next.
+
 ## v0.5.1
 
 A dial-only `connect` no longer overwrites the address record a live `expose` node published.

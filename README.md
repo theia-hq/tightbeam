@@ -187,10 +187,17 @@ is one of:
 
 - a `host:port` or `unix:<path>`, spliced to a local address: the built-in `Forward` service;
 - a `file:<path>` or `fifo:<path>` (a path's raw bytes sourced to the peer), or `stdin:` (whatever a
-  producer pipes in). A `stdin:` or `fifo:` source serves ONE consumer by default; `+lossy` opts it into
-  fan-out to many, dropping bytes for any consumer that falls behind (a live feed, never exact bytes: a
-  dropped byte in a `tar` is silent corruption, so `+lossy` is refused on any other scheme and under an open
-  gate);
+  producer pipes in). A `stdin:` or `fifo:` source serves ONE consumer by default (`stdin:` refuses a
+  later dial; two concurrent `fifo:` dials split its bytes); `+lossy` opts it into fan-out to many,
+  dropping bytes for any consumer that falls behind. Only `stdin:` and `fifo:` sources take `+lossy`.
+  A `+lossy` source serves a live feed, never exact bytes: a dropped byte in a `tar` is silent corruption.
+  `--public` alone refuses a raw source: `--public-unsafe` names the raw sources the open gate may
+  serve. A lagging consumer loses bytes with no marker on the wire; the host log warns once per lapse,
+  with the dropped-byte count. One 1 MiB ring per source, shared by every consumer, covers 4.19 s of a
+  2 Mbps feed (0.52 s at 16 Mbps); the transport buffers about 1.1 MiB more per stream over iroh. A
+  `fifo:+lossy` source re-opens for the next consumer. A `stdin:+lossy` source is one session, ever:
+  once its last consumer leaves, the session is over, and later dials are refused until the node restarts
+  (on a `--public-unsafe` service, a stranger connecting and leaving can end the feed);
 - a named `Handler` you bound with `.service(name, handler)` (a shell, or any code that consumes one
   admitted stream).
 
