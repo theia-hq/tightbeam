@@ -8,6 +8,7 @@ resolver = "3"
 [package]
 publish = false  # git-only for now, not published to crates.io
 name = "tightbeam"
+description = "Named services behind one gate, reached by public key: a router, a connector, and the wire between them."
 version = "0.5.1"
 edition = "2024"
 rust-version = "1.85"

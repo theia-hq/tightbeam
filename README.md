@@ -1,18 +1,30 @@
 # tightbeam
 
-Reach a service on a machine by its public key, prove you belong at its gate, and get a raw bidirectional
-byte stream to it, over any transport and across any NAT. That is the whole of tightbeam: one primitive, a
-forwarded stream to a service someone named, addressed by key rather than by host and port.
+A node serves named services behind one gate, addressed by its public key. Another machine that holds the
+key and passes the gate gets a raw byte stream to the one service it asked for, and nothing else. Anything
+that speaks over a TCP port or a Unix socket rides it unchanged; a handler you write serves anything else.
+No port forwarding, no VPN, no public IP.
 
-A machine exposes local services under its public key, each behind a gate. Another machine, holding the key
-and passing the gate, reaches one service and gets a plain byte stream to it. Anything that speaks over a
-TCP port or a Unix socket rides it unchanged. No port forwarding, no VPN, no public IP.
+tightbeam is a Rust library you embed. A `Router` binds each name to a service and proves the node once at
+`expose()`; a `Connector` reaches one service on a peer and hands back the stream.
 
-tightbeam is a Rust library you embed. You build a `Router` to serve services behind a gate, or a
-`Connector` to reach one and get a stream back. It ships only its own built-ins (`echo:`, forwards, raw
-streams) and prints nothing: the program that embeds it supplies the other services, the identity, and
-the output. The keyed connection underneath is [bifrost](https://github.com/theia-hq/bifrost)'s; who may
-pass a gate is [nauthy](https://github.com/theia-hq/nauthy)'s.
+```rust
+use tightbeam::tunnel::Router;
+
+let node = Router::new(gate)                        // one gate in front of every route
+    .service("ssh".parse()?, Sshd::new(host_seed))? // a handler you import; never opens
+    .forward("web".parse()?, "127.0.0.1:8080")?     // a local port, spliced
+    .echo("demo".parse()?)?                         // a built-in
+    .public(["demo".parse()?])                      // opened to anyone, by name
+    .expose()?;                                     // proves every route before it serves
+node.run(&bifrost_node, cancel).await?;
+```
+
+It prints nothing and ships only its own built-ins (`echo:`, forwards, raw streams): the program that
+embeds it supplies the identity, the other services, and the output. The keyed connection underneath is
+[bifrost](https://github.com/theia-hq/bifrost)'s; who may pass a gate is
+[nauthy](https://github.com/theia-hq/nauthy)'s; the engines a node commonly serves are in
+[services](https://github.com/theia-hq/services).
 
 > Experimental. Works for TCP over the iroh transport; not ready for production use.
 
@@ -22,14 +34,13 @@ Git-only for now, not published to crates.io. Point at the repo:
 
 ```toml
 [dependencies]
-tightbeam = { git = "https://github.com/theia-hq/tightbeam", tag = "v0.4.0" }
+tightbeam = { git = "https://github.com/theia-hq/tightbeam", tag = "v0.5.1" }
 ```
 
-A service crate that implements the contract without the rest of tightbeam can depend on
-`tightbeam-handler` directly: the `Handler` trait, the `Never`/`OptIn` markers, and the proofs, with no
-backends and no binary. The crate is new since v0.4.0, so until the next release pin a git dependency on
-the repo (`tightbeam-handler = { git = "https://github.com/theia-hq/tightbeam" }`). `tightbeam`
-re-exports the same author-facing items at their original paths.
+A service crate that implements the contract without the rest of tightbeam depends on `tightbeam-handler`
+alone: the `Handler` trait, the `Never`/`OptIn` markers, and the served proof, with no backends and no
+binary (`tightbeam-handler = { git = "https://github.com/theia-hq/tightbeam", tag = "v0.5.1" }`).
+`tightbeam` re-exports the same items at their original paths.
 
 You also depend on `bifrost` (to bind an overlay node) and `nauthy` (to build the gate and mint
 capabilities). Three runnable examples show the whole library, no network needed (`cargo run --example
@@ -187,17 +198,12 @@ is one of:
 
 - a `host:port` or `unix:<path>`, spliced to a local address: the built-in `Forward` service;
 - a `file:<path>` or `fifo:<path>` (a path's raw bytes sourced to the peer), or `stdin:` (whatever a
-  producer pipes in). A `stdin:` or `fifo:` source serves ONE consumer by default (`stdin:` refuses a
-  later dial; two concurrent `fifo:` dials split its bytes); `+lossy` opts it into fan-out to many,
-  dropping bytes for any consumer that falls behind. Only `stdin:` and `fifo:` sources take `+lossy`.
-  A `+lossy` source serves a live feed, never exact bytes: a dropped byte in a `tar` is silent corruption.
-  `--public` alone refuses a raw source: `--public-unsafe` names the raw sources the open gate may
-  serve. A lagging consumer loses bytes with no marker on the wire; the host log warns once per lapse,
-  with the dropped-byte count. One 1 MiB ring per source, shared by every consumer, covers 4.19 s of a
-  2 Mbps feed (0.52 s at 16 Mbps); the transport buffers about 1.1 MiB more per stream over iroh. A
-  `fifo:+lossy` source re-opens for the next consumer. A `stdin:+lossy` source is one session, ever:
-  once its last consumer leaves, the session is over, and later dials are refused until the node restarts
-  (on a `--public-unsafe` service, a stranger connecting and leaving can end the feed);
+  producer pipes in). A `stdin:` or `fifo:` source serves one consumer at a time. `stdin:+lossy` or
+  `fifo:<path>+lossy` fans it out to many, dropping bytes for a consumer that falls behind: a live feed,
+  never exact bytes (a dropped byte in a `tar` is silent corruption), with the host log noting each
+  lapse. A `fifo:+lossy` source re-opens for the next consumer; a `stdin:+lossy` source is one session,
+  over for good once its last consumer leaves. A raw source opens to anyone only through
+  `--public-unsafe`;
 - a named `Handler` you bound with `.service(name, handler)` (a shell, or any code that consumes one
   admitted stream).
 
