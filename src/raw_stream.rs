@@ -127,9 +127,11 @@ impl Stdin {
 /// shared bounded ring in [`crate::raw_stream_fanout`]. The underlying source is opened lazily (on the first
 /// consumer) because a `fifo:` open is async and fallible and must not run until someone actually connects;
 /// the [`Opener`] is what to open. Once opened, the [`Fanout`] is memoized, so every later consumer attaches
-/// to the SAME ring. The lazy-open transition is behind a `tokio::sync::Mutex` so "first consumer opens, the
-/// rest attach" is a single critical section; the banner-facing [`RawSource`] is recorded ALONGSIDE it at
-/// construction so a manifest read needs no async lock (and stays valid after the opener is taken).
+/// to the SAME ring. A `fifo:` session that ends (its pump exited) re-arms for the next consumer, matching
+/// plain `fifo:` re-open-per-dial; a `stdin:` session is one session, ever (fd 0 cannot rewind). The
+/// lazy-open transition is behind a `tokio::sync::Mutex` so "first consumer opens, the rest attach" is a
+/// single critical section; the banner-facing [`RawSource`] is recorded ALONGSIDE it at construction so a
+/// manifest read needs no async lock (and stays valid after the opener is taken).
 #[derive(Clone)]
 struct Lossy {
     source: RawSource,
@@ -139,8 +141,13 @@ struct Lossy {
 /// The lazy-open state of a [`Lossy`] source: what to open on the first consumer, then the memoized fan-out.
 struct LossyState {
     /// How to open the underlying source, taken once by the first consumer. `None` once opened (the fan-out
-    /// owns the reader now) or once a `stdin:` session ran to completion (non-rewindable, never re-armed).
+    /// owns the reader now) or once a `stdin:` session ran to completion (non-rewindable, never re-armed). A
+    /// `fifo:` session restores this when it ends, so the next consumer starts a fresh session (see `fifo`).
     opener: Option<Opener>,
+    /// The `fifo:` path a new session re-opens after the last one ended (`None` for a `stdin:`/test reader,
+    /// which is one session, ever). Retained beside `opener` because `opener` is cleared when a session arms;
+    /// the path must survive to re-arm, exactly like the plain `fifo:` open-per-dial contract.
+    fifo: Option<PathBuf>,
     /// The shared fan-out, present once the source has been opened. Every consumer after the first attaches to
     /// this same ring.
     fanout: Option<Fanout>,
@@ -164,15 +171,22 @@ impl core::fmt::Debug for Lossy {
 impl Lossy {
     fn new(opener: Opener) -> Self {
         // Record the banner-facing source before the opener is moved into the shared state: a `fifo:+lossy`
-        // names its absolute path, a `stdin:+lossy` (or a test reader) names the piped-stdin marker.
+        // names its absolute path, a `stdin:+lossy` (or a test reader) names the piped-stdin marker. The
+        // `fifo:` path is ALSO kept separately: the opener is cleared when a session arms, and the path must
+        // survive to re-arm a new session when that one ends (A-2).
         let source = match &opener {
             Opener::Fifo(path) => RawSource::Path(absolute_display(path)),
             Opener::Ready(_) => RawSource::Stdin,
+        };
+        let fifo = match &opener {
+            Opener::Fifo(path) => Some(path.clone()),
+            Opener::Ready(_) => None,
         };
         Self {
             source,
             state: std::sync::Arc::new(tokio::sync::Mutex::new(LossyState {
                 opener: Some(opener),
+                fifo,
                 fanout: None,
             })),
         }
@@ -180,26 +194,58 @@ impl Lossy {
 
     /// Attach a consumer: on the first, open the underlying source (a `fifo:` under the guards, or take the
     /// ready reader) and arm the shared fan-out; on every later consumer, attach to the same ring. A cursor is
-    /// returned as a [`BoxRead`]. Refuses if the source already ran to completion and closed (a non-rewindable
-    /// `stdin:+lossy` session): there is nothing left to attach to.
+    /// returned as a [`BoxRead`]. A `fifo:` source whose session ended re-arms here (a fresh open, up to the
+    /// full writer-wait); a non-rewindable `stdin:+lossy` session that ended refuses: there is nothing left
+    /// to attach to.
+    ///
+    /// The opener is a PEEK-AND-COMMIT, never a take: a `fifo:` open is async and fallible, so the path
+    /// crosses the await as a clone and the armed opener is cleared only on success. A failed (or cancelled)
+    /// attempt therefore leaves the source armed for the next consumer instead of disarming it for good, and
+    /// the next consumer reports its OWN attempt's outcome (the open error, never a stale "not armed").
+    /// Retries serialize on this mutex, one attempt at a time: each gets the full writer-wait and a fresh
+    /// raw-open permit, exactly like a first dial, so N concurrent first dials against a writer-less FIFO
+    /// cost N writer-waits with N raw-open permits held for the batch (bounded by `RAW_STREAM_OPEN_TIMEOUT`
+    /// and `RAW_STREAM_OPEN_PERMITS`, which are the existing bounds; no backoff, no attempt counter).
     async fn open(&self) -> eyre::Result<BoxRead> {
         let mut state = self.state.lock().await;
-        // First consumer: open the source and arm the fan-out. The `fifo:` open is async and fallible, so a
-        // failure here is returned as a clean refusal, never a half-armed fan-out.
-        if let Some(opener) = state.opener.take() {
-            let reader = match opener {
-                Opener::Fifo(path) => open_path(path.clone(), Kind::Fifo).await?,
-                Opener::Ready(reader) => reader,
-            };
-            state.fanout = Some(Fanout::new(reader));
-        }
-        let fanout = state
-            .fanout
-            .as_ref()
-            .ok_or_else(|| eyre::eyre!("lossy source not armed"))?;
-        match fanout.open() {
-            Some(cursor) => Ok(Box::new(cursor)),
-            None => eyre::bail!("this lossy source's live session has ended"),
+        loop {
+            // First consumer (or the first of a re-armed `fifo:` session): open the source and arm the
+            // fan-out. A `fifo:` failure returns as a clean refusal with the opener still armed; a `Ready`
+            // reader cannot fail, so it is taken once and never restored.
+            if state.fanout.is_none() {
+                // Peek the `fifo:` path out as a CLONE; the opener itself stays armed until the open
+                // returns `Ok`, so a failed or cancelled attempt never disarms the source (A-1).
+                let path = if let Some(Opener::Fifo(path)) = &state.opener {
+                    Some(path.clone())
+                } else {
+                    None
+                };
+                if let Some(path) = path {
+                    let reader = open_path(path, Kind::Fifo).await?;
+                    state.opener = None;
+                    state.fanout = Some(Fanout::new(reader));
+                } else if let Some(Opener::Ready(reader)) = state.opener.take() {
+                    state.fanout = Some(Fanout::new(reader));
+                }
+            }
+            let fanout = state
+                .fanout
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("lossy source not armed"))?;
+            match fanout.open() {
+                Some(cursor) => return Ok(Box::new(cursor)),
+                // The memoized fan-out's session ended (its pump exited). A `fifo:` re-arms: drop the
+                // finished fan-out, restore the opener, and loop to open a fresh session. A `stdin:` (or a
+                // test reader) cannot rewind: refuse, as documented.
+                None => match &state.fifo {
+                    Some(path) => {
+                        let path = path.clone();
+                        state.fanout = None;
+                        state.opener = Some(Opener::Fifo(path));
+                    }
+                    None => eyre::bail!("this lossy source's live session has ended"),
+                },
+            }
         }
     }
 }
@@ -739,13 +785,18 @@ mod tests {
     /// Make a fresh scratch FIFO with `mkfifo`, cleaned by the caller.
     fn scratch_fifo(tag: &str) -> std::path::PathBuf {
         let path = scratch(tag);
-        let mut c_path = path.clone().into_os_string().into_encoded_bytes();
+        mkfifo_at(&path);
+        path
+    }
+
+    /// `mkfifo` at `path`, failing the test if it cannot. Mode 0600: scratch, this process only.
+    fn mkfifo_at(path: &std::path::Path) {
+        let mut c_path = path.to_path_buf().into_os_string().into_encoded_bytes();
         c_path.push(0);
         // SAFETY: `c_path` is a NUL-terminated C string that outlives the call; a failed `mkfifo` returns -1
-        // and the assert fails. Mode 0600: scratch, this process only.
+        // and the assert fails.
         let rc = unsafe { libc::mkfifo(c_path.as_ptr().cast::<libc::c_char>(), 0o600) };
         assert_eq!(rc, 0, "mkfifo {} failed", path.display());
-        path
     }
 
     /// (a) `file:` to a regular file sources its exact bytes.
@@ -964,6 +1015,292 @@ mod tests {
         let mut got = Vec::new();
         source.read_to_end(&mut got).await.expect("read the stream");
         assert_eq!(got, body, "a FIFO with a writer streams its exact bytes");
+
+        let _ = std::fs::remove_file(&fifo);
+    }
+
+    /// A-1 (wedge pin): a failed first `fifo:` open must not consume the opener. The first open over a
+    /// missing path fails with the open error, and a second open must fail with the SAME open error (the
+    /// path is still absent), never the disarm message. Red on the shipped code, where the opener was taken
+    /// before the fallible open, so the second open read "lossy source not armed" for the life of the node.
+    #[tokio::test]
+    async fn lossy_fifo_failed_first_open_leaves_the_source_retryable() {
+        let path = scratch("lossy-missing");
+        let stream = RawStream::fifo(&path.to_string_lossy(), "cam=fifo:x+lossy", true)
+            .expect("parse fifo:+lossy");
+        let Err(first) = stream.open().await else {
+            panic!("an absent path must refuse the first open");
+        };
+        assert!(
+            first.to_string().contains("cannot open"),
+            "the first refusal names the open failure: {first}"
+        );
+        let Err(second) = stream.open().await else {
+            panic!("the path is still absent, so the retry must refuse too");
+        };
+        assert!(
+            second.to_string().contains("cannot open"),
+            "the retry re-attempts the open rather than reading a disarmed source: {second}"
+        );
+        assert!(
+            !second.to_string().contains("not armed"),
+            "a failed open must leave the source armed for the next consumer: {second}"
+        );
+    }
+
+    /// A-1 (fail-then-writer pin): after a failed first open, creating the FIFO and connecting a writer lets
+    /// the NEXT consumer open the source and receive exactly the bytes written. The service is not disarmed
+    /// by the failed attempt; the bytes, not only an `Ok`, are pinned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lossy_fifo_first_open_failure_then_a_writer_streams() {
+        let path = scratch("lossy-then-fifo");
+        let stream = RawStream::fifo(&path.to_string_lossy(), "cam=fifo:x+lossy", true)
+            .expect("parse fifo:+lossy");
+        let Err(first) = stream.open().await else {
+            panic!("an absent path must refuse the first open");
+        };
+        assert!(
+            first.to_string().contains("cannot open"),
+            "the first refusal names the open failure: {first}"
+        );
+
+        // The operator's benign sequence: the FIFO appears (and a writer connects) after the refusal.
+        mkfifo_at(&path);
+        let body = b"the writer arrives after the first refusal";
+        let writer_path = path.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .and_then(|mut f| f.write_all(body))
+                .expect("write into the FIFO");
+        });
+
+        let mut source = stream
+            .open()
+            .await
+            .expect("the retry opens the FIFO with its writer");
+        writer.await.expect("writer task");
+        let mut got = Vec::new();
+        source
+            .read_to_end(&mut got)
+            .await
+            .expect("read the retried session");
+        assert_eq!(
+            got, body,
+            "the retried session streams the writer's exact bytes"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A-1 (the Operator's acceptance flow, on the failure mode its run could not reach): the first open
+    /// fails on the writer-wait TIMEOUT, and the service stays retryable: a writer connecting afterwards
+    /// lets the next consumer open the source and deliver the post-attach bytes. The ENOENT variant is
+    /// pinned next door (`lossy_fifo_first_open_failure_then_a_writer_streams`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_first_lossy_open_does_not_disarm_the_service() {
+        let fifo = scratch_fifo("lossy-timeout");
+        let stream = RawStream::fifo(&fifo.to_string_lossy(), "cam=fifo:x+lossy", true)
+            .expect("parse fifo:+lossy");
+
+        // Hold the shared writer-wait lock so the flood test's long wait cannot race this shrink, and
+        // restore the production wait (dropping the guard) BEFORE the writer arrives below.
+        let lock = super::WRITER_WAIT_TEST_LOCK.lock().await;
+        let short = super::set_writer_wait_timeout_for_test(100);
+        let Err(first) = stream.open().await else {
+            panic!("a writer-less FIFO must refuse the first open");
+        };
+        assert!(
+            first.to_string().contains("timed out"),
+            "the refusal names the writer-wait timeout: {first}"
+        );
+        drop(short);
+
+        let body = b"post-attach bytes after a timed-out first open";
+        let writer_path = fifo.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .and_then(|mut f| f.write_all(body))
+                .expect("write into the FIFO");
+        });
+
+        let mut source = stream
+            .open()
+            .await
+            .expect("the retry opens with the writer present");
+        writer.await.expect("writer task");
+        let mut got = Vec::new();
+        source
+            .read_to_end(&mut got)
+            .await
+            .expect("read the retried session");
+        assert_eq!(
+            got, body,
+            "a timed-out first open leaves the service armed for the next consumer"
+        );
+        drop(lock);
+
+        let _ = std::fs::remove_file(&fifo);
+    }
+
+    /// A-2 (served-path pin): a zero-consumer instant on a served `fifo:+lossy` source does not refuse the
+    /// next consumer. Consumer 1 attaches and drains a priming byte, then drops while the FIFO writer is
+    /// still connected, holding the session live (the pump parked); consumer 2 attaches to the SAME live
+    /// session and receives exactly the bytes written after it attached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_zero_consumer_instant_does_not_refuse_the_served_lossy_fifo() {
+        let fifo = scratch_fifo("lossy-live");
+        let stream = RawStream::fifo(&fifo.to_string_lossy(), "cam=fifo:x+lossy", true)
+            .expect("parse fifo:+lossy");
+
+        // A writer that stays connected across the zero-consumer instant: it primes one byte, then waits
+        // for the test's signal before writing the body, so consumer 2 attaches to a live, idle session.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let body = b"post-attach bytes on the live session";
+        let writer_path = fifo.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .expect("open the FIFO for write");
+            file.write_all(b"p").expect("prime the FIFO");
+            rx.recv().expect("wait for the write signal");
+            file.write_all(body).expect("write the body");
+        });
+
+        // Consumer 1: attach, drain the priming byte, leave. The pump is now parked (the writer is idle),
+        // which is exactly the live zero-consumer window that used to end the session for good.
+        let mut first = stream.open().await.expect("the first consumer attaches");
+        let mut prime = [0u8; 1];
+        first
+            .read_exact(&mut prime)
+            .await
+            .expect("drain the priming byte");
+        assert_eq!(&prime, b"p", "the priming byte arrives first");
+        drop(first);
+
+        // Consumer 2 attaches while the session is still live, and receives the post-attach bytes.
+        let mut second = stream
+            .open()
+            .await
+            .expect("a zero-consumer instant must not refuse the next consumer");
+        tx.send(()).expect("signal the writer");
+        let mut got = Vec::new();
+        second
+            .read_to_end(&mut got)
+            .await
+            .expect("read the live session");
+        assert_eq!(
+            got, body,
+            "a consumer attaching to the live session receives the bytes written after it attached"
+        );
+        writer.await.expect("writer task");
+
+        let _ = std::fs::remove_file(&fifo);
+    }
+
+    /// A-2 (the re-arm): after the last consumer leaves and the session has ENDED (the writer closed, the
+    /// pump exited), a fresh consumer starts a NEW session: the `fifo:` is re-opened (waiting for its next
+    /// writer) and streams that writer's bytes. Plain `fifo:` semantics: open per dial, not one session for
+    /// the node's lifetime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lossy_fifo_rearms_a_new_session_after_the_last_consumer_left() {
+        let fifo = scratch_fifo("lossy-rearm");
+        let stream = RawStream::fifo(&fifo.to_string_lossy(), "cam=fifo:x+lossy", true)
+            .expect("parse fifo:+lossy");
+
+        // Session 1: a writer connects, streams its body, and closes; the consumer drains to EOF.
+        let body1 = b"first session";
+        let writer_path = fifo.clone();
+        let writer1 = tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .and_then(|mut f| f.write_all(body1))
+                .expect("write body 1");
+        });
+        let mut first = stream.open().await.expect("the first session opens");
+        writer1.await.expect("writer 1 task");
+        let mut got1 = Vec::new();
+        first
+            .read_to_end(&mut got1)
+            .await
+            .expect("drain the first session");
+        assert_eq!(got1, body1, "the first session streams body 1");
+        drop(first);
+
+        // Session 2: a later consumer re-arms the `fifo:` and gets the next writer's bytes.
+        let body2 = b"second session";
+        let writer_path = fifo.clone();
+        let writer2 = tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .and_then(|mut f| f.write_all(body2))
+                .expect("write body 2");
+        });
+        let mut second = stream
+            .open()
+            .await
+            .expect("a `fifo:+lossy` source re-arms after its session ended");
+        writer2.await.expect("writer 2 task");
+        let mut got2 = Vec::new();
+        second
+            .read_to_end(&mut got2)
+            .await
+            .expect("read the re-armed session");
+        assert_eq!(got2, body2, "the re-armed session streams body 2");
+
+        let _ = std::fs::remove_file(&fifo);
+    }
+
+    /// A-2 (the one-shot side): a `stdin:+lossy` (here an in-memory reader) session is one session, ever.
+    /// Draining to EOF and dropping the cursor leaves the next consumer refused ("live session has ended"):
+    /// fd 0 cannot rewind.
+    #[tokio::test]
+    async fn lossy_stdin_does_not_rearm_after_its_session_ends() {
+        let body: &'static [u8] = b"one stdin session, ever";
+        let stream = RawStream::lossy_from_reader(Box::new(body));
+        let mut first = stream.open().await.expect("the first consumer attaches");
+        let mut got = Vec::new();
+        first.read_to_end(&mut got).await.expect("drain");
+        assert_eq!(got, body, "the session streams its exact bytes");
+        drop(first);
+
+        let Err(err) = stream.open().await else {
+            panic!("a non-rewindable `stdin:+lossy` session must refuse a later consumer");
+        };
+        assert!(
+            err.to_string().contains("live session has ended"),
+            "the refusal names the ended session: {err}"
+        );
+    }
+
+    /// The concurrent-first-dial serialization pin: first dials against a writer-less FIFO serialize on the
+    /// per-source state mutex, and every one reports its OWN open failure (each pays the writer-wait in
+    /// turn), never the disarm message. No queued dial can observe a half-armed source, and a failed attempt
+    /// does not consume the opener out from under the next.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_first_lossy_dials_serialize_behind_one_open() {
+        let fifo = scratch_fifo("lossy-concurrent");
+        let stream = RawStream::fifo(&fifo.to_string_lossy(), "cam=fifo:x+lossy", true)
+            .expect("parse fifo:+lossy");
+
+        let _lock = super::WRITER_WAIT_TEST_LOCK.lock().await;
+        let _short = super::set_writer_wait_timeout_for_test(100);
+        let (first, second) = tokio::join!(stream.open(), stream.open());
+        for (dial, result) in [("first", first), ("second", second)] {
+            let Err(err) = result else {
+                panic!("the {dial} dial found no writer, so it must be refused");
+            };
+            assert!(
+                err.to_string().contains("timed out"),
+                "the {dial} dial reports its own open failure: {err}"
+            );
+        }
 
         let _ = std::fs::remove_file(&fifo);
     }

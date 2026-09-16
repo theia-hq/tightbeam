@@ -5,7 +5,7 @@
 //! NOT a mutation of the running exposer. Instead it mirrors the [`Revocations`](nauthy::Revocations) shape
 //! exactly: a small, node-local set the gate consults per stream, backed by a file another process (an
 //! `enable`/`disable` command) writes. The set here is DISABLED service names; a stream requesting a name in
-//! the set is refused at the same point a revoked capability is, with the same indistinguishable refusal, so a
+//! the set is refused after admission, with the same indistinguishable refusal a gate miss gives, so a
 //! disabled service reads to a dialer exactly like a gated or absent one (no enumeration oracle).
 //!
 //! [`EnabledServices`] is the extension point. It is a synchronous, one-method trait, so a consumer whose state lives in
@@ -27,7 +27,7 @@ use std::time::{Instant, SystemTime};
 use nauthy::Service;
 use tokio::io::AsyncReadExt as _;
 
-/// The enable/disable oracle the exposer consults per inbound stream, right where it consults the gate.
+/// The enable/disable oracle the exposer consults per inbound stream, right after it consults the gate.
 ///
 /// Synchronous by design: admission is synchronous policy, so the enabled check must never require an async
 /// runtime. A consumer whose state lives elsewhere (a database, a live config) implements this over that

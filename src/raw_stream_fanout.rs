@@ -7,19 +7,23 @@
 //!
 //! - **One shared bounded ring PER SOURCE, bounded by BYTES.** A per-consumer ring would be an
 //!   aggregate-memory attack (a flooder pins `ring x N`); there is exactly one [`Ring`] per source, capped at
-//!   [`RING_BYTES`], so a source's memory ceiling is independent of consumer count.
+//!   [`RING_BYTES`] at every instant (the pump evicts the oldest bytes BEFORE it extends), so a source's
+//!   memory ceiling is independent of consumer count.
 //! - **The producer NEVER blocks on a consumer.** The pump appends to the ring and, on overflow, evicts the
 //!   OLDEST bytes (advancing the ring's absolute base) rather than waiting for the slowest reader. A consumer
 //!   that never reads cannot stall the producer or any other consumer.
 //! - **Drop-for-slow, per cursor, local.** A cursor whose position has fallen behind the ring's base (its
 //!   bytes were evicted while it lagged) is force-advanced to the live edge on its next read: it silently
 //!   loses the gap and continues. A lag on consumer A never gaps consumer B (each cursor is independent), and
-//!   the lag is NEVER injected in-band (that would corrupt the exact-content case); it is a local operator log
-//!   only.
+//!   the lag is NEVER injected in-band (that would corrupt the exact-content case): the consumer sees a
+//!   silent discontinuity on the wire, and the host log gets one `warn` per lag episode carrying the
+//!   dropped-byte count (never one per read).
 //! - **Lazy-open on first consumer, shared while >=1, close on the last leaving.** The pump starts when the
 //!   first cursor is handed out and stops when the last cursor drops (the source reader is dropped with it).
-//!   A `stdin:` fan-out is one non-rewindable live session: a late joiner attaches at the live edge, it does
-//!   not replay history.
+//!   The reader is dropped BEFORE the ring is marked closed, so a session that ended can be re-armed without
+//!   ever having two readers of one source: a `fifo:` fan-out serves the next consumer from a fresh open
+//!   (plain `fifo:` semantics), while a `stdin:` fan-out is one non-rewindable session, ever. A late joiner
+//!   attaches at the live edge, it does not replay history.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -34,10 +38,15 @@ use tokio::sync::Notify;
 use crate::tunnel::BoxRead;
 
 /// The shared ring's byte ceiling: the most live bytes buffered for the slowest consumer before older bytes
-/// are dropped. One ring per source, so a source's fan-out memory is at most this regardless of how many
-/// consumers attach (a per-consumer ring would let a flooder pin `RING_BYTES x N`; this is why the ring is
-/// shared). 1 MiB is generous for a live media source (well over a second of most streams) and small enough
-/// that a node serving several fan-out sources stays bounded.
+/// are dropped. One ring per source, so a source's fan-out memory is one ring of at most this many bytes
+/// plus the pump's one [`PUMP_CHUNK`] read buffer, regardless of how many consumers attach (a per-consumer
+/// ring would let a flooder pin `RING_BYTES x N`; this is why the ring is shared). It is a BYTE ceiling,
+/// never a time one: a bursty feed can hold a byte arbitrarily long, so what the ceiling covers at feed
+/// rate `R` is `RING_BYTES/R` (4.19 s at 2 Mbps, 0.52 s at 16 Mbps). A slow consumer's app-visible
+/// staleness adds the transport's OWN buffering, `RING_BYTES/R + S/d` at drain rate `d` (`S` fitted at
+/// 1.04-1.18 MiB from the drain tail against iroh's QUIC window), and under that transport `S > RING_BYTES`,
+/// so the transport term dominates for any consumer staying slower than the feed. 1 MiB is generous for a
+/// live media source and small enough that a node serving several fan-out sources stays bounded.
 const RING_BYTES: usize = 1 << 20;
 
 /// How much the pump reads from the source per iteration. Independent of [`RING_BYTES`]; just the copy
@@ -71,8 +80,8 @@ struct Shared {
 /// and the count of live cursors, which drives lazy-open (0 -> 1 starts the pump) and close-on-last (1 -> 0
 /// drops the source).
 struct Life {
-    /// The source reader, taken by the first consumer to start the pump. `None` once the pump owns it (or the
-    /// fan-out was already run once and closed: a `stdin:` session is non-rewindable, so it never re-arms).
+    /// The source reader, taken by the first consumer to start the pump. `None` once the pump owns it, and
+    /// never put back: one [`Fanout`] is one session (the caller's `fifo:` re-arm builds a fresh `Fanout`).
     source: Option<BoxRead>,
     /// How many cursors are attached. The pump runs while this is >= 1 and stops when it reaches 0.
     consumers: usize,
@@ -86,6 +95,10 @@ pub(crate) struct Cursor {
     /// This cursor's absolute read position (bytes since the source began). Compared against the ring's `base`
     /// to detect a lag: `pos < base` means the bytes between them were dropped while this consumer was slow.
     pos: u64,
+    /// Whether this cursor is inside a lag episode (it fell behind the evicted window and has not caught back
+    /// up to the live edge). Drives the one-`warn`-per-episode log line, so a lagging cursor does not write a
+    /// log line on every `poll_read`.
+    lagged: bool,
     /// The in-flight wake future when this cursor is parked at the live edge, held ACROSS polls so the waker
     /// stays registered. Dropping it on each `Pending` would deregister the waker and lose the wake that
     /// resumes the read; keeping it is what makes the park race-free (interest is registered before the ring
@@ -122,13 +135,23 @@ impl Ring {
     /// Append `bytes` and, if the ring is now over its byte ceiling, DROP the oldest bytes to fit (advancing
     /// `base`). This never blocks and never waits on a consumer: an overflowing ring evicts history, so the
     /// producer's rate is never bounded by the slowest reader.
+    ///
+    /// The eviction runs BEFORE the extend (N1): draining the overflow first holds `buf.len() <= RING_BYTES`
+    /// at every instant, so the sustained ceiling is exactly [`RING_BYTES`], not `RING_BYTES + PUMP_CHUNK`.
+    /// The overflow comes out of the existing buffer first; an append larger than the whole ring is trimmed
+    /// to its newest `RING_BYTES`, and the dropped prefix still advances `base`, so `buf[0]` is always the
+    /// byte at absolute offset `base` (a cursor's position can never be misread as in-window).
     fn append(&mut self, bytes: &[u8]) {
-        self.buf.extend(bytes);
-        if self.buf.len() > RING_BYTES {
-            let overflow = self.buf.len() - RING_BYTES;
-            self.buf.drain(..overflow);
-            self.base += overflow as u64;
+        let overflow = (self.buf.len() + bytes.len()).saturating_sub(RING_BYTES);
+        let from_buffer = overflow.min(self.buf.len());
+        if from_buffer > 0 {
+            self.buf.drain(..from_buffer);
+            self.base += from_buffer as u64;
         }
+        let skipped = overflow - from_buffer;
+        let bytes = &bytes[skipped..];
+        self.base += skipped as u64;
+        self.buf.extend(bytes);
     }
 }
 
@@ -150,19 +173,30 @@ impl Fanout {
     /// first consumer. A late joiner attaches at the current head (a `stdin:` fan-out is a live session, not a
     /// replay), so it sees bytes from now on, never the history other consumers already drained.
     ///
-    /// Returns `None` if the source was already consumed and closed (a non-rewindable `stdin:` session that
-    /// ended): there is nothing left to attach to, so the caller refuses cleanly rather than hand out a cursor
-    /// that only ever reads EOF.
+    /// Returns `None` only once the session is over: the source reader has been taken, no consumer is live,
+    /// and the pump has EXITED (the ring is closed, which is set only after the reader was dropped). While the
+    /// pump is parked, a fresh consumer attaches and revives the session; a `fifo:` caller re-arms on `None`
+    /// with a new open, a non-rewindable `stdin:` caller refuses cleanly rather than hand out a cursor that
+    /// only ever reads EOF.
     pub(crate) fn open(&self) -> Option<Cursor> {
         let Self(shared) = self;
         let mut life = shared.life.lock().unwrap_or_else(PoisonError::into_inner);
         // The first consumer starts the pump by taking the source. A later consumer finds `source` already
-        // taken (the pump owns it) and simply attaches; but if the source is gone AND no consumer is live, the
-        // session already ran to completion and closed, so there is nothing to attach to.
+        // taken (the pump owns it) and simply attaches; but if the source is gone AND no consumer is live,
+        // the session is over only once its pump has exited, so the refusal must read the ring's `closed`
+        // rather than the bare zero count. A zero-consumer instant while the pump is parked was the old
+        // kill switch: reviving it here is what keeps a live `fifo:` session (and a `stdin:` feed) alive.
         if let Some(source) = life.source.take() {
             spawn_pump(Arc::clone(shared), source);
         } else if life.consumers == 0 {
-            return None;
+            let closed = shared
+                .ring
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .closed;
+            if closed {
+                return None;
+            }
         }
         life.consumers += 1;
         // A late joiner starts at the live edge (the head), never replaying the bytes already streamed.
@@ -174,6 +208,7 @@ impl Fanout {
         Some(Cursor {
             shared: Arc::clone(shared),
             pos,
+            lagged: false,
             parked: None,
         })
     }
@@ -214,6 +249,12 @@ fn spawn_pump(shared: Arc<Shared>, mut source: BoxRead) {
                 }
             }
         }
+        // Drop the source reader BEFORE marking the ring closed (A-2). `closed` is the signal
+        // [`Fanout::open`] reads to decide a session is over, and it must mean the reader fd is gone: a
+        // re-armed `fifo:` session that opened the same path while this reader was still live would create
+        // two readers, and concurrent readers of one FIFO SPLIT its bytes (the corruption `raw_stream.rs`
+        // names). Dropping first makes "closed" mean "no reader", which is what makes the re-arm safe.
+        drop(source);
         shared
             .ring
             .lock()
@@ -275,6 +316,17 @@ impl AsyncRead for Cursor {
                 // were evicted. Force-advance to the live edge (the ring's base) and continue: it silently
                 // loses the gap. This is LOCAL (only this cursor jumps); consumer B is untouched.
                 if this.pos < ring.base {
+                    if !this.lagged {
+                        // One warn per lag EPISODE, never per `poll_read`: the cursor's own read cadence
+                        // drives this path, so a per-read log would let a slow consumer write host log
+                        // lines without bound. A new episode logs again only after the cursor reaches the
+                        // live edge below.
+                        tracing::warn!(
+                            dropped_bytes = ring.base - this.pos,
+                            "lossy consumer lagged; dropped bytes to catch up"
+                        );
+                        this.lagged = true;
+                    }
                     this.pos = ring.base;
                 }
                 if this.pos < ring.head() {
@@ -287,8 +339,15 @@ impl AsyncRead for Cursor {
                     copy_from_deque(front, back, start, n, buf);
                     this.pos += n as u64;
                     this.parked = None;
+                    // Still behind the live edge: the same episode continues (no second warn). Caught up:
+                    // the episode is over, so a later eviction is a fresh episode with its own warn.
+                    if this.pos == ring.head() {
+                        this.lagged = false;
+                    }
                     return Poll::Ready(Ok(()));
                 }
+                // At the live edge with nothing buffered: any lag episode has ended.
+                this.lagged = false;
                 if ring.closed {
                     // Caught up and the source has ended: EOF (leave `buf` unfilled).
                     this.parked = None;
@@ -551,6 +610,59 @@ mod tests {
         assert!(
             fanout.open().is_none(),
             "a non-rewindable session that ran and closed hands out no more cursors"
+        );
+    }
+
+    /// A-2: a zero-consumer instant does NOT end a live session. With the pump parked on the source read (the
+    /// writer half held open, so the session is live), dropping the only cursor and reopening must hand out a
+    /// fresh cursor that receives the bytes written afterwards. Refusing on the bare zero count was the
+    /// kill switch: it turned one viewer leaving into a dead service for the node's lifetime. This is the
+    /// mechanism-level pin for the re-arm (`raw_stream.rs` pins the served `fifo:` path end to end).
+    #[tokio::test]
+    async fn a_zero_consumer_instant_does_not_end_a_live_lossy_session() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let body: &'static [u8] = b"bytes after the zero-consumer instant";
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let fanout = Fanout::new(Box::new(reader));
+
+        let cursor = fanout.open().expect("a live source hands out a cursor");
+        drop(cursor); // zero consumers while the pump is parked on the source read
+
+        let mut revived = fanout
+            .open()
+            .expect("a new consumer attaches while the pump is still parked");
+        writer.write_all(body).await.expect("write the source");
+        drop(writer);
+
+        let mut got = Vec::new();
+        revived
+            .read_to_end(&mut got)
+            .await
+            .expect("read the revived session");
+        assert_eq!(
+            got, body,
+            "a consumer attaching to a live session receives the bytes written after it attached"
+        );
+    }
+
+    /// N1: the ring's byte ceiling is exact. `append` of a full ring plus one pump chunk leaves the buffer at
+    /// `RING_BYTES` with `base` advanced by the overflow, because the eviction runs BEFORE the extend. The old
+    /// extend-then-evict order peaked at `RING_BYTES + PUMP_CHUNK`.
+    #[test]
+    fn ring_append_holds_the_byte_ceiling_exactly() {
+        let mut ring = super::Ring::new();
+        let chunk = vec![7u8; super::RING_BYTES + super::PUMP_CHUNK];
+        ring.append(&chunk);
+        assert_eq!(
+            ring.buf.len(),
+            super::RING_BYTES,
+            "the sustained ceiling is exactly RING_BYTES, not RING_BYTES + PUMP_CHUNK"
+        );
+        assert_eq!(
+            ring.base,
+            super::PUMP_CHUNK as u64,
+            "the evicted overflow is the leading bytes, so base advances by exactly the overflow"
         );
     }
 }

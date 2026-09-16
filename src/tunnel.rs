@@ -77,8 +77,9 @@ const RAW_STREAM_OPEN_PERMITS: usize = 16;
 /// the whole table by itself. It reserves nothing: a session that never reaches an opened service (a gated
 /// or unknown request, or none) takes no permit, so a stranger can still hold the shared session table up
 /// to [`MAX_SESSIONS`] and make member dials queue at accept. That residual is the accepted loss, the same
-/// shape the round-3 re-spec accepted one layer up (a redialing occupier keeps the public semaphore full).
-/// The cap bounds occupation, not fairness: a dialer that keeps reconnecting can still hold all 32.
+/// shape the round-3 re-spec accepted one layer up. The cap bounds occupation, not fairness: the slots are
+/// activity-independent, so a dialer that keeps its sessions open can hold all 32 and wedge new public
+/// dialers until it closes them.
 const PUBLIC_SESSION_PERMITS: usize = 32;
 
 /// The maximum number of concurrent public streams (delib-49 G5), taken at the public-admit seam. Single
@@ -1443,20 +1444,6 @@ where
     // BEFORE the gate so a delegated slip for that service still matches (the gate checks the RESOLVED service).
     let service = resolve_single_service(service, services);
 
-    // Live enable/disable (delib-47), consulted at the SAME point in admission as the gate, on the RESOLVED name: a service
-    // the operator has disabled refuses here, before admission, and a re-enable restores it on the next stream
-    // with no restart (the oracle re-reads its backing file on change). The wire gets the SAME indistinguishable
-    // refusal a gate miss gives, so a disabled service reads exactly like a gated or absent one: no dialer can
-    // tell "disabled" from "not a member", and toggling leaks nothing. An already-open stream to a service
-    // disabled mid-flight stays open (next-stream semantics, identical to revocation).
-    if !enabled.is_enabled(&service) {
-        tracing::warn!(%peer, service = %service, "refused: service disabled");
-        return Response::Refused(Refusal::NotAdmitted)
-            .write(&mut writer)
-            .await
-            .map_err(Into::into);
-    }
-
     // `admitted` carries the public-stream permit (when this is a public stream) for the WHOLE of this
     // function: the permit field is never moved, so it drops when this stream ends, which is what releases
     // the slot. Its witness is moved on below into `prepare`; the remaining permit field stays bound to the
@@ -1489,6 +1476,23 @@ where
                 .map_err(Into::into);
         }
     };
+
+    // Live enable/disable (delib-47), consulted POST-admission on the RESOLVED name: a service the
+    // operator has disabled refuses here, and a re-enable restores it on the next stream with no restart
+    // (the oracle re-reads its backing file on change). The check sits AFTER `admit` so every dialer pays
+    // the gate first: a pre-gate check let a cap-holder time "refused without a gate verify" (disabled)
+    // against "refused after one" (enabled or absent) and learn the disabled set, the timing oracle
+    // delib-34 r3 Finding 4 ruled out (queued as delib-67 F5). The wire gets the SAME indistinguishable
+    // refusal a gate miss gives, so a disabled service reads exactly like a gated or absent one: no dialer
+    // can tell "disabled" from "not a member", and toggling leaks nothing. An already-open stream to a
+    // service disabled mid-flight stays open (next-stream semantics, identical to revocation).
+    if !enabled.is_enabled(&service) {
+        tracing::warn!(%peer, service = %service, "refused: service disabled");
+        return Response::Refused(Refusal::NotAdmitted)
+            .write(&mut writer)
+            .await
+            .map_err(Into::into);
+    }
 
     // The member floor (delib-54): a route declared `Access::Member` at registration is checked ONCE here,
     // after `admit` and before every `Response::Ok` below, so the check covers every dispatch arm and can
@@ -2357,11 +2361,11 @@ mod tests {
     use tokio::io::AsyncReadExt as _;
 
     use super::{
-        Access, Admission, AllEnabled, BoxRead, BoxWrite, Exposer, Handler, Metering, Posture,
-        PublicPool, PublicRequest, PublicServices, PublicSession, PublicUnsafeRequest,
-        RAW_STREAM_OPEN_PERMITS, RawSource, Route, Router, Security, Semaphore, ServeError, Served,
-        ServiceCatalog, ServiceEntry, Services, SessionPeer, Target, TargetKind,
-        resolve_single_service, serve_request,
+        Access, Admission, AllEnabled, BoxRead, BoxWrite, Exposer, Handler, Metering,
+        PUBLIC_STREAM_PERMITS, Posture, PublicPool, PublicRequest, PublicServices, PublicSession,
+        PublicUnsafeRequest, RAW_STREAM_OPEN_PERMITS, RawSource, Route, Router, Security,
+        Semaphore, ServeError, Served, ServiceCatalog, ServiceEntry, Services, SessionPeer, Target,
+        TargetKind, resolve_single_service, serve_request,
     };
     use crate::open_policy::{Never, OptIn};
     use crate::raw_stream::RawStream;
@@ -3851,6 +3855,101 @@ mod tests {
             .expect("the serve future returns Ok");
     }
 
+    /// delib-49 G5 at its PRODUCTION value (delib-76 Q1): `PUBLIC_STREAM_PERMITS = 4` is one node-wide,
+    /// service-blind pool. Four parked public streams on one service hold every slot (held to stream end,
+    /// idle or not), and a fifth public dial on a DIFFERENT public service is refused with the uniform
+    /// `NotAdmitted` rather than queued. Releasing the parked streams frees the slots for the next dial.
+    #[tokio::test]
+    async fn four_public_streams_hold_the_node_wide_pool_and_the_fifth_is_refused() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+        let services = Services(HashMap::new())
+            .with_handler(
+                "a",
+                Parked {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                },
+            )
+            .expect("`a` binds")
+            .with_handler(
+                "b",
+                Parked {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                },
+            )
+            .expect("`b` binds");
+        let serving = Arc::new(super::Serving {
+            gate: Gate::Open,
+            public: PublicServices(["a".to_owned(), "b".to_owned()].into_iter().collect()),
+            public_unsafe: PublicServices::default(),
+            services,
+            raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
+            // The PRODUCTION pool (not the small hand-built ones the other cap tests isolate with).
+            public_pool: PublicPool::new(),
+            enabled: Box::new(AllEnabled),
+        });
+
+        // Four public streams on `a`, each parked in the handler, holding one of the four slots for life.
+        let session = Arc::new(PublicSession::default());
+        let mut held = Vec::new();
+        for _ in 0..PUBLIC_STREAM_PERMITS {
+            let (mut reader, serve) =
+                drive_open_in("a", Arc::clone(&serving), Arc::clone(&session), None);
+            let serve = tokio::spawn(serve);
+            assert_eq!(
+                crate::protocol::Response::read(&mut reader)
+                    .await
+                    .expect("the response reads"),
+                crate::protocol::Response::Ok,
+                "a public stream under the cap is admitted"
+            );
+            entered.notified().await;
+            held.push(serve);
+        }
+
+        // Service-blind: the pool is node-wide, so the fifth stream, aimed at the OTHER public service, is
+        // refused with the uniform class (never queued behind the parked four).
+        let (mut fifth_reader, fifth_serve) =
+            drive_open_in("b", Arc::clone(&serving), Arc::clone(&session), None);
+        let (served, response) = tokio::join!(
+            fifth_serve,
+            crate::protocol::Response::read(&mut fifth_reader)
+        );
+        served.expect("the serving future returns after the refusal");
+        assert_eq!(
+            response.expect("the response reads"),
+            crate::protocol::Response::Refused(bifrost::Refusal::NotAdmitted),
+            "the fifth public stream is refused on the uniform class, on any public service"
+        );
+
+        // Releasing the four parked streams returns their slots; the next dial is admitted.
+        release.add_permits(PUBLIC_STREAM_PERMITS);
+        for serve in held {
+            serve
+                .await
+                .expect("a parked stream ends after its release")
+                .expect("the serve future returns Ok");
+        }
+        let (mut sixth_reader, sixth_serve) =
+            drive_open_in("b", Arc::clone(&serving), Arc::clone(&session), None);
+        let sixth = tokio::spawn(sixth_serve);
+        assert_eq!(
+            crate::protocol::Response::read(&mut sixth_reader)
+                .await
+                .expect("the response reads"),
+            crate::protocol::Response::Ok,
+            "a released slot admits the next public stream"
+        );
+        entered.notified().await;
+        release.add_permits(1);
+        sixth
+            .await
+            .expect("the sixth stream ends")
+            .expect("the serve future returns Ok");
+    }
+
     /// AVAILABILITY (Adversary A-1, delib 05, issue #25): a flood of never-written `fifo:` opens is bounded
     /// by `RAW_STREAM_OPEN_PERMITS` and, crucially, parks NO threads (the open is nonblocking; a writer-less
     /// FIFO is awaited via the reactor, not a blocking-pool thread). With a cap of N, launch N+K concurrent
@@ -3978,7 +4077,7 @@ mod tests {
     /// with no restart (the mtime-watched [`FileDisabledList`] re-read the change). This is the property the
     /// whole feature turns on: disable refuses live, enable restores live.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_disabled_service_is_refused_at_the_gate_then_restored_live_on_re_enable() {
+    async fn a_disabled_service_is_refused_then_restored_live_on_re_enable() {
         use std::io::Write as _;
 
         use tokio::io::AsyncReadExt as _;
@@ -4010,7 +4109,8 @@ mod tests {
             enabled: Box::new(enabled),
         });
 
-        // Disabled: the gate refuses with the uniform typed refusal, before any dispatch.
+        // Disabled: `serve_request` refuses with the uniform typed refusal, after admission and before any
+        // dispatch.
         let (mut client_read, serve) = drive_open("doc", std::sync::Arc::clone(&serving));
         tokio::spawn(serve);
         match crate::protocol::Response::read(&mut client_read)
@@ -4018,7 +4118,9 @@ mod tests {
             .expect("read response")
         {
             crate::protocol::Response::Refused(bifrost::Refusal::NotAdmitted) => {}
-            other => panic!("a disabled service must be refused at the gate, got: {other:?}"),
+            other => {
+                panic!("a disabled service must be refused with the uniform class, got: {other:?}")
+            }
         }
 
         // Re-enable: rewrite the file without `doc` and wait past the mtime-watch debounce (100ms).
@@ -4044,6 +4146,85 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&disabled);
+    }
+
+    /// delib-67 F5 (delib-34 r3 Finding 4): the disabled oracle is consulted AFTER admission, never before the
+    /// gate. A gate miss must not touch it at all: a pre-gate disabled check let a cap-holder time "refused
+    /// without a gate verify" (disabled) against "refused after one" (enabled or absent) and learn the
+    /// disabled set. The counting oracle is the ordering pin: a gate miss leaves the count at 0, and an
+    /// admitted dial (open gate) reaches the check and is refused with the same uniform class.
+    #[tokio::test]
+    async fn a_disabled_service_is_refused_after_admission_not_before_the_gate() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        /// An enabled-oracle double that counts consultations and reports every service disabled.
+        struct CountingDisabled(Arc<AtomicUsize>);
+        impl crate::enabled::EnabledServices for CountingDisabled {
+            fn is_enabled(&self, _service: &Service) -> bool {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let signet = nauthy::Identity::from_secret(&[5u8; 32]).expect("valid secret");
+        let rooted = Arc::new(super::Serving {
+            gate: Gate::rooted(
+                signet.verifying_key(),
+                nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-disabled-order")),
+            ),
+            public: PublicServices::default(),
+            public_unsafe: PublicServices::default(),
+            services: services(&["doc=127.0.0.1:80"]),
+            raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
+            public_pool: PublicPool::new(),
+            enabled: Box::new(CountingDisabled(Arc::clone(&count))),
+        });
+
+        // A dialer the rooted gate refuses (no badge): the uniform refusal, and the oracle is never consulted.
+        let (mut refused_reader, refused_serve) = drive_open("doc", rooted);
+        let (served, response) = tokio::join!(
+            refused_serve,
+            crate::protocol::Response::read(&mut refused_reader)
+        );
+        served.expect("the serving future returns after the refusal");
+        assert_eq!(
+            response.expect("the response reads"),
+            crate::protocol::Response::Refused(bifrost::Refusal::NotAdmitted),
+            "a gate miss stays the uniform payload-free refusal"
+        );
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "a gate miss must not consult the disabled oracle: the check is post-admission"
+        );
+
+        // An admitted dialer on an open gate reaches the check and is refused with the same uniform class.
+        let open = Arc::new(super::Serving {
+            gate: Gate::Open,
+            public: PublicServices::default(),
+            public_unsafe: PublicServices::default(),
+            services: services(&["doc=127.0.0.1:80"]),
+            raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
+            public_pool: PublicPool::new(),
+            enabled: Box::new(CountingDisabled(Arc::clone(&count))),
+        });
+        let (mut admitted_reader, admitted_serve) = drive_open("doc", open);
+        let (served, response) = tokio::join!(
+            admitted_serve,
+            crate::protocol::Response::read(&mut admitted_reader)
+        );
+        served.expect("the serving future returns after the refusal");
+        assert_eq!(
+            response.expect("the response reads"),
+            crate::protocol::Response::Refused(bifrost::Refusal::NotAdmitted),
+            "an admitted dial to a disabled service gets the same uniform refusal"
+        );
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "an admitted dial reaches the disabled oracle once"
+        );
     }
 
     /// A tiny test client that speaks tightbeam's `Request`/`Response` handshake on one stream, so the unit
