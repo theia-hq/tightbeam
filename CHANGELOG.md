@@ -17,6 +17,8 @@ All notable changes to tightbeam, newest first.
   bytes the feed has moved past.
 
 ### Changed
+- **`Router::catalog` no longer takes a gate.** The router has held its base gate since `Router::new`, so
+  the catalog reads its own; `Router::gate()` hands that gate back for a program composing a node from it.
 - **The public stream pool is pinned by test.** Four connected public streams fill the node-wide pool on
   any mix of public services; the fifth is refused on the uniform class and a released slot admits the
   next.

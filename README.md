@@ -90,9 +90,9 @@ any protocol generic over a bifrost session runs over the tunnel unchanged.
 
 ## Serve services behind a gate
 
-A [`Router`](src/tunnel.rs) is one route table: bind each served name to a handler, a local forward, a
+A [`Router`](src/tunnel/router.rs) is one route table: bind each served name to a handler, a local forward, a
 raw-stream source, or the built-in loopback reflector, then prove the whole node once with `.expose()`. The
-proved [`Exposer`](src/tunnel.rs) accepts overlay sessions from permitted peers and forwards each inbound
+proved [`Exposer`](src/tunnel/exposer.rs) accepts overlay sessions from permitted peers and forwards each inbound
 stream to the service it names.
 
 ```rust
@@ -123,7 +123,7 @@ announces readiness before `run`.
 
 ## Inject a named service
 
-tightbeam knows only the [`Handler`](src/tunnel.rs) contract, never what a handler does. A handler names its
+tightbeam knows only the [`Handler`](tightbeam-handler/src/lib.rs) contract, never what a handler does. A handler names its
 `Exposure` ceiling as a type (`Never` for a keyless shell, `OptIn` for a legitimately public responder),
 declares its `Metering` if it bounds callers, and serves one admitted stream from the `Served<Self>` proof
 the gate prepared for it. The declaration is the author's: the marker prevents an omitted choice and a
