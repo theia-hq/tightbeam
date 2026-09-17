@@ -29,15 +29,17 @@ pub struct ExposeCmd {
     #[arg(required = true, value_name = "name=target")]
     pub services: Vec<String>,
     /// open the WHOLE node to anyone, unauthenticated (the one opt-out from the signet)
-    // CLI-Architect round-3 (Ruling 2): tightbeam's `--public` stays a whole-node BOOLEAN (the library
-    // primitive, a `Gate::Open` BASE), NOT per-service like swoosh; the help states the whole-node scope so
-    // the layer difference is on the surface. The bang-suffix (`--public svc!`) was REJECTED.
+    // A whole-node BOOLEAN, never a per-service list: this bin exposes the library primitive directly, so
+    // `--public` sets the gate's BASE posture and every service under it opens at once. The help spells the
+    // whole-node scope out loud, because a layer above can offer the same word per service and an operator
+    // who carries that reading over here would open far more than they meant to.
     #[arg(long)]
     pub public: bool,
     /// serve these raw-stream services (file:/fifo:/stdin:) to ANYONE, unauthenticated (comma-list)
-    // CLI-Architect round-3 (Rulings 1 & 2): KEEP the separate `--public-unsafe <names>` name list on both
-    // bins; `requires = "public"` is RULED for tightbeam ONLY (its `--public` is whole-node, so the unsafe set
-    // is inert without it, a silent "I thought I opened it" footgun that this turns into a parse error).
+    // A separate name list from `--public`, because opening a raw byte source to strangers is a louder
+    // decision than opening a handler that authenticates for itself. It `requires = "public"`: with a
+    // whole-node gate there is no open posture to serve these names through, so the set would sit inert and
+    // the operator would believe they opened something they did not. A parse error says so instead.
     #[arg(
         long,
         value_name = "name",
@@ -153,11 +155,9 @@ fn expose_banner<'a>(node_id: NodeId, names: impl Iterator<Item = &'a str>, gate
 /// from the manifest's declared [`RawSource`] so it names what tightbeam resolved, never the operator's typed
 /// string. Nothing is printed when no raw stream is open (the common case). On STDERR with the rest of the
 /// banner, never stdout (the data path).
-// The per-stream gloss wording is CLI-Architect round-3 (Ratified-in-passing): `serving the raw bytes of
-// {abs} to anyone, no auth` / `serving this process's piped stdin to anyone, no auth`, and the absolute path
-// is NEVER truncated (the operator must SEE the exact bytes at risk). The `UNSAFE:` line prefix and one-line-
-// per-stream shape are this thin bin's presentation default (the round-3 banner ruling detailed swoosh's
-// grouped banner; the thin bin has no group table).
+// The absolute path is NEVER truncated or elided: the operator has to see the exact bytes at risk, and the
+// middle of a path is precisely where `~/.ssh/id_rsa` would hide. One line per opened stream rather than a
+// count or a summary, so a single dangerous entry cannot ride along inside a tally nobody expands.
 fn expose_unsafe_warning(manifest: &[ManifestEntry]) {
     for entry in manifest {
         if entry.posture != Posture::Open || entry.kind != TargetKind::RawStream {

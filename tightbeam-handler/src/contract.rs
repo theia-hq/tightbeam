@@ -60,10 +60,10 @@ pub enum ServeError {
 /// [`Never`](crate::open_policy::Never) (an open gate over it is refused when the proof is prepared), a
 /// legitimately-public responder names [`OptIn`](crate::open_policy::OptIn). There is no default and no
 /// runtime bool: omitting the choice does not compile, and the marker is sealed + uninhabited, so "a keyless
-/// service mislabeled open" is unrepresentable rather than a guarded default (delib-37).
+/// service mislabeled open" is unrepresentable rather than a guarded default.
 ///
 /// The `serve` future is `+ Send`: a dispatcher may run it on a multi-thread runtime and hold the boxed serve
-/// future across `.await`, so it must be `Send` (delib-32 r2, compiler-forced). Authors may still write a
+/// future across `.await`, so it must be `Send`, and the compiler enforces it. Authors may still write a
 /// plain `async fn serve` whose body is `Send`; on the pinned toolchain that coerces to the `+ Send` RPITIT
 /// bound at the impl site with no `trait_variant` needed. `where Self: Sized` is compiler-forced by
 /// [`Served<Self>`](Served).

@@ -32,7 +32,7 @@ use crate::splice_halves;
 /// Building a node-wide [`Gate::Open`] base is a caller's own deliberate choice (nauthy's
 /// [`Gate::Open`]), not something a
 /// gate-resolution policy hands back from a flag: that node-wide-open flag was exactly the whole-node blast
-/// radius per-service exposure removes (delib-39).
+/// radius per-service exposure removes.
 pub fn resolve_gate(signet: Option<NodeId>, denylist: FileDenylist) -> eyre::Result<Gate> {
     let root = signet.ok_or_else(|| {
         eyre::eyre!(
@@ -51,7 +51,7 @@ pub(super) const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// The gate decides per stream, not per session, because the requested service (and any presented
 /// capability) is a property of the stream: one session may carry several service requests, each gated on
-/// its own merits. `public_session` is this session's half of the public cap (delib-49 G5): a stream that
+/// its own merits. `public_session` is this session's half of the public cap: a stream that
 /// takes the public path classifies the session, and the permit it carries rides this future to the end.
 pub(super) async fn serve_request<W, R>(
     peer: SessionPeer,
@@ -140,12 +140,12 @@ where
         }
     };
 
-    // Live enable/disable (delib-47), consulted POST-admission on the RESOLVED name: a service the
-    // operator has disabled refuses here, and a re-enable restores it on the next stream with no restart
-    // (the oracle re-reads its backing file on change). The check sits AFTER `admit` so every dialer pays
-    // the gate first: a pre-gate check let a cap-holder time "refused without a gate verify" (disabled)
-    // against "refused after one" (enabled or absent) and learn the disabled set, the timing oracle
-    // delib-34 r3 Finding 4 ruled out (queued as delib-67 F5). The wire gets the SAME indistinguishable
+    // Live enable/disable, consulted POST-admission on the RESOLVED name: a service the operator has
+    // disabled refuses here, and a re-enable restores it on the next stream with no restart (the oracle
+    // re-reads its backing file on change). The check sits AFTER `admit` so every dialer pays the gate
+    // first: a pre-gate check would let a cap-holder time "refused without a gate verify" (disabled)
+    // against "refused after one" (enabled or absent) and read the disabled set straight off the clock.
+    // The wire gets the SAME indistinguishable
     // refusal a gate miss gives, so a disabled service reads exactly like a gated or absent one: no dialer
     // can tell "disabled" from "not a member", and toggling leaks nothing. An already-open stream to a
     // service disabled mid-flight stays open (next-stream semantics, identical to revocation).
@@ -157,7 +157,7 @@ where
             .map_err(Into::into);
     }
 
-    // The member floor (delib-54): a route declared `Access::Member` at registration is checked ONCE here,
+    // The member floor: a route declared `Access::Member` at registration is checked ONCE here,
     // after `admit` and before every `Response::Ok` below, so the check covers every dispatch arm and can
     // still be a WIRE refusal; a handler-side check would run post-`Ok` and the client would read a stopped
     // "success". The witness is BORROWED for `is_member` (`&self`) and stays owned for the single move into
@@ -239,9 +239,9 @@ where
         None => {
             // Unknown service. The node's OWN log names what it exposes, so a service-name mismatch (the
             // connector defaulting to `default` while the exposer named `web`) is diagnosable by the
-            // operator. It must NOT cross the wire: enumerating the service menu to a dialer is exactly the
-            // pre-authorization capability-enumeration oracle deliberation 18 forbids, so the wire gets the
-            // same indistinguishable refusal as any not-admitted dial. A dialer learns a service exists only
+            // operator. It must NOT cross the wire: enumerating the service menu to a dialer hands an
+            // unauthorized peer the node's capability list before it has proved anything, so the wire gets
+            // the same indistinguishable refusal as any not-admitted dial. A dialer learns a service exists only
             // by being admitted to it; the teaching hint returns as the gated `control.services` verb, never
             // as a free menu here. (This arm is reached only past the gate: an Open node, or a whole-node
             // member badge that admits any name -- so uniformity here also stops a member from mapping the
@@ -265,7 +265,7 @@ where
 /// Why the host did not admit a stream, in full, for the host's OWN log. It
 /// never crosses the wire: the dialer gets one uniform `Refusal::NotAdmitted`,
 /// so a stranger cannot tell a missing token from a revoked one, nor confirm an
-/// absent name (deliberation 18).
+/// absent name.
 #[derive(Debug, thiserror::Error)]
 enum HostRefusal {
     /// A presented capability link did not parse. The parse error is the cause;
@@ -285,7 +285,7 @@ enum HostRefusal {
     /// The gate ruled: nauthy's typed cause.
     #[error(transparent)]
     Gate(nauthy::Refusal),
-    /// The public-path capacity (delib-49 G5) is reached: the node already serves its cap of ADMITTED
+    /// The public-path capacity is reached: the node already serves its cap of ADMITTED
     /// public sessions or concurrent public streams. The wire still gets the same payload-free
     /// `Refusal::NotAdmitted` a gate miss gives, so a saturation is indistinguishable from a refusal;
     /// this cause is only the operator's log line. The shared session table is bounded separately by
@@ -337,7 +337,7 @@ struct Admission<'a> {
 /// serve" is a compile-time precondition (see [`nauthy::Admitted`]). The refusal returned here NEVER crosses
 /// the wire (the caller sends the payload-free `Refusal::NotAdmitted` to a not-admitted dialer); it exists
 /// only so the operator can see WHY on their own `tracing` output. Distinguishing missing/not-granted/revoked
-/// to the wire would be a revocation + capability-enumeration oracle for an unauthorized peer (deliberation 18).
+/// to the wire would hand an unauthorized peer a revocation and capability-enumeration oracle.
 fn admit(
     admission: Admission<'_>,
     session: &PublicSession,
@@ -374,7 +374,7 @@ fn admit(
                 service,
             )
             .map_err(HostRefusal::from)?;
-        // delib-49 G5, the ONE place the public caps are taken. A public stream first takes a
+        // The ONE place the public caps are taken. A public stream first takes a
         // public-stream permit (held for the stream's life) and then classifies its session (one
         // public-session permit, held until the session closes). Past either cap the answer is a refusal
         // BEFORE any `Response::Ok`, mapped by the caller to the same payload-free `NotAdmitted` a gate
@@ -410,7 +410,7 @@ fn admit(
     // identical family path (the same cap parse, the same two ed25519 verifies, the same refusal), so a
     // gated service and an absent one are timing- and response-identical. There is no cheaper path for
     // "absent" than for "gated-present", so hit-vs-miss reveals only what is already public (a public name
-    // is reachable by anyone), never the gated menu (delib-18/39 anti-oracle).
+    // is reachable by anyone), never the gated menu.
     //
     // Parse a presented capability at the edge; a malformed token is a refusal, not a hard error, so the
     // stream ends cleanly rather than being dropped mid-read.

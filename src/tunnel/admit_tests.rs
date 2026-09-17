@@ -255,7 +255,7 @@ async fn an_open_witness_is_refused_before_ok_for_a_never_handler() {
     );
 }
 
-/// delib-49 G5, the anti-starvation property: with the public-session pool FULL, a gated member dial
+/// The anti-starvation property: with the public-session pool FULL, a gated member dial
 /// on its own session is still admitted and served, because only the public-admit seam touches the
 /// pool. The public dial over the cap gets the same payload-free `NotAdmitted` a gate miss gives, and
 /// dropping the public session releases its slot for the next public dial.
@@ -367,7 +367,7 @@ async fn a_saturated_public_pool_never_starves_a_gated_member() {
     );
 }
 
-/// delib-49 G5, the public-stream cap: one parked public stream holds the single stream permit, so a
+/// The public-stream cap: one parked public stream holds the single stream permit, so a
 /// second public stream on the same (already classified) session is refused at the seam; releasing the
 /// parked handler lets its stream end, drops the permit, and the next stream is admitted. Over-cap
 /// refusal is the uniform wire class, written before any `Response::Ok`.
@@ -449,7 +449,7 @@ async fn a_public_stream_over_the_cap_is_refused_and_released_when_it_ends() {
         .expect("the serve future returns Ok");
 }
 
-/// delib-49 G5 at its PRODUCTION value (delib-76 Q1): `PUBLIC_STREAM_PERMITS = 4` is one node-wide,
+/// The public-stream cap at its PRODUCTION value: `PUBLIC_STREAM_PERMITS = 4` is one node-wide,
 /// service-blind pool. Four parked public streams on one service hold every slot (held to stream end,
 /// idle or not), and a fifth public dial on a DIFFERENT public service is refused with the uniform
 /// `NotAdmitted` rather than queued. Releasing the parked streams frees the slots for the next dial.
@@ -544,7 +544,7 @@ async fn four_public_streams_hold_the_node_wide_pool_and_the_fifth_is_refused() 
         .expect("the serve future returns Ok");
 }
 
-/// AVAILABILITY (Adversary A-1, delib 05, issue #25): a flood of never-written `fifo:` opens is bounded
+/// AVAILABILITY: a flood of never-written `fifo:` opens is bounded
 /// by `RAW_STREAM_OPEN_PERMITS` and, crucially, parks NO threads (the open is nonblocking; a writer-less
 /// FIFO is awaited via the reactor, not a blocking-pool thread). With a cap of N, launch N+K concurrent
 /// opens of a writer-less FIFO: exactly N acquire a permit and wait for a writer (no `Response` yet, no
@@ -665,7 +665,7 @@ async fn a_single_raw_stream_open_is_unaffected_by_the_cap() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// delib-47 live toggle, END TO END through the gate: a service named in the `<home>/disabled` file is
+/// The live toggle, END TO END through the gate: a service named in the `<home>/disabled` file is
 /// refused at `serve_request` with the SAME indistinguishable refusal a gate miss gives, and after the file
 /// is rewritten to RE-ENABLE it, the very next stream against the SAME running serving context serves it,
 /// with no restart (the mtime-watched [`FileDisabledList`] re-read the change). This is the property the
@@ -742,10 +742,10 @@ async fn a_disabled_service_is_refused_then_restored_live_on_re_enable() {
     let _ = std::fs::remove_file(&disabled);
 }
 
-/// delib-67 F5 (delib-34 r3 Finding 4): the disabled oracle is consulted AFTER admission, never before the
-/// gate. A gate miss must not touch it at all: a pre-gate disabled check let a cap-holder time "refused
-/// without a gate verify" (disabled) against "refused after one" (enabled or absent) and learn the
-/// disabled set. The counting oracle is the ordering pin: a gate miss leaves the count at 0, and an
+/// The disabled oracle is consulted AFTER admission, never before the gate. A gate miss must not touch it
+/// at all: a pre-gate disabled check would let a cap-holder time "refused without a gate verify"
+/// (disabled) against "refused after one" (enabled or absent) and learn the disabled set. The counting
+/// oracle is the ordering pin: a gate miss leaves the count at 0, and an
 /// admitted dial (open gate) reaches the check and is refused with the same uniform class.
 #[tokio::test]
 async fn a_disabled_service_is_refused_after_admission_not_before_the_gate() {
@@ -912,7 +912,7 @@ fn a_public_member_admits_a_stranger_and_every_miss_takes_the_family_path() {
     );
 }
 
-/// Server-side slot-2 guard (Adversary): the second slot is parsed ONLY when slot 1 is a signet-bound
+/// Server-side slot-2 guard: the second slot is parsed ONLY when slot 1 is a signet-bound
 /// slip. A plain member badge admits on slot 1 alone, so a hostile client's garbage in slot 2 is never
 /// parsed and cannot turn a valid member dial into a refusal. The server guards this itself, never
 /// trusting the dialer's attach logic.
@@ -1080,7 +1080,7 @@ async fn an_announced_session_is_refused_at_admission_with_the_uniform_answer() 
     );
 }
 
-/// The flagship, at the tunnel level (delib-39): a family-gated node opens ONE service per-service; a
+/// The flagship, at the tunnel level: a family-gated node opens ONE service per-service; a
 /// stranger with no token is ADMITTED to that service but still REFUSED, uniformly, for a gated service
 /// and for the always-on `control.stop`, which can never be opened. Proves the anti-oracle survives the
 /// overlay: the gated refusals are the same payload-free class.
@@ -1149,7 +1149,7 @@ async fn a_stranger_is_admitted_to_an_opened_service_and_uniformly_refused_for_t
         .await;
 }
 
-/// The member floor (delib-54), end to end at the tunnel level: a route declared member-only serves a
+/// The member floor, end to end at the tunnel level: a route declared member-only serves a
 /// whole-node member (the witness is borrowed for the check and then moved once into the handler, so the
 /// single-use guarantee survives), and refuses a delegated slip for the SAME route and a tokenless
 /// stranger with the SAME uniform class a gate miss gives. The echo route proves the floor covers a

@@ -349,7 +349,7 @@ fn a_catalog_reports_public_services_open_and_the_rest_gated() {
     }
 }
 
-/// The catalog's self-listing contract (delib-54): `self_listing` renders the one row whose handler value
+/// The catalog's self-listing contract: `self_listing` renders the one row whose handler value
 /// is being built from the catalog (the member-only `control.services` read) as a GATED entry, sorted in
 /// tightbeam with the rest, so a consumer never patches the wire ordering itself.
 #[test]

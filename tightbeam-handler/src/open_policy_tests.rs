@@ -26,7 +26,7 @@ fn never_is_not_open_safe_and_optin_is() {
     assert!(open_safe::<OptIn>());
 }
 
-/// The ratified supertraits (`PublicUse: Send + Sync + 'static`, delib-56 verdict 2): a generic wrapper can
+/// The supertraits (`PublicUse: Send + Sync + 'static`): a generic wrapper can
 /// hold the marker in `PhantomData` knowing only the `PublicUse` bound. This generic body fails E0277
 /// without the supertraits, which is the downstream wrapper shape the clause exists for.
 #[test]

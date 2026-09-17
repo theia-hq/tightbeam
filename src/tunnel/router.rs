@@ -472,8 +472,8 @@ impl Services {
     ///
     /// A name that resolves to a handler is a TEACHING REDIRECT, never silently opened: the unsafe overlay is
     /// ONLY for raw byte sources, so a legitimate service named here is refused with a message pointing at the
-    /// safe public overlay ([`Router::public`]). This is the disjoint-token partition (delib-39): the two
-    /// overlays never fold, so crossing them teaches rather than opens. A survivor set freezes into the
+    /// safe public overlay ([`Router::public`]). The two overlays partition the opened names disjointly and
+    /// never fold, so crossing them teaches rather than opens. A survivor set freezes into the
     /// overlay [`admit`](super::admit) consults. The proof reads THROUGH each target, matched by served name, so an alias
     /// can never open a raw stream by naming it.
     pub(super) fn prove_unsafe(
@@ -579,7 +579,7 @@ impl Services {
 /// A LOCAL render view an embedder draws its OWN banner from, DISTINCT from the on-wire [`ServiceEntry`] the
 /// member-only `control.services` read returns: the banner is printed by a node to its own operator, so it
 /// carries the extra render tells (kind, metering) that never cross the wire, and it stays off the
-/// anti-oracle surface (delib-18) the wire catalog guards. Built by [`Exposer::manifest`] from the resolved
+/// anti-oracle surface the wire catalog guards. Built by [`Exposer::manifest`] from the resolved
 /// services, so a consumer RENDERS declared facts (posture from the proven overlay, kind from the target,
 /// the metering caveat from the handler) rather than re-deriving them from address strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -705,7 +705,7 @@ impl PublicServices {
 /// after) names a handler; anything else must be a socket forward (`host:port` or `unix:<path>`). All
 /// validated here so a typo fails at parse with a teaching message, not at dial time.
 fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
-    // A trailing `+lossy` is the operator's opt-in to raw-stream FAN-OUT (delib-20 SYNTHESIS + delib-24): the
+    // A trailing `+lossy` is the operator's opt-in to raw-stream FAN-OUT: the
     // source may be reached by MANY consumers at once, and a consumer that falls behind has its bytes DROPPED
     // rather than stall the producer or the others. It is a claim only the operator can make ("this stream
     // tolerates loss"), so it is legal ONLY on the live single-writer sources `stdin:`/`fifo:` and REFUSED at

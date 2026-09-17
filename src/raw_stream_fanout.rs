@@ -1,9 +1,10 @@
 //! Opt-in raw-stream fan-out: one live source, many consumers, drop-for-slow.
 //!
-//! A `stdin:`/`fifo:` source marked `+lossy` (operator-declared, delib-20 SYNTHESIS + delib-24) becomes a
-//! fan-out: the underlying reader is opened ONCE and its bytes are copied into ONE shared ring, from which N
-//! independent consumers each read through their own cursor. The design's ship-blockers (delib-20 Adversary,
-//! all mandatory) are what this module IS:
+//! A `stdin:`/`fifo:` source marked `+lossy` (operator-declared, never inferred) becomes a fan-out: the
+//! underlying reader is opened ONCE and its bytes are copied into ONE shared ring, from which N independent
+//! consumers each read through their own cursor. Three properties are mandatory, because a fan-out that
+//! gives up any one of them is either an aggregate-memory attack or a stall a stranger can trigger, and they
+//! are what this module IS:
 //!
 //! - **One shared bounded ring PER SOURCE, bounded by BYTES.** A per-consumer ring would be an
 //!   aggregate-memory attack (a flooder pins `ring x N`); there is exactly one [`Ring`] per source, capped at
@@ -454,7 +455,7 @@ mod tests {
         }
     }
 
-    /// N consumers each receive the source's exact bytes from ONE shared ring (fan-out, delib-20). A small
+    /// N consumers each receive the source's exact bytes from ONE shared ring. A small
     /// static body fits the ring, so no cursor lags: every consumer reads the whole stream, proving one source
     /// is delivered to many independent cursors.
     #[tokio::test]
@@ -480,11 +481,12 @@ mod tests {
         }
     }
 
-    /// DROP-ON-LAG WITHOUT STALL (the delib-20 ship-blocker): a deliberately-slow consumer has its bytes
-    /// dropped while a fast consumer keeps up, and NEITHER the producer nor the fast consumer stalls. The
-    /// source is PACED (a short sleep between chunks) so a consumer that drains promptly stays inside the ring
-    /// window and receives every byte, while a consumer that sleeps LONGER than the pacing falls out of the
-    /// window and has the evicted bytes dropped (its cursor force-advanced to the live edge). That the slow
+    /// DROP-ON-LAG WITHOUT STALL, the property the fan-out is only safe to offer because of: a deliberately
+    /// slow consumer has its bytes dropped while a fast consumer keeps up, and NEITHER the producer nor the
+    /// fast consumer stalls. The source is PACED (a short sleep between chunks) so a consumer that drains
+    /// promptly stays inside the ring window and receives every byte, while a consumer that sleeps LONGER
+    /// than the pacing falls out of the window and has the evicted bytes dropped (its cursor force-advanced
+    /// to the live edge). That the slow
     /// consumer finishes at all (rather than the producer stalling on it) is the no-stall proof; that the fast
     /// consumer is untouched is the "a lag on the laggard never gaps the keeper" proof.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

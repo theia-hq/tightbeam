@@ -42,18 +42,19 @@ const MAX_STREAMS_PER_SESSION: usize = 256;
 /// over the cap is refused cleanly.
 pub(super) const RAW_STREAM_OPEN_PERMITS: usize = 16;
 
-/// The maximum number of concurrent PUBLIC sessions (delib-49 G5): a session that has reached any opened
+/// The maximum number of concurrent PUBLIC sessions: a session that has reached any opened
 /// service holds one permit until it closes. This bounds what ADMITTED public dials can occupy: at most 32
 /// of [`MAX_SESSIONS`] sessions and [`PUBLIC_STREAM_PERMITS`] streams, so the public path cannot consume
 /// the whole table by itself. It reserves nothing: a session that never reaches an opened service (a gated
 /// or unknown request, or none) takes no permit, so a stranger can still hold the shared session table up
-/// to [`MAX_SESSIONS`] and make member dials queue at accept. That residual is the accepted loss, the same
-/// shape the round-3 re-spec accepted one layer up. The cap bounds occupation, not fairness: the slots are
+/// to [`MAX_SESSIONS`] and make member dials queue at accept. That residual is accepted rather than
+/// overlooked: the shared table is bounded on its own by [`MAX_SESSIONS`], and this pool's claim is only
+/// over ADMITTED public work. The cap bounds occupation, not fairness: the slots are
 /// activity-independent, so a dialer that keeps its sessions open can hold all 32 and wedge new public
 /// dialers until it closes them.
 const PUBLIC_SESSION_PERMITS: usize = 32;
 
-/// The maximum number of concurrent public streams (delib-49 G5), taken at the public-admit seam. Single
+/// The maximum number of concurrent public streams, taken at the public-admit seam. Single
 /// digits because one public stream is already a stranger's whole session of work; 4 bounds the aggregate
 /// public drain to four in-flight streams while leaving room for a handful of honest dials. Over the cap
 /// REFUSES (never queues): queuing would park one stranger's stream behind another's.
@@ -74,11 +75,11 @@ pub struct Exposer {
     /// The UNSAFE raw-stream overlay, proven at [`Router::expose`](super::Router::expose): raw byte
     /// sources (`file:`/`fifo:`/`stdin:`) with no auth of their own, knowingly served to any reaching
     /// peer. Kept DISJOINT from
-    /// `public` so the two proof walls write disjoint state (no clobber), the toggle interlock (delib-34) can
-    /// read `!public_unsafe.is_empty()` trivially, and the on-thesis reading stays legible: `public` =
+    /// `public` so the two proof walls write disjoint state (no clobber), the toggle interlock can read
+    /// `!public_unsafe.is_empty()` trivially, and the on-thesis reading stays legible: `public` =
     /// "opened a legitimate service", `public_unsafe` = "knowingly serves raw bytes with no auth".
     public_unsafe: PublicServices,
-    /// The live enable/disable oracle the per-stream gate consults (delib-47): a stream for a name this
+    /// The live enable/disable oracle the per-stream gate consults: a stream for a name this
     /// reports disabled is refused at admission, exactly like a revoked capability. Defaults to
     /// [`AllEnabled`] (nothing disabled), so a caller that never toggles pays nothing; a caller that does
     /// wires a file-backed [`FileDisabledList`](crate::enabled::FileDisabledList) with
@@ -96,7 +97,7 @@ impl Exposer {
     /// and would make the floor a route no dialer can reach (and, opened, a posture lie); and the safe
     /// public overlay proves every requested name exposed and open-safe.
     ///
-    /// The two raw-stream interlocks stay DISJOINT (delib-37): the keyless-handler refusal reads a
+    /// The two raw-stream interlocks stay DISJOINT: the keyless-handler refusal reads a
     /// compile-time marker (`type Exposure`), while the raw-stream-unsafe refusal is a RUNTIME opt-in guard
     /// (the danger depends on a runtime path value no type can see), so the two are never folded onto one
     /// mechanism.
@@ -146,7 +147,7 @@ impl Exposer {
                  otherwise gate it or drop it from the public set"
             );
         }
-        // Interlock 3 (member floor, delib-54): a route declared member-only is reachable only through a
+        // Interlock 3 (member floor): a route declared member-only is reachable only through a
         // witness the gate minted as a whole-node member, so two pairings make it DEAD and both fail here
         // rather than ship a route no dialer can reach:
         //   * a node-wide open gate proves nothing about a peer, so every dial would hit the floor and be
@@ -174,14 +175,15 @@ impl Exposer {
                  renders it open. drop it from the unsafe raw-stream set, or drop the member-only declaration"
             );
         }
-        // Interlock 4 (toggle mutual-exclusion): a DESIGN-LOCK with no operand today. delib-34's live-toggle
-        // set (`ActiveSet`/`--toggleable`) is UNBUILT, so there is no second set to refuse; inventing a toggle
-        // field now purely to refuse it would be machinery for a case that cannot occur yet. When the toggle
-        // allowlist lands it enters THIS proof beside `public_unsafe` and adds ONE bail here:
+        // Interlock 4 (toggle mutual-exclusion): a DESIGN-LOCK with no operand today. A live-toggle
+        // allowlist (the set of services a peer may re-enable at runtime) is UNBUILT, so there is no second
+        // set to refuse; inventing a toggle field now purely to refuse it would be machinery for a case that
+        // cannot occur yet. When that allowlist lands it enters THIS proof beside `public_unsafe` and adds
+        // ONE bail here:
         //   `if !proven_unsafe.is_empty() && !toggleable.is_empty() { eyre::bail!(...) }`
-        // refusing their co-presence by construction (an unauthenticated toggle must never re-arm a raw-byte
-        // exfil remotely). Recorded as a binding acceptance criterion for the delib-34 build; do NOT add a
-        // toggle field in this change.
+        // refusing their co-presence by construction, because a remotely flippable toggle over an open raw
+        // byte source is a re-armable exfil: the operator closes the hole and a stranger reopens it. Do NOT
+        // add a toggle field before that set exists.
         let proven_public = services.prove_public(public)?;
         Ok(Self {
             services,
@@ -194,7 +196,7 @@ impl Exposer {
         })
     }
 
-    /// Wire the live enable/disable oracle the per-stream gate consults (delib-47): a stream requesting a
+    /// Wire the live enable/disable oracle the per-stream gate consults: a stream requesting a
     /// service this oracle reports disabled is refused at admission, indistinguishably from a gated or
     /// absent service, and a re-enable restores it LIVE with no restart (the oracle re-reads its backing state
     /// when it changes). A separate builder, NOT an assembly parameter, because disabling is orthogonal to
@@ -374,15 +376,15 @@ pub(super) struct Serving {
     pub(super) public_unsafe: PublicServices,
     pub(super) services: Services,
     pub(super) raw_stream_opens: Semaphore,
-    /// The public-path capacity (delib-49 G5): taken only at the public-admit seam, so a gated route never
+    /// The public-path capacity: taken only at the public-admit seam, so a gated route never
     /// consults it and non-public traffic is untouched.
     pub(super) public_pool: PublicPool,
-    /// The live enable/disable oracle (delib-47), consulted per stream at admission, beside the gate: a
+    /// The live enable/disable oracle, consulted per stream at admission, beside the gate: a
     /// disabled service is refused with the same indistinguishable refusal a gate miss gives.
     pub(super) enabled: Box<dyn EnabledServices + Send + Sync>,
 }
 
-/// The node's public-path capacity (delib-49 G5): the two permit pools that bound what strangers can
+/// The node's public-path capacity: the two permit pools that bound what strangers can
 /// occupy. `sessions` holds one permit per session that has reached an opened service, until that session
 /// closes; `streams` holds one per public stream in flight. Both are taken ONLY at the public-admit seam
 /// ([`admit`](super::admit)): a gated route never consults either pool.
@@ -404,7 +406,7 @@ impl PublicPool {
     }
 }
 
-/// The per-session half of the public cap (delib-49 G5): the ONE public-session permit a session holds
+/// The per-session half of the public cap: the ONE public-session permit a session holds
 /// once it has been admitted to any opened service, held until the session closes and its last stream
 /// drops. A session that only ever dials gated routes never takes one: classification happens at the
 /// public-admit seam, so a member's session is invisible to the pool.
@@ -463,7 +465,7 @@ where
         node: session.peer(),
         security: <S::Security as SecurityProfile>::SECURITY,
     };
-    // The per-session half of the public cap (delib-49 G5): created empty, classified by the first stream
+    // The per-session half of the public cap: created empty, classified by the first stream
     // that reaches an opened service, and dropped with the session (which releases its permit, if any).
     let public_session = Arc::new(PublicSession::default());
     let mut pipes = FuturesUnordered::new();

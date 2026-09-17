@@ -7,7 +7,7 @@
 //!   in [`open_guarded`]).
 //! - `stdin:`: this process's own standard input (fd 0). No path, so none of the path guards apply; it is
 //!   a SINGLE-CONSUMER source (fd 0 is one non-re-openable stream) taken once and never re-armed.
-//! - `stdin:+lossy` / `fifo:<path>+lossy`: the operator's opt-in to FAN-OUT (delib-20 SYNTHESIS + delib-24):
+//! - `stdin:+lossy` / `fifo:<path>+lossy`: the operator's opt-in to FAN-OUT:
 //!   the source is opened ONCE and read by MANY consumers through one shared bounded ring, a consumer that
 //!   falls behind having its bytes dropped rather than stalling the producer or the others. The `+lossy` claim
 //!   ("this stream tolerates loss") is legal only on these live single-writer sources (a `file:` is already
@@ -83,8 +83,8 @@ enum Source {
     /// stream, so it is taken once. See [`Stdin`].
     Stdin(Stdin),
     /// A `+lossy` fan-out source (`stdin:+lossy` / `fifo:...+lossy`): opened ONCE, then read by MANY consumers
-    /// through one shared bounded ring with drop-for-slow. Opt-in and operator-declared (delib-20 SYNTHESIS +
-    /// delib-24); the underlying source is lazy-opened on the first consumer. See [`Lossy`].
+    /// through one shared bounded ring with drop-for-slow. Loss is never inferred: the operator declares it
+    /// on the target, and the underlying source is lazy-opened on the first consumer. See [`Lossy`].
     Lossy(Lossy),
 }
 
@@ -1094,10 +1094,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A-1 (the Operator's acceptance flow, on the failure mode its run could not reach): the first open
-    /// fails on the writer-wait TIMEOUT, and the service stays retryable: a writer connecting afterwards
-    /// lets the next consumer open the source and deliver the post-attach bytes. The ENOENT variant is
-    /// pinned next door (`lossy_fifo_first_open_failure_then_a_writer_streams`).
+    /// A first open that fails on the writer-wait TIMEOUT leaves the service RETRYABLE: a writer connecting
+    /// afterwards lets the next consumer open the source and deliver the post-attach bytes. The ENOENT
+    /// variant is pinned next door (`lossy_fifo_first_open_failure_then_a_writer_streams`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_first_lossy_open_does_not_disarm_the_service() {
         let fifo = scratch_fifo("lossy-timeout");

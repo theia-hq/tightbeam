@@ -173,7 +173,7 @@ fn metering_defaults_to_unmetered_and_reads_the_override() {
 fn a_public_gate_over_a_lossy_source_is_refused_at_the_same_door() {
     // A `+lossy` fan-out is still a raw-stream source with no auth of its own: a public gate over it would
     // serve the piped bytes to anyone. It must be refused at the SAME door as a non-lossy raw stream, so
-    // `+lossy` cannot reopen the delib-05/11 exfil gate.
+    // `+lossy` cannot reopen the raw-byte exfil this door exists to close.
     let lossy = services(&["cam=stdin:+lossy"]);
     assert!(
         prove(
@@ -500,17 +500,17 @@ fn public_unsafe_naming_an_unserved_name_is_a_parse_error() {
     );
 }
 
-/// DESIGN-LOCK marker (delib-34, no operand today): the toggle mutual-exclusion interlock is OWED but not
-/// yet buildable. delib-34's live-toggle set (`ActiveSet`/`--toggleable`) is unbuilt, so there is no
-/// second set for `Exposer::new` to refuse against a `public_unsafe` set; inventing a toggle field now
-/// purely to refuse it would be machinery for a case that cannot occur yet. This test records the
-/// acceptance criterion for the delib-34 build: when the toggle allowlist lands it enters `Exposer::new`
-/// beside `public_unsafe` and adds ONE bail refusing their co-presence
-/// (`!proven_unsafe.is_empty() && !toggleable.is_empty()`), so an unauthenticated toggle can never re-arm
-/// a raw-byte exfil remotely. TODO(delib-34): replace this marker with the live construction-fail test
+/// A DESIGN-LOCK marker with no operand today: the toggle mutual-exclusion interlock is OWED but not yet
+/// buildable. A live-toggle allowlist (the set of services a peer may re-enable at runtime) is unbuilt, so
+/// there is no second set for `Exposer::new` to refuse against a `public_unsafe` set; inventing a toggle
+/// field now purely to refuse it would be machinery for a case that cannot occur yet. This test records
+/// the acceptance criterion instead: when the toggle allowlist lands it enters `Exposer::new` beside
+/// `public_unsafe` and adds ONE bail refusing their co-presence
+/// (`!proven_unsafe.is_empty() && !toggleable.is_empty()`), because a remotely flippable toggle over an
+/// open raw byte source is a re-armable exfil. Replace this marker with the live construction-fail test
 /// once the toggle set exists. Today, an unsafe set alone builds (no toggle operand to conflict with).
 #[test]
-fn public_unsafe_alone_builds_and_the_toggle_interlock_is_a_design_lock_owed_to_delib_34() {
+fn public_unsafe_alone_builds_and_the_toggle_interlock_stays_a_design_lock() {
     let path = std::env::temp_dir().join("tb-public-unsafe-designlock");
     let entry = format!("logs=file:{}", path.display());
     let services = services(&[&entry]);
@@ -523,7 +523,7 @@ fn public_unsafe_alone_builds_and_the_toggle_interlock_is_a_design_lock_owed_to_
             PublicUnsafeRequest::new(["logs".to_owned()]),
         )
         .is_ok(),
-        "an unsafe raw-stream set alone builds; the toggle mutual-exclusion is owed to the delib-34 build"
+        "an unsafe raw-stream set alone builds; the toggle mutual-exclusion is owed a toggle set"
     );
 }
 
@@ -660,7 +660,7 @@ async fn an_echo_service_reflects_the_clients_own_bytes() {
         .await;
 }
 
-/// The cancel path (delib-18/S18): `Exposer::run` returns gracefully when its cancel token fires, so any
+/// The cancel path: `Exposer::run` returns gracefully when its cancel token fires, so any
 /// holder of a CLONE of this token can stop the node. Here the token is cancelled from OUTSIDE the run
 /// (the shape any such holder uses); the run must finish with `Ok(())` rather than accept forever. Uses
 /// the mem transport so no real socket is bound.
@@ -694,7 +694,7 @@ async fn run_returns_gracefully_when_its_cancel_token_fires() {
     );
 }
 
-/// FAN-OUT (delib-20 ship-blocker): a `+lossy` source served to N consumers over the in-process transport,
+/// FAN-OUT: a `+lossy` source served to N consumers over the in-process transport,
 /// each receiving the source's bytes from ONE shared ring. The source is a duplex whose write half the test
 /// holds, so all N consumers attach BEFORE any bytes flow (a live session, not a replay); then the body is
 /// written once and every consumer reads it. This drives the exact `Target::RawStream(RawStream::lossy)`
@@ -761,7 +761,7 @@ async fn a_lossy_source_fans_out_to_many_consumers() {
         .await;
 }
 
-/// SECURITY (deliberation 18, the discovery oracle): a dialer the gate does NOT admit must get ONE
+/// SECURITY, the discovery oracle: a dialer the gate does NOT admit must get ONE
 /// indistinguishable refusal on the wire. No reason separates a stranger (no token) from a revoked
 /// holder from a not-granting token, and no response enumerates or confirms a service. This test dials a
 /// Family-gated node four ways -- a stranger, a revoked-slip holder, an unknown-service probe, and a
@@ -868,7 +868,7 @@ async fn an_unadmitted_dialer_gets_one_uniform_refusal_no_reason_no_menu() {
             );
 
             // And the refusal renders NOTHING distinguishing: no cause word, no service name, no menu.
-            // The ratified `NotAdmitted` phrase names both credential kinds by policy ("no member badge
+            // The `NotAdmitted` phrase names both credential kinds by policy ("no member badge
             // or capability ... was accepted"), the same bytes for every cause, so it is not a leak.
             let rendered = stranger.to_string();
             for leaked in [
