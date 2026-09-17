@@ -28,8 +28,9 @@ use crate::open_policy::PublicUse;
 /// [`Never`](crate::open_policy::Never) and an [`OptIn`](crate::open_policy::OptIn) handler) share ONE
 /// `Arc<dyn ErasedHandler>` storage type. The marker
 /// never enters these signatures, so it does its job at the impl-site type-check and then vanishes into the
-/// object's frozen `open_safe()` answer (delib-37: this is why the associated type, not a generic, survives
-/// erasure).
+/// object's frozen `open_safe()` answer. An associated type survives erasure as a const the trait object
+/// still carries; a generic would have to be chosen at the storage site, which is exactly where the
+/// handler author is absent.
 ///
 /// SEALED: the blanket impl below is the only impl, because the private supertrait closes the set. A
 /// downstream crate cannot mint a [`Prepared`] anyway (private fields), so the seal states the invariant

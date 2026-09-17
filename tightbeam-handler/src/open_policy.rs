@@ -2,8 +2,8 @@
 //! legitimate PUBLIC use, or must it never face an unauthenticated stranger?
 //!
 //! A handler names one of two markers as an associated type, so the answer is a COMPILE-TIME property of the
-//! handler, with no forgettable default. The marker names the LEGITIMACY question (delib-37's S6 predicate:
-//! "no legitimate public USE"), never the auth mechanism: [`Never`] = a keyless shell no operator may serve
+//! handler, with no forgettable default. The marker names the LEGITIMACY question ("is there any
+//! legitimate public use"), never the auth mechanism: [`Never`] = a keyless shell no operator may serve
 //! to strangers, [`OptIn`] = legitimate to serve publicly IF the operator opts in. It carries its whole
 //! payload as [`PublicUse::OPEN_SAFE`], a const the type carries: readable by any consumer, implementable
 //! only by the two sealed markers here. An assembler reads it once at construction to refuse an open gate
