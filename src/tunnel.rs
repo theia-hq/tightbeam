@@ -10,7 +10,7 @@
 
 use core::time::Duration;
 
-// The handler contract lives in the lean `tightbeam-handler` crate (delib-56 verdict 13), re-exported here
+// The handler contract lives in the lean `tightbeam-handler` crate, re-exported here
 // unchanged so every existing `tightbeam::tunnel::*` path keeps working, and a service implements the
 // contract without taking this crate's tree. The erased bridge is imported, not re-exported: `Target` stores
 // it privately and it is not part of the author-facing surface.

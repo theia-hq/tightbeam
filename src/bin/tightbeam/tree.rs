@@ -2,7 +2,7 @@
 //!
 //! A local verb (binds no transport, dials nobody). It reads the same `///` one-liners clap renders for
 //! `--help`, so the printed tree can never drift from the help text: that is the whole point. A re-review
-//! diffs "what the binary exposes" against CLI-DESIGN in one command, rather than eyeballing help screens.
+//! diffs what the binary exposes against the intended surface in one command, rather than eyeballing help screens.
 //! Rendered with two-space indentation, one tree idiom across the family.
 
 use clap::{Args, Command};
