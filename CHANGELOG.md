@@ -2,7 +2,9 @@
 
 All notable changes to tightbeam, newest first.
 
-## Unreleased
+## v0.6.0
+
+One concern per file, a router that reads its own gate, and a disabled service that cannot be told from a gated one.
 
 ### Fixed
 - **A disabled service is checked after admission, not before.** The enabled oracle ran ahead of the
