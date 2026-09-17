@@ -11,6 +11,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use core::marker::PhantomData;
+use core::net::SocketAddr;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 
@@ -63,6 +64,10 @@ impl<T: Transport, P: SecurityProfile> Transport for Profiled<T, P> {
 
     fn local_addr(&self) -> Addr {
         self.inner.local_addr()
+    }
+
+    fn bound_sockets(&self) -> Vec<SocketAddr> {
+        self.inner.bound_sockets()
     }
 
     async fn connect(&self, addr: Addr) -> Result<Self::Session, Error> {

@@ -181,6 +181,7 @@ impl Connector {
 /// The announced profile is rejected where a proven peer is required:
 ///
 /// ```compile_fail,E0277
+/// # use core::net::SocketAddr;
 /// # use bifrost::{Addr, Announced, Error, Node, NodeId, NoDiscovery, Session, Transport};
 /// # use nauthy::{Link, Service};
 /// # use tightbeam::tunnel::PresentingConnector;
@@ -193,6 +194,7 @@ impl Connector {
 /// #     type Session = AnnouncedSession;
 /// #     fn node_id(&self) -> NodeId { unimplemented!() }
 /// #     fn local_addr(&self) -> Addr { unimplemented!() }
+/// #     fn bound_sockets(&self) -> Vec<SocketAddr> { unimplemented!() }
 /// #     async fn connect(&self, _: Addr) -> Result<Self::Session, Error> { unimplemented!() }
 /// #     async fn accept(&self) -> Result<Self::Session, Error> { unimplemented!() }
 /// #     async fn close(&self) {}
