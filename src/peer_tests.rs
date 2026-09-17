@@ -1,0 +1,95 @@
+//! What the composed discovery reads off its transport: bind truth, never the rewritten hints.
+
+use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
+
+use bifrost::{Addr, Error, InProcess, NodeId, Transport};
+use bifrost_mem::{MemSession, MemTransport};
+
+use crate::peer::Peer;
+
+/// A wildcard bind on a fixed port: the shape the rewrite destroys, since `local_addr` reports it as
+/// loopback and a publisher cannot then tell it from a node that deliberately bound `127.0.0.1`.
+const WILDCARD: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9000);
+
+/// An address accessor read off the transport, with what it handed back.
+#[derive(Debug, PartialEq, Eq)]
+enum Read {
+    /// The dialable hints, which rewrite an unspecified bind to loopback.
+    LocalAddr(Vec<SocketAddr>),
+    /// The sockets as bound, unspecified IP preserved.
+    BoundSockets(Vec<SocketAddr>),
+}
+
+/// A transport over mem's sessions that records which address accessor was read and answers
+/// [`bound_sockets`](Transport::bound_sockets) with a wildcard bind of its own.
+///
+/// The two accessors are indistinguishable downstream (the advertisement goes to the network, not to
+/// a value the test holds), so recording the read at the source is what proves which one the
+/// composition root trusted.
+struct Recording {
+    inner: MemTransport,
+    reads: Arc<Mutex<Vec<Read>>>,
+}
+
+impl Transport for Recording {
+    type Security = InProcess;
+    type Session = MemSession;
+
+    fn node_id(&self) -> NodeId {
+        self.inner.node_id()
+    }
+
+    fn local_addr(&self) -> Addr {
+        let addr = self.inner.local_addr();
+        self.record(Read::LocalAddr(addr.hints.clone()));
+        addr
+    }
+
+    fn bound_sockets(&self) -> Vec<SocketAddr> {
+        self.record(Read::BoundSockets(vec![WILDCARD]));
+        vec![WILDCARD]
+    }
+
+    async fn connect(&self, addr: Addr) -> Result<Self::Session, Error> {
+        self.inner.connect(addr).await
+    }
+
+    async fn accept(&self) -> Result<Self::Session, Error> {
+        self.inner.accept().await
+    }
+
+    async fn close(&self) {
+        self.inner.close().await;
+    }
+}
+
+impl Recording {
+    /// Note one accessor read. A poisoned lock would only be a panic inside an accessor, which would
+    /// have failed the test already.
+    fn record(&self, read: Read) {
+        self.reads.lock().unwrap().push(read);
+    }
+}
+
+/// Composing the discovery hands mDNS the transport's bound sockets, and never asks for the hints.
+///
+/// The advertisement itself may or may not reach the network here (a sandbox blocks multicast, which
+/// is the honest degraded path), so the assertion is on what the composition root read, which holds
+/// either way.
+#[tokio::test]
+async fn composing_discovery_advertises_the_bound_sockets() {
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let transport = Recording {
+        inner: MemTransport::bind(),
+        reads: Arc::clone(&reads),
+    };
+
+    let _discovery = Peer::discovery(&transport, []);
+
+    assert_eq!(
+        *reads.lock().unwrap(),
+        vec![Read::BoundSockets(vec![WILDCARD])],
+        "the advertisement must take raw bind truth, not the loopback-rewritten hints"
+    );
+}

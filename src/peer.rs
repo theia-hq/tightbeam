@@ -12,7 +12,7 @@ use core::str::FromStr;
 use std::net::ToSocketAddrs;
 
 use bifrost::{Layered, NodeId, StaticDiscovery, Transport};
-use bifrost_mdns::MdnsDiscovery;
+use bifrost_mdns::{Advertising, MdnsDiscovery, Started};
 use eyre::WrapErr as _;
 
 /// The discovery tightbeam composes: explicit [`Peer`] hints layered over LAN mDNS (iroh keeps n0 as the
@@ -31,7 +31,7 @@ pub struct Peer {
 
 impl Peer {
     /// Compose the discovery for a freshly bound transport: the [`Peer`] hints layered over an mDNS
-    /// resolver that advertises this node locally and browses the LAN. Degrades to hints-only if mDNS
+    /// resolver that advertises this node's bind and browses the LAN. Degrades to hints-only if mDNS
     /// cannot start (multicast blocked), rather than failing the command.
     pub fn discovery<T: Transport>(
         transport: &T,
@@ -41,15 +41,47 @@ impl Peer {
         for Self { node, addrs } in peers {
             hints.insert(node, addrs);
         }
-        let local = transport.local_addr();
-        let mdns = match MdnsDiscovery::advertise(local.node, local.hints) {
-            Ok(mdns) => mdns,
+        // Bind truth, never `local_addr`'s hints: the hints rewrite an unspecified bind to loopback, so
+        // handing them over would advertise `127.0.0.1` for a node bound to every interface and make
+        // every LAN dialer reach its own machine. Discovery owns what of the bind is publishable.
+        let mdns = match MdnsDiscovery::advertise(transport.node_id(), transport.bound_sockets()) {
+            Ok(Started {
+                discovery,
+                advertising,
+            }) => {
+                report(&advertising);
+                discovery
+            }
             Err(err) => {
                 tracing::warn!(error = %err, "mDNS discovery unavailable; using explicit peer hints only");
                 MdnsDiscovery::disabled()
             }
         };
         Layered::new(hints, mdns)
+    }
+}
+
+/// Log how far the started advertisement actually reaches.
+///
+/// The composed [`Discovery`] cannot be asked: a node publishing nothing, a node publishing only
+/// loopback, and a node on the LAN all resolve peers identically, and the two degraded ones are
+/// invisible to every other host while looking live from the inside. Each arm names its own reach, so
+/// a run that cannot be found says why instead of leaving the operator to guess.
+fn report(advertising: &Advertising) {
+    match advertising {
+        Advertising::OnLan(advertised) => tracing::debug!(
+            port = advertised.port(),
+            addrs = advertised.addrs().len(),
+            "advertising this node on the LAN over mDNS"
+        ),
+        Advertising::LoopbackOnly(advertised) => tracing::debug!(
+            port = advertised.port(),
+            "advertising this node over mDNS on loopback only; a peer on another host needs a direct address hint"
+        ),
+        Advertising::BrowseOnly(cause) => tracing::debug!(
+            error = %cause,
+            "browsing the LAN over mDNS without advertising this node; a peer on another host needs a direct address hint"
+        ),
     }
 }
 

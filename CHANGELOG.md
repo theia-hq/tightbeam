@@ -17,6 +17,12 @@ All notable changes to tightbeam, newest first.
   bytes the feed has moved past.
 
 ### Changed
+- **Pinned to the bifrost and nauthy revs that carry raw bind truth.** `bifrost::Transport` now requires
+  `bound_sockets()`, so a program that brings its own transport to `Peer::discovery` must implement it; in
+  return the composed mDNS discovery advertises the sockets the node actually bound, expanding a `0.0.0.0`
+  bind into this host's own addresses instead of publishing the loopback address `local_addr` rewrites it
+  to, and the outcome is logged rather than assumed. `nauthy::Link` is pointer-sized and reaches its `Cap`
+  through `Link::cap()`.
 - **`Router::catalog` no longer takes a gate.** The router has held its base gate since `Router::new`, so
   the catalog reads its own; `Router::gate()` hands that gate back for a program composing a node from it.
 - **The public stream pool is pinned by test.** Four connected public streams fill the node-wide pool on
