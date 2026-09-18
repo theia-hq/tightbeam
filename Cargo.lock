@@ -232,6 +232,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "bifrost"
 version = "0.2.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=70a7c7e122300a9956874af76873950b24fc1dda#70a7c7e122300a9956874af76873950b24fc1dda"
 dependencies = [
  "bifrost-core",
  "bifrost-transport",
@@ -241,6 +242,7 @@ dependencies = [
 [[package]]
 name = "bifrost-core"
 version = "0.0.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=70a7c7e122300a9956874af76873950b24fc1dda#70a7c7e122300a9956874af76873950b24fc1dda"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -251,6 +253,7 @@ dependencies = [
 [[package]]
 name = "bifrost-iroh"
 version = "0.0.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=70a7c7e122300a9956874af76873950b24fc1dda#70a7c7e122300a9956874af76873950b24fc1dda"
 dependencies = [
  "bifrost-core",
  "bifrost-transport",
@@ -262,6 +265,7 @@ dependencies = [
 [[package]]
 name = "bifrost-mdns"
 version = "0.0.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=70a7c7e122300a9956874af76873950b24fc1dda#70a7c7e122300a9956874af76873950b24fc1dda"
 dependencies = [
  "bifrost-core",
  "if-addrs",
@@ -274,6 +278,7 @@ dependencies = [
 [[package]]
 name = "bifrost-mem"
 version = "0.0.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=70a7c7e122300a9956874af76873950b24fc1dda#70a7c7e122300a9956874af76873950b24fc1dda"
 dependencies = [
  "bifrost-core",
  "bifrost-transport",
@@ -284,6 +289,7 @@ dependencies = [
 [[package]]
 name = "bifrost-transport"
 version = "0.0.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=70a7c7e122300a9956874af76873950b24fc1dda#70a7c7e122300a9956874af76873950b24fc1dda"
 dependencies = [
  "bifrost-core",
  "tokio",
@@ -292,6 +298,7 @@ dependencies = [
 [[package]]
 name = "bifrost-wire"
 version = "0.0.0"
+source = "git+https://github.com/theia-hq/bifrost?rev=70a7c7e122300a9956874af76873950b24fc1dda#70a7c7e122300a9956874af76873950b24fc1dda"
 dependencies = [
  "blake3",
  "thiserror 2.0.20",
@@ -2119,6 +2126,7 @@ dependencies = [
 [[package]]
 name = "nauthy"
 version = "0.2.1"
+source = "git+https://github.com/theia-hq/nauthy?rev=fcd30ccd295aee03a7b0b12de4ebf4b8b7e09d54#fcd30ccd295aee03a7b0b12de4ebf4b8b7e09d54"
 dependencies = [
  "biscuit-auth",
  "data-encoding",
