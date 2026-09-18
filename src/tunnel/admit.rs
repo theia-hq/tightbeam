@@ -133,7 +133,7 @@ where
             // pre-authorization revocation or capability-enumeration oracle. A saturated public pool is
             // wire-identical to a gate miss for the same reason.
             tracing::warn!(%peer, service = %service, %refusal, "refused");
-            return Response::Refused(Refusal::NotAdmitted)
+            return Response::Refused(wire_refusal(&refusal))
                 .write(&mut writer)
                 .await
                 .map_err(Into::into);
@@ -297,6 +297,32 @@ enum HostRefusal {
         /// Which pool is at its cap (`public sessions` / `public streams`).
         cap: &'static str,
     },
+}
+
+/// The wire refusal a host cause becomes. Every cause maps to the same payload-free `NotAdmitted` today,
+/// and this function exists so that stays a DECISION rather than a default.
+///
+/// It is written as an exhaustive match, with the gate's own cause destructured and no wildcard anywhere,
+/// because the alternative failed: a new gate outcome added upstream inherits whatever the fall-through
+/// happened to be, silently, and a uniform refusal is exactly the kind of answer that must never be
+/// inherited. nauthy is about to gain one (an evaluation that ran out of time, which is not a ruling about
+/// the dialer at all), and when that pin moves this match will stop compiling until someone rules on it.
+/// That is the point, and a reviewer who reaches for a wildcard to make it build has thrown the guard away.
+///
+/// The uniformity itself is settled and is not what this function reopens: a dialer must not be able to
+/// tell a stranger's missing token from a revoked holder's, an absent service from a gated one, or a
+/// saturated public pool from a gate miss.
+fn wire_refusal(refusal: &HostRefusal) -> Refusal {
+    match refusal {
+        HostRefusal::MalformedCapability(_)
+        | HostRefusal::PeerNotProven { .. }
+        | HostRefusal::PublicAtCapacity { .. } => Refusal::NotAdmitted,
+        HostRefusal::Gate(gate) => match gate {
+            nauthy::Refusal::Missing | nauthy::Refusal::NotGranted | nauthy::Refusal::Revoked => {
+                Refusal::NotAdmitted
+            }
+        },
+    }
 }
 
 impl From<nauthy::Refusal> for HostRefusal {
