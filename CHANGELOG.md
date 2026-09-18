@@ -2,7 +2,9 @@
 
 All notable changes to tightbeam, newest first.
 
-## Unreleased
+## v0.7.0
+
+Every target carries a scheme, so the grammar is total and a near-miss is a refusal.
 
 ### Changed
 - **Every target carries a scheme: a TCP forward is now `tcp:<host>:<port>`.** The bare `host:port` form is
@@ -12,6 +14,12 @@ All notable changes to tightbeam, newest first.
   `<scheme>:<rest>`, an unknown scheme is refused by name with the legal set (`tcp:`, `unix:`, `file:`,
   `fifo:`, `stdin:`, `echo:`), and a scheme that takes no argument refuses a tail. `unix:<path>` is
   unchanged. Update every `name=host:port` entry and every `Router::forward` addr to `tcp:host:port`.
+- **A target is parsed once.** `Forward` held the whole address as a string and re-parsed it at dial, so
+  two functions decided `unix:` versus TCP and already disagreed on a reachable input: a forward named with
+  a bare `unix:` validated and then dialed the empty path. The parse at the boundary is the only one now,
+  which deletes the validator and the prefix re-dispatch both.
+- **The legal target forms are public.** A consumer that serves its own schemes on top of this grammar has
+  to name both sets in one refusal, and the alternative is retyping the list somewhere it can rot.
 
 ## v0.6.0
 
