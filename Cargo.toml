@@ -20,10 +20,10 @@ license = "MIT OR Apache-2.0"
 # `.cargo/config.toml` still [patch]es these by URL to sibling PATH checkouts, so a `rev` here does not
 # slow local builds (the patch wins locally regardless of the rev); CI resolves the rev from GitHub. All
 # bifrost-* crates live in one repo, so they share one rev. Bump deliberately each release.
-bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "a5764e22b72be4288b53fafe5d7425319aa33f51" }
-bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "a5764e22b72be4288b53fafe5d7425319aa33f51" }
-bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "a5764e22b72be4288b53fafe5d7425319aa33f51" }
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "fcd30ccd295aee03a7b0b12de4ebf4b8b7e09d54" }
+bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "21ea41f13ea5dedfc95c98e7f01234c38fe11b74" }
+bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "21ea41f13ea5dedfc95c98e7f01234c38fe11b74" }
+bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "21ea41f13ea5dedfc95c98e7f01234c38fe11b74" }
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "f2ad714070ced87f91dae5275d30e9b2fa10e3dd" }
 # The handler contract, in-tree beside its only dispatcher. A path dep (not a git self-dep): the workspace
 # member resolves within this checkout, and the package stays separately pinnable by a consumer.
 tightbeam-handler = { path = "tightbeam-handler" }
@@ -46,7 +46,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "a5764e22b72be4288b53fafe5d7425319aa33f51" }
+bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "21ea41f13ea5dedfc95c98e7f01234c38fe11b74" }
 
 [lints]
 workspace = true
