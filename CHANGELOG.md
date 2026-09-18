@@ -2,6 +2,16 @@
 
 All notable changes to tightbeam, newest first.
 
+## v0.7.1
+
+The bifrost pin moves, and both manifests move with it.
+
+### Changed
+- **Pinned to bifrost v0.2.1.** Additive upstream: the expansion that turns a bind into the sockets it
+  answers on is public there now, and a node reports the sockets it bound. Nothing this crate calls
+  changes shape. The handler contract crate pins `bifrost-core` on its own, so both manifests move
+  together; bumping only the root left two copies of it in one graph.
+
 ## v0.7.0
 
 Every target carries a scheme, so the grammar is total and a near-miss is a refusal.
