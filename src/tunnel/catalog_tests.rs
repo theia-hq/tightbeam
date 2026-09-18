@@ -11,7 +11,7 @@ use crate::tunnel::router::{PublicRequest, PublicUnsafeRequest};
 /// round trip byte for byte: the read `control.services` returns and the client decodes are the same value.
 #[test]
 fn a_gated_catalog_reports_gated_and_round_trips() {
-    let services = services(&["c=127.0.0.1:80"])
+    let services = services(&["c=tcp:127.0.0.1:80"])
         .with_handler("a", OpenNoop)
         .expect("`a` binds");
     let services = services.with_handler("b", OpenNoop).expect("`b` binds");
@@ -37,7 +37,7 @@ fn a_gated_catalog_reports_gated_and_round_trips() {
 /// public node's catalog says anyone may reach these.
 #[test]
 fn an_open_catalog_reports_open() {
-    let services = services(&["a=127.0.0.1:80"])
+    let services = services(&["a=tcp:127.0.0.1:80"])
         .with_handler("b", OpenNoop)
         .expect("`b` binds");
     let catalog = services.catalog(

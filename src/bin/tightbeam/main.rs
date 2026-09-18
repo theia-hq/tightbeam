@@ -2,7 +2,7 @@
 //!
 //! The library is [`tightbeam::tunnel`]; a full-featured CLI over this library owns the real product
 //! surface. This binary drives the same core over an EMPTY registry, so it serves only raw forwards
-//! (`host:port` / `unix:<path>` / `file:` / `fifo:` / `stdin:`), never a named handler. Its one real use is
+//! (`tcp:<host>:<port>` / `unix:<path>` / `file:` / `fifo:` / `stdin:`), never a named handler. Its one real use is
 //! as a ProxyCommand-shaped stdio bridge (reach a service over a stream, `connect --to -`) before a
 //! full-featured CLI is on a machine.
 //!

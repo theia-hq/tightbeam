@@ -13,7 +13,7 @@ use tightbeam::tunnel::Router;
 
 let node = Router::new(gate)                        // one gate in front of every route
     .service("ssh".parse()?, Sshd::new(host_seed))? // a handler you import; never opens
-    .forward("web".parse()?, "127.0.0.1:8080")?     // a local port, spliced
+    .forward("web".parse()?, "tcp:127.0.0.1:8080")? // a local port, spliced
     .echo("demo".parse()?)?                         // a built-in
     .public(["demo".parse()?])                      // opened to anyone, by name
     .expose()?;                                     // proves every route before it serves
@@ -103,7 +103,7 @@ use tightbeam::tunnel::{self, CancellationToken, Router};
 let gate = tunnel::resolve_gate(Some(signet), denylist)?;   // family gate on the node's signet
 let exposer = Router::new(gate)
     .echo("demo".parse()?)?
-    .forward("web".parse()?, "127.0.0.1:8080")?
+    .forward("web".parse()?, "tcp:127.0.0.1:8080")?
     .expose()?;
 exposer.run(&node, CancellationToken::new()).await?;   // runs until cancelled; prints nothing
 ```
@@ -112,10 +112,10 @@ exposer.run(&node, CancellationToken::new()).await?;   // runs until cancelled; 
 to strangers is a deliberate second step, `.public(names)` (a safe handler opened per service), which
 `.expose()` proves before the node serves it. A handler that declares itself closed (`Never`: a keyless
 shell) is refused when the proof is prepared, and a raw byte source (`file:`/`fifo:`/`stdin:`) is
-redirected to the distinct, louder `.public_unsafe(names)` opt-in. `.parse(&["web=127.0.0.1:8080".into()])`
-absorbs the `name=target` grammar; a bare `<name>:` no longer resolves, since handlers bind by value. The
-`CancellationToken` is the node's teardown handle: a caller may hold a clone and fire it to stop the accept
-loop.
+redirected to the distinct, louder `.public_unsafe(names)` opt-in. `.parse(&["web=tcp:127.0.0.1:8080".into()])`
+absorbs the `name=target` grammar, where every target carries a scheme and the set is closed: an unknown
+scheme is an error naming the legal set, since handlers bind by value. The `CancellationToken` is the
+node's teardown handle: a caller may hold a clone and fire it to stop the accept loop.
 
 The exposer proves the transport as well: `Exposer::run` refuses to arm a rooted gate over a transport
 that does not prove the peer, and `Exposer::prove_security::<T>()` exposes the same check to a caller that
@@ -196,7 +196,7 @@ the host's involvement. Revoking cuts it off at once; short expiry backs that up
 A forward carries bytes. The program on each end does not know the overlay is there. The service on the host
 is one of:
 
-- a `host:port` or `unix:<path>`, spliced to a local address: the built-in `Forward` service;
+- a `tcp:<host>:<port>` or `unix:<path>`, spliced to a local socket: the built-in `Forward` service;
 - a `file:<path>` or `fifo:<path>` (a path's raw bytes sourced to the peer), or `stdin:` (whatever a
   producer pipes in). A `stdin:` or `fifo:` source serves one consumer at a time. `stdin:+lossy` or
   `fifo:<path>+lossy` fans it out to many, dropping bytes for a consumer that falls behind: a live feed,
@@ -227,7 +227,7 @@ refused, then the transparent byte pipe begins.
 
 The library is the product, but the `tightbeam` binary is a real command-line tool that drives it from the
 shell, and the [getting-started walkthrough](examples.md) runs entirely on it. It exposes services (raw
-`host:port` / `unix:` forwards, and the `echo:` / `stdin:` / `file:` / `fifo:` sources), gated by default or
+`tcp:` / `unix:` forwards, and the `echo:` / `stdin:` / `file:` / `fifo:` sources), gated by default or
 opened with `--public` (and `--public-unsafe` for a raw source); it reaches them with `connect`; and it
 mints, shares, and revokes `sheer:` links. It registers no `Handler` of its own, so a named handler (a
 shell, say) is something a library embedder adds in code. On its own the binary already covers forwarding,

@@ -49,9 +49,12 @@ pub use router::{ManifestEntry, RawSource, Router, TargetKind};
 /// no one submodule here owns it.
 pub(crate) const RAW_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Dial a service target (a `unix:<path>` socket or a `host:port`) and pipe it to the bifrost stream. The
-/// serve half of [`builtins::Forward`](crate::builtins::Forward), typed [`ServeError`] so a handler body
+/// Dial a local stream endpoint (`tcp:<host>:<port>` or `unix:<path>`) and pipe it to the bifrost stream.
+/// The serve half of [`builtins::Forward`](crate::builtins::Forward), typed [`ServeError`] so a handler body
 /// can `?` it directly.
+///
+/// The two endpoints are siblings and the splice does not care which it got; only the connect differs. The
+/// scheme is matched, never guessed, so this dials exactly what the grammar admitted.
 ///
 /// It sits at the tunnel root because it is the local-dial half [`crate::builtins`] serves a forward with,
 /// neither the route table's business nor the overlay connector's.
@@ -64,22 +67,30 @@ where
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
-    if let Some(path) = addr.strip_prefix("unix:") {
+    match addr.split_once(':') {
+        Some(("tcp", host_port)) => {
+            let local = TcpStream::connect(host_port).await?;
+            splice(local, writer, reader).await?;
+        }
         #[cfg(unix)]
-        {
+        Some(("unix", path)) => {
             let local = tokio::net::UnixStream::connect(path).await?;
             splice(local, writer, reader).await?;
         }
         #[cfg(not(unix))]
-        {
-            let _ = path;
+        Some(("unix", _)) => {
             return Err(ServeError::Io(io::Error::other(
                 "unix sockets are not supported on this platform",
             )));
         }
-    } else {
-        let local = TcpStream::connect(addr).await?;
-        splice(local, writer, reader).await?;
+        // Unreachable through the Router, whose grammar admits only the two above. It is reachable by a
+        // library caller that built a `Forward` by hand, so it refuses by name rather than guessing a TCP
+        // dial out of an address no one validated.
+        _ => {
+            return Err(ServeError::Io(io::Error::other(format!(
+                "`{addr}` is not a local stream endpoint; expected `tcp:<host>:<port>` or `unix:<path>`"
+            ))));
+        }
     }
     Ok(())
 }

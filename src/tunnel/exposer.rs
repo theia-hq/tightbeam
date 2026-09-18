@@ -130,7 +130,7 @@ impl Exposer {
         // no auth of its own, so under a node-wide open BASE it would serve a chosen path's bytes (or the
         // piped stdin) to anyone; a `file:<secret>` or `stdin:` source would exfil it. Refuse it at the same
         // door that refuses a keyless shell, UNLESS the operator knowingly opted this exact name into the
-        // unsafe overlay. A local forward (`host:port`/`unix:`) is not refused: it is a service the operator
+        // unsafe overlay. A local forward (`tcp:`/`unix:`) is not refused: it is a service the operator
         // deliberately stood up, not a bare file path one keystroke from a key.
         if matches!(gate, Gate::Open)
             && let Some(name) = services

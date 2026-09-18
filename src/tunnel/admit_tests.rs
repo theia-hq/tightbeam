@@ -213,13 +213,13 @@ impl Session for AnnouncedSession {
 
 #[test]
 fn a_single_service_node_needs_no_service_name() {
-    let Services(one) = services(&["a=127.0.0.1:80"]);
+    let Services(one) = services(&["a=tcp:127.0.0.1:80"]);
     // A connector defaulting to `default` on a single-service node resolves to that one service.
     assert_eq!(resolve_single_service(svc("default"), &one).as_str(), "a");
     // A request that already names the exposed service is unchanged.
     assert_eq!(resolve_single_service(svc("a"), &one).as_str(), "a");
 
-    let Services(two) = services(&["a=127.0.0.1:80", "b=127.0.0.1:81"]);
+    let Services(two) = services(&["a=tcp:127.0.0.1:80", "b=tcp:127.0.0.1:81"]);
     // With two services, an unmatched request is left as-is (fails later with the hint, never guesses).
     assert_eq!(
         resolve_single_service(svc("default"), &two).as_str(),
@@ -769,7 +769,7 @@ async fn a_disabled_service_is_refused_after_admission_not_before_the_gate() {
         ),
         public: PublicServices::default(),
         public_unsafe: PublicServices::default(),
-        services: services(&["doc=127.0.0.1:80"]),
+        services: services(&["doc=tcp:127.0.0.1:80"]),
         raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
         public_pool: PublicPool::new(),
         enabled: Box::new(CountingDisabled(Arc::clone(&count))),
@@ -798,7 +798,7 @@ async fn a_disabled_service_is_refused_after_admission_not_before_the_gate() {
         gate: Gate::Open,
         public: PublicServices::default(),
         public_unsafe: PublicServices::default(),
-        services: services(&["doc=127.0.0.1:80"]),
+        services: services(&["doc=tcp:127.0.0.1:80"]),
         raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
         public_pool: PublicPool::new(),
         enabled: Box::new(CountingDisabled(Arc::clone(&count))),
@@ -1041,7 +1041,7 @@ async fn an_announced_session_is_refused_at_admission_with_the_uniform_answer() 
         gate: family_gate("announced-seam"),
         public: PublicServices::default(),
         public_unsafe: PublicServices::default(),
-        services: services(&["web=127.0.0.1:80"]),
+        services: services(&["web=tcp:127.0.0.1:80"]),
         raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
         public_pool: PublicPool::new(),
         enabled: Box::new(AllEnabled),
