@@ -2,6 +2,24 @@
 
 All notable changes to tightbeam, newest first.
 
+## v0.8.0
+
+A gate that ran out of time no longer tells a dialer they lack authority.
+
+### Changed
+- **BREAKING for a dialer that matches on the refusal: an undecided gate answer is now `Unavailable`,
+  not `NotAdmitted`.** A capability check that exceeds its evaluation budget decided nothing about the
+  caller's authority, and the uniform not-admitted refusal is a lie they act on: they stop retrying and
+  go looking for a credential nothing rejected, and a download of theirs becomes a permanent 403 rather
+  than a retry. The detail is fixed text, never host state, because a detail that varied with load would
+  put a channel on a pre-admission refusal. Every other gate cause stays uniform and indistinguishable.
+  Interim: the ruling is that this answer deserves its own wire code, which is a format change and not
+  this crate's to make.
+- **Pinned to nauthy v0.3.0 and bifrost v0.2.2.** The nauthy bump is the point: every capability check
+  there ran on a one-millisecond wall-clock budget, so a loaded host refused a VALID capability and
+  reported it as a denial. On the previous pin a valid device badge was refused about one run in three on
+  the driver's machine.
+
 ## v0.7.1
 
 The bifrost pin moves, and both manifests move with it.

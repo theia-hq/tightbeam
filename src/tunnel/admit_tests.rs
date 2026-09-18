@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bifrost::{
-    Announced, ChannelProtection, NoDiscovery, Node, NodeId, PeerProof, Security, Session,
+    Announced, ChannelProtection, NoDiscovery, Node, NodeId, PeerProof, Refusal, Security, Session,
 };
 use bifrost_mem::MemTransport;
 use nauthy::{Gate, Service};
@@ -1257,4 +1257,40 @@ fn a_not_admitted_refusal_renders_descriptively_never_doubled() {
         !rendered.contains("refused: refused"),
         "the refusal render must never double the bare word: {rendered:?}"
     );
+}
+
+/// A gate that ran out of time decided NOTHING about the dialer, so the wire must not send them the
+/// answer that says it did. The uniform not-admitted refusal is a lie they act on: they stop retrying
+/// and go looking for a credential nothing rejected, and a download of theirs turns into a permanent
+/// 403 rather than a retry.
+///
+/// This is the interim mapping. The ruling is that the answer deserves its own wire code, which is a
+/// format change and not this layer's to make; the test pins the fallback so the day it is upgraded, the
+/// change is deliberate rather than silent. Every other gate cause stays uniform, which is settled and
+/// is not what this reopens.
+#[test]
+fn an_undecided_gate_is_not_the_refusal_that_rules_on_the_dialer() {
+    let undecided = super::wire_refusal(&super::HostRefusal::Gate(nauthy::Refusal::Undecided));
+
+    assert!(
+        matches!(undecided, Refusal::Unavailable { .. }),
+        "an answer about this host goes on the refusal that is about this host: {undecided}"
+    );
+    assert!(
+        !undecided.to_string().contains("not admitted"),
+        "and never on the one that tells a dialer they lack authority: {undecided}"
+    );
+
+    for uniform in [
+        nauthy::Refusal::Missing,
+        nauthy::Refusal::NotGranted,
+        nauthy::Refusal::Revoked,
+    ] {
+        let rendered = super::wire_refusal(&super::HostRefusal::Gate(uniform));
+        assert!(
+            matches!(rendered, Refusal::NotAdmitted),
+            "a stranger's missing token, a revoked holder's, and a non-granting one stay \
+             indistinguishable: {rendered}"
+        );
+    }
 }

@@ -321,6 +321,25 @@ fn wire_refusal(refusal: &HostRefusal) -> Refusal {
             nauthy::Refusal::Missing | nauthy::Refusal::NotGranted | nauthy::Refusal::Revoked => {
                 Refusal::NotAdmitted
             }
+            // NOT a ruling about the dialer, so not the refusal that says one. The gate ran out of time
+            // and decided nothing about their authority; sending the uniform not-admitted answer tells
+            // them they lack a credential nothing rejected, and they act on it, stopping their retries
+            // and going to look for a token they already hold.
+            //
+            // INTERIM, and named as one. The ruling on this is that it deserves its own wire code, which
+            // is a format change and therefore the founder's call; this is the fallback that same ruling
+            // named as acceptable in the meantime, and it changes no format. The cost is that
+            // `Unavailable` no longer implies the dialer got past the gate, which is why that variant's
+            // own doc was widened rather than left to drift. Taken now because the defect underneath it
+            // is live: on the previous pin a valid device badge was refused about one run in three.
+            //
+            // The detail is FIXED text, never host state. A detail that varied with load would put a
+            // channel on a pre-admission refusal, which is the thing the uniform answer exists to deny.
+            nauthy::Refusal::Undecided => Refusal::Unavailable {
+                detail: RefusalDetail::bounded(
+                    "the gate did not finish deciding in time; retry".to_owned(),
+                ),
+            },
         },
     }
 }
