@@ -12,9 +12,9 @@ repository = "https://github.com/theia-hq/tightbeam"
 # The gate's single-use admission witness and the origin it carries. `default-features = false` keeps the
 # contract runtime-free (no file denylist, no OS RNG); a consumer that needs those unifies its own nauthy
 # features in, cargo features being additive.
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "2b86559ddd22753673f86dd403648cbd1abd2fa0", default-features = false }
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "fcd30ccd295aee03a7b0b12de4ebf4b8b7e09d54", default-features = false }
 # `Refusal` for the typed serve error. `bifrost-core` only: the contract never names a transport backend.
-bifrost-core = { git = "https://github.com/theia-hq/bifrost", rev = "72f0b33e77e590f552907b60f50bb2a679a93707" }
+bifrost-core = { git = "https://github.com/theia-hq/bifrost", rev = "70a7c7e122300a9956874af76873950b24fc1dda" }
 thiserror = "2"
 # The boxed stream halves a handler receives. `io-util` only, no runtime: the contract never spawns.
 tokio = { version = "1", default-features = false, features = ["io-util"] }
@@ -22,7 +22,7 @@ tokio = { version = "1", default-features = false, features = ["io-util"] }
 [dev-dependencies]
 # The proof tests build a real rooted gate over the file-backed denylist, the same mint a dispatcher uses, so
 # they need nauthy's async-fs feature; the contract's normal dependency stays runtime-free.
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "2b86559ddd22753673f86dd403648cbd1abd2fa0", features = ["tokio-fs"] }
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "fcd30ccd295aee03a7b0b12de4ebf4b8b7e09d54", features = ["tokio-fs"] }
 
 [lints]
 workspace = true
