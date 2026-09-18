@@ -44,7 +44,7 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             tokio::task::spawn_local(async move {
                 let gate = tunnel::resolve_gate(Some(signet), empty_denylist().await).unwrap();
                 Router::new(gate)
-                    .parse(&[format!("web={echo_addr}")])
+                    .parse(&[format!("web=tcp:{echo_addr}")])
                     .unwrap()
                     .expose()
                     .unwrap()
@@ -117,7 +117,7 @@ async fn a_refused_forward_fails_at_preflight_with_the_reason() {
             tokio::task::spawn_local(async move {
                 let gate = tunnel::resolve_gate(Some(signet), empty_denylist().await).unwrap();
                 Router::new(gate)
-                    .parse(&[format!("web={echo_addr}")])
+                    .parse(&[format!("web=tcp:{echo_addr}")])
                     .unwrap()
                     .expose()
                     .unwrap()

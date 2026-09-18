@@ -44,7 +44,7 @@ async fn tunnels_tcp_over_bifrost() {
             // so any peer reaching the key is served (this test exercises the tunnel path, not authorization).
             tokio::task::spawn_local(async move {
                 Router::new(Gate::Open)
-                    .parse(&[format!("echo={echo_addr}")])
+                    .parse(&[format!("echo=tcp:{echo_addr}")])
                     .unwrap()
                     .expose()
                     .unwrap()

@@ -181,7 +181,7 @@ async fn a_sealed_transport_carries_a_gated_dial_unchanged() {
             tokio::task::spawn_local(async move {
                 let gate = tunnel::resolve_gate(Some(signet_id()), empty_denylist().await).unwrap();
                 Router::new(gate)
-                    .forward("web".parse().unwrap(), &echo.to_string())
+                    .forward("web".parse().unwrap(), &format!("tcp:{echo}"))
                     .unwrap()
                     .expose()
                     .unwrap()
@@ -224,7 +224,7 @@ async fn a_presenting_connector_dials_a_gated_service_over_a_proven_profile() {
             tokio::task::spawn_local(async move {
                 let gate = tunnel::resolve_gate(Some(signet_id()), empty_denylist().await).unwrap();
                 Router::new(gate)
-                    .forward("web".parse().unwrap(), &echo.to_string())
+                    .forward("web".parse().unwrap(), &format!("tcp:{echo}"))
                     .unwrap()
                     .expose()
                     .unwrap()
@@ -262,7 +262,7 @@ async fn a_rooted_gate_over_an_announced_transport_refuses_to_arm() {
 
     let rooted =
         Router::new(tunnel::resolve_gate(Some(signet_id()), empty_denylist().await).unwrap())
-            .forward("web".parse().unwrap(), "127.0.0.1:80")
+            .forward("web".parse().unwrap(), "tcp:127.0.0.1:80")
             .unwrap()
             .expose()
             .unwrap();
@@ -280,7 +280,7 @@ async fn a_rooted_gate_over_an_announced_transport_refuses_to_arm() {
     );
 
     let open = Router::new(nauthy::Gate::Open)
-        .forward("web".parse().unwrap(), "127.0.0.1:80")
+        .forward("web".parse().unwrap(), "tcp:127.0.0.1:80")
         .unwrap()
         .expose()
         .unwrap();

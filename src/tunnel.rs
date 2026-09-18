@@ -35,7 +35,7 @@ pub use admit::resolve_gate;
 pub use catalog::{Posture, ServiceCatalog, ServiceEntry};
 pub use connector::{Connector, DialRefused, PortForward, PresentingConnector, ServiceSession};
 pub use exposer::{CancellationToken, Exposer};
-pub use router::{ManifestEntry, RawSource, Router, TargetKind};
+pub use router::{ManifestEntry, RawSource, Router, TARGET_SCHEMES, TargetKind};
 
 /// How long to wait for a `fifo:` WRITER before dropping the stream. The FIFO open itself is NONBLOCKING
 /// (`O_NONBLOCK`, so it returns a valid fd at once with no writer and never parks a thread), but a writer-less

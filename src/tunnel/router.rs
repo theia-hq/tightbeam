@@ -701,9 +701,13 @@ impl PublicServices {
     }
 }
 
-/// Every legal target scheme, rendered once so the two grammar refusals below (no scheme, unknown scheme)
-/// can never drift from each other or from what [`parse_target`] actually routes.
-const TARGET_SCHEMES: &str = "`tcp:<host>:<port>`, `unix:<path>`, `file:<path>`, `fifo:<path>`, \
+/// Every target scheme tightbeam itself routes, rendered once so the two grammar refusals below (no
+/// scheme, unknown scheme) can never drift from each other or from what [`parse_target`] actually routes.
+///
+/// Public because a consumer that serves its OWN schemes on top of this grammar has to name both sets in
+/// one refusal, and the only alternative is retyping this list somewhere it can rot. It is prose for a
+/// message, not a parseable list: match on the scheme, not on this.
+pub const TARGET_SCHEMES: &str = "`tcp:<host>:<port>`, `unix:<path>`, `file:<path>`, `fifo:<path>`, \
                               `stdin:`, `echo:`";
 
 /// Resolve an exposed service's address to a [`Target`]. Every target is `<scheme>:<rest>`, so the grammar
