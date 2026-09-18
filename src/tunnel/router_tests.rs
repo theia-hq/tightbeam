@@ -25,9 +25,9 @@ fn a_bare_service_name_is_rejected_with_a_hint() {
 
 #[test]
 fn a_bare_scheme_without_a_name_is_rejected() {
-    // Bare `ping:` names no service either: only `ping=ping:` is spelled.
-    let Err(err) = Services::parse(&["ping:".to_owned()]) else {
-        panic!("bare `ping:` should be rejected, not served");
+    // Bare `echo:` names no service either: only `demo=echo:` is spelled.
+    let Err(err) = Services::parse(&["echo:".to_owned()]) else {
+        panic!("bare `echo:` should be rejected, not served");
     };
     assert!(
         err.to_string().contains("name=target"),
@@ -39,8 +39,10 @@ fn a_bare_scheme_without_a_name_is_rejected() {
 /// overwrite would drop the first target (and could move a member floor off the route it was declared on).
 #[test]
 fn a_duplicate_service_name_is_refused_by_parse() {
-    let Err(err) = Services::parse(&["web=127.0.0.1:80".to_owned(), "web=127.0.0.1:81".to_owned()])
-    else {
+    let Err(err) = Services::parse(&[
+        "web=tcp:127.0.0.1:80".to_owned(),
+        "web=tcp:127.0.0.1:81".to_owned(),
+    ]) else {
         panic!("a duplicate name must be refused, never silently overwritten");
     };
     assert!(
@@ -52,7 +54,7 @@ fn a_duplicate_service_name_is_refused_by_parse() {
 #[test]
 fn real_targets_parse() {
     for entry in [
-        "web=127.0.0.1:8080",
+        "web=tcp:127.0.0.1:8080",
         "db=unix:/run/db.sock",
         "pipe=file:/tmp/beam",
         "named=fifo:/tmp/beam",
@@ -65,29 +67,60 @@ fn real_targets_parse() {
     }
 }
 
-/// A bare `<scheme>:` used to name a registry handler. Handlers bind by value on the Router, so the
-/// scheme namespace is a teaching error now, never a silently-dangling target.
+/// The grammar is TOTAL: there is no fall-through arm, so a scheme tightbeam does not serve is refused by
+/// name and told the legal set, whether it was once a registry handler (`handler:`, `control.status:`), a
+/// typo, or the bare `host:port` the `tcp:` scheme replaced. Handlers bind by value on the Router, so no
+/// scheme names one.
 #[test]
-fn a_handler_scheme_entry_is_a_teaching_error() {
+fn an_unknown_scheme_is_refused_and_names_the_legal_set() {
     for entry in [
         "a=handler:",
         "status=control.status:",
         "restart=control.restart:",
+        "web=htp:example",
+        "web=127.0.0.1:8080",
     ] {
         let Err(err) = Services::parse(&[entry.to_owned()]) else {
-            panic!("`{entry}` names a handler scheme and must be refused");
+            panic!("`{entry}` names an unknown scheme and must be refused");
         };
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("handler scheme"),
-            "the refusal teaches the binding shape: {err}"
+            message.contains("unknown target scheme"),
+            "the refusal names the fault: {message}"
+        );
+        assert!(
+            message.contains("`tcp:<host>:<port>`") && message.contains("`echo:`"),
+            "the refusal names the legal set: {message}"
+        );
+    }
+}
+
+/// THE defect this grammar exists to kill. While a bare `host:port` was a legal target, `ping=ping:80` was
+/// syntactically indistinguishable from a forward to a host named `ping`, so a probe that missed its exact
+/// string silently became a forward. With a scheme on every target, a scheme that takes no argument refuses
+/// a tail instead of quietly becoming something else.
+#[test]
+fn a_zero_argument_scheme_refuses_a_tail() {
+    for (entry, scheme) in [("demo=echo:80", "echo"), ("cam=stdin:80", "stdin")] {
+        let Err(err) = Services::parse(&[entry.to_owned()]) else {
+            panic!("`{entry}` gives a tail to a zero-argument scheme and must be refused");
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("`{scheme}:` takes no argument")),
+            "the refusal names the scheme and the rule: {message}"
+        );
+        assert!(
+            message.contains("`80`"),
+            "the refusal quotes the offending tail: {message}"
         );
     }
 }
 
 #[test]
-fn raw_stream_schemes_resolve_to_a_raw_stream_target_never_a_bare_forward_or_handler() {
+fn raw_stream_schemes_resolve_to_a_raw_stream_target_never_a_forward_or_handler() {
     // `file:`/`fifo:` carry a PATH tail, so they must resolve to the guarded raw-stream forward, NEVER
-    // a plain `Target::Forward` (which would splice unguarded) nor a `Target::Handler` (a bare scheme).
+    // a plain forward (which would splice unguarded) nor a `Target::Handler`.
     // Pin it so a future refactor cannot regress the routing into an unguarded shape.
     for entry in ["pipe=file:/tmp/beam", "named=fifo:/tmp/beam"] {
         let Services(parsed) = services(&[entry]);
@@ -97,20 +130,37 @@ fn raw_stream_schemes_resolve_to_a_raw_stream_target_never_a_bare_forward_or_han
             "{entry} must resolve to Target::RawStream, got {route:?}"
         );
     }
-    // A bare `file:`/`fifo:` with no path is NOT a handler: it fails loudly at parse.
+    // A bare `file:`/`fifo:` with no path is not a target: it fails loudly at parse.
     assert!(
         Services::parse(&["pipe=file:".to_owned()]).is_err(),
-        "`file:` with no path must be rejected, never treated as a handler scheme"
+        "`file:` with no path must be rejected"
     );
     assert!(
         Services::parse(&["pipe=fifo:".to_owned()]).is_err(),
-        "`fifo:` with no path must be rejected, never treated as a handler scheme"
+        "`fifo:` with no path must be rejected"
     );
 }
 
+/// An addr with no colon carries no scheme at all, so it is not a target: refused with the legal set,
+/// never dialed on the guess that it might be a host.
 #[test]
 fn a_named_service_pointed_at_a_bogus_addr_is_rejected() {
-    assert!(Services::parse(&["web=nonsense".to_owned()]).is_err());
+    let Err(err) = Services::parse(&["web=nonsense".to_owned()]) else {
+        panic!("`web=nonsense` names no target scheme and must be refused");
+    };
+    assert!(
+        err.to_string().contains("names no target scheme"),
+        "the refusal names the fault: {err}"
+    );
+    // The tail of a `tcp:` target is still proven: a scheme alone does not make an addr dialable.
+    assert!(
+        Services::parse(&["web=tcp:nonsense".to_owned()]).is_err(),
+        "`tcp:` with no `<host>:<port>` tail must be rejected at parse, not at dial"
+    );
+    assert!(
+        Services::parse(&["db=unix:".to_owned()]).is_err(),
+        "`unix:` with no path must be rejected at parse, not at dial"
+    );
 }
 
 #[test]
@@ -124,8 +174,7 @@ fn echo_scheme_resolves_to_the_builtin_reflector() {
         "`echo:` must resolve to a bound handler, got {route:?}"
     );
     assert_eq!(route.target.kind(), TargetKind::Handler);
-    // `echo:` takes no argument and tolerates no `+lossy` (it is not a raw-stream source): both are refused
-    // at parse, loudly at expose.
+    // `echo:` tolerates no `+lossy` (it is not a raw-stream source), refused at parse rather than at expose.
     assert!(
         Services::parse(&["demo=echo:+lossy".to_owned()]).is_err(),
         "`echo:+lossy` must be rejected: echo is not a fan-out raw-stream source"
@@ -161,11 +210,11 @@ fn lossy_is_accepted_only_on_stdin_and_fifo_and_rejected_elsewhere() {
         );
     }
     // On any OTHER scheme `+lossy` is refused at PARSE with a teaching message: a `file:` (static bytes,
-    // dropping would be corruption), a `host:port` / `unix:` forward, or a handler scheme are not
+    // dropping would be corruption), a `tcp:` / `unix:` forward, or an unknown scheme are not
     // loss-tolerant live sources. Rejected loudly at expose, not silently ignored.
     for entry in [
         "doc=file:/etc/hosts+lossy",
-        "web=127.0.0.1:8080+lossy",
+        "web=tcp:127.0.0.1:8080+lossy",
         "db=unix:/run/db.sock+lossy",
         "a=handler:+lossy",
     ] {
@@ -199,7 +248,7 @@ fn a_dotted_name_binds_a_handler_for_a_method_on_an_interface() {
 /// decides), and `member_only` flips exactly the named route to [`Access::Member`].
 #[test]
 fn routes_default_to_family_and_member_only_flips_the_named_route() {
-    let parsed = services(&["web=127.0.0.1:80", "locked=127.0.0.1:81"]);
+    let parsed = services(&["web=tcp:127.0.0.1:80", "locked=tcp:127.0.0.1:81"]);
     let Services(routes) = &parsed;
     assert!(
         routes.values().all(|route| route.access == Access::Family),
@@ -215,7 +264,7 @@ fn routes_default_to_family_and_member_only_flips_the_named_route() {
 /// a silent no-op would leave the operator believing a floor exists that does not.
 #[test]
 fn member_only_refuses_a_name_the_node_does_not_serve() {
-    let Err(error) = services(&["web=127.0.0.1:80"]).member_only("nope") else {
+    let Err(error) = services(&["web=tcp:127.0.0.1:80"]).member_only("nope") else {
         panic!("marking an unserved name must be refused");
     };
     assert!(
@@ -225,9 +274,9 @@ fn member_only_refuses_a_name_the_node_does_not_serve() {
 }
 
 #[test]
-fn stdin_resolves_to_a_raw_stream_target_routed_before_the_bare_scheme_arm() {
-    // `stdin:` is a zero-arg raw-stream source: it must resolve to `Target::RawStream`, NOT a
-    // `Target::Handler("stdin")` (which the bare-scheme arm would produce and no registry would hold).
+fn stdin_resolves_to_a_raw_stream_target() {
+    // `stdin:` is a zero-arg raw-stream source: it must resolve to `Target::RawStream`, never a handler
+    // and never a forward to a host named `stdin`.
     // (Under `cargo test` fd 0 is not a tty, so the parse-time TTY refusal does not fire.)
     let Services(parsed) = services(&["cam=stdin:"]);
     let route = parsed.values().next().expect("one service parsed");
@@ -254,15 +303,16 @@ fn a_router_refuses_a_duplicate_across_bind_verbs() {
     let through_parse = Router::new(Gate::Open)
         .service(svc("web"), OpenNoop)
         .expect("first bind")
-        .parse(&["web=127.0.0.1:80".to_owned()]);
+        .parse(&["web=tcp:127.0.0.1:80".to_owned()]);
     assert!(
         through_parse.is_err(),
         "the parse entry must refuse the duplicate too"
     );
     // And within one `parse`, the duplicate is refused by the same message.
-    let Err(error) = Router::new(Gate::Open)
-        .parse(&["web=127.0.0.1:80".to_owned(), "web=127.0.0.1:81".to_owned()])
-    else {
+    let Err(error) = Router::new(Gate::Open).parse(&[
+        "web=tcp:127.0.0.1:80".to_owned(),
+        "web=tcp:127.0.0.1:81".to_owned(),
+    ]) else {
         panic!("a duplicate `name=target` entry must be refused");
     };
     assert!(
@@ -279,7 +329,8 @@ fn a_router_refuses_a_duplicate_across_bind_verbs() {
 fn open_safe_is_total_over_target() {
     let optin: Target = Target::Handler(Arc::new(OpenNoop));
     let never: Target = Target::Handler(Arc::new(GatedNoop));
-    let forward: Target = Target::Handler(Arc::new(crate::builtins::Forward::new("127.0.0.1:80")));
+    let forward: Target =
+        Target::Handler(Arc::new(crate::builtins::Forward::new("tcp:127.0.0.1:80")));
     let echo: Target = Target::Handler(Arc::new(crate::builtins::Echo));
     let raw = Target::RawStream(RawStream::from_reader(Box::new(&b"x"[..])));
 
@@ -299,14 +350,14 @@ fn open_safe_is_total_over_target() {
     );
 }
 
-/// The scheme namespace is gone: a `fetch_0:`-shaped entry is a handler-scheme teaching error at parse,
+/// The scheme namespace is gone: a `fetch_0:`-shaped entry is an unknown-scheme teaching error at parse,
 /// while the NAME `fetch_0` binds through the typed Router call like any other service name. Nothing is
 /// special about an underscore anymore; per-service instances are structural (one `service` call each).
 #[test]
 fn a_synthetic_shaped_name_is_just_a_bound_name() {
     assert!(
         Services::parse(&["x=fetch_0:".to_owned()]).is_err(),
-        "`fetch_0:` is a handler scheme and must be a teaching error"
+        "`fetch_0:` is not a target scheme and must be a teaching error"
     );
     let exposer = Router::new(Gate::Open)
         .service(svc("pub"), OpenNoop)
@@ -323,7 +374,7 @@ fn a_synthetic_shaped_name_is_just_a_bound_name() {
 /// the rest `gated`, under a family base gate. This is what the `control.services` read serves.
 #[test]
 fn a_catalog_reports_public_services_open_and_the_rest_gated() {
-    let services = services(&["web=127.0.0.1:80"])
+    let services = services(&["web=tcp:127.0.0.1:80"])
         .with_handler("speed", OpenNoop)
         .expect("`speed` binds")
         .with_handler("ssh", GatedNoop)
@@ -356,7 +407,7 @@ fn a_catalog_reports_public_services_open_and_the_rest_gated() {
 fn a_catalog_self_lists_the_row_being_built_gated() {
     let gate = family_gate("self-listing");
     let router = Router::new(gate)
-        .parse(&["aaa=127.0.0.1:81".to_owned()])
+        .parse(&["aaa=tcp:127.0.0.1:81".to_owned()])
         .expect("parses");
     let catalog = router.catalog(Some(svc("control.services")));
     let names: Vec<&str> = catalog.entries().map(|entry| entry.name.as_str()).collect();
@@ -384,7 +435,7 @@ fn a_router_binds_every_verb_and_proves_at_expose() {
     let exposer = Router::new(Gate::Open)
         .service(svc("ping"), OpenNoop)
         .expect("service binds")
-        .forward(svc("web"), "127.0.0.1:80")
+        .forward(svc("web"), "tcp:127.0.0.1:80")
         .expect("forward binds")
         .echo(svc("demo"))
         .expect("echo binds")

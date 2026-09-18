@@ -71,10 +71,10 @@ impl Router {
         self.service(name, crate::builtins::Echo)
     }
 
-    /// Bind `name` to tightbeam's built-in local forward: connect `addr` (a `host:port` or a
-    /// `unix:<path>`) and splice bytes to it. Sugar over [`service`](Self::service) with
-    /// [`Forward`](crate::builtins::Forward). The addr is validated here, so a typo fails at bind with a
-    /// teaching message rather than at dial time as an opaque reset.
+    /// Bind `name` to tightbeam's built-in local forward: connect `addr` (a `tcp:<host>:<port>` or a
+    /// `unix:<path>`, the two local stream endpoints) and splice bytes to it. Sugar over
+    /// [`service`](Self::service) with [`Forward`](crate::builtins::Forward). The addr is validated here, so
+    /// a typo fails at bind with a teaching message rather than at dial time as an opaque reset.
     pub fn forward(self, name: Service, addr: &str) -> eyre::Result<Self> {
         validate_forward(addr)?;
         self.service(name, crate::builtins::Forward::new(addr))
@@ -86,10 +86,11 @@ impl Router {
         self.bind(name, Target::RawStream(source), Access::Family)
     }
 
-    /// Absorb the `name=target` serve grammar: `echo:` is the built-in reflector, a `host:port` /
-    /// `unix:<path>` a local forward, and `file:<path>` / `fifo:<path>` / `stdin:` a raw-stream source. A
-    /// bare `<scheme>:` is a teaching error: handlers are bound by value through
-    /// [`service`](Self::service), so the scheme namespace does not survive the merge.
+    /// Absorb the `name=target` serve grammar, where every target carries a scheme: `tcp:<host>:<port>` /
+    /// `unix:<path>` a local forward, `file:<path>` / `fifo:<path>` / `stdin:` a raw-stream source, and
+    /// `echo:` the built-in reflector. The set is closed, so an unknown scheme is a teaching error naming
+    /// the legal ones: handlers are bound by value through [`service`](Self::service), so the scheme
+    /// namespace does not survive the merge.
     pub fn parse(mut self, entries: &[String]) -> eyre::Result<Self> {
         self.services.extend_parse(entries)?;
         Ok(self)
@@ -178,7 +179,7 @@ impl Router {
 ///
 /// There is no scheme-string indirection: the handler value IS the row, so two names bound to one handler
 /// type are two independent instances with no synthetic key namespace. The built-in local forward
-/// (`host:port` / `unix:<path>`) and the loopback reflector are first-party [`Handler`]s (see
+/// (`tcp:<host>:<port>` / `unix:<path>`) and the loopback reflector are first-party [`Handler`]s (see
 /// [`crate::builtins`]), so everything but the raw-stream family is one access path.
 #[derive(Clone)]
 pub(super) enum Target {
@@ -297,10 +298,11 @@ impl Route {
 pub(super) struct Services(pub(super) HashMap<String, Route>);
 
 impl Services {
-    /// Parse `name=target` service entries into a fresh table; every entry must name its service. `echo:` is
-    /// the built-in loopback reflector, a `host:port` / `unix:<path>` a local forward, and `file:<path>` /
-    /// `fifo:<path>` / `stdin:` a raw-stream source. A bare `<scheme>:` no longer resolves: handlers are
-    /// bound by value through [`Router::service`], so the scheme namespace is a teaching error.
+    /// Parse `name=target` service entries into a fresh table; every entry must name its service, and every
+    /// target its scheme: `tcp:<host>:<port>` / `unix:<path>` a local forward, `file:<path>` / `fifo:<path>`
+    /// / `stdin:` a raw-stream source, `echo:` the built-in loopback reflector. An unknown scheme no longer
+    /// resolves: handlers are bound by value through [`Router::service`], so the scheme namespace is a
+    /// teaching error.
     #[cfg(test)]
     pub(super) fn parse(entries: &[String]) -> eyre::Result<Self> {
         let mut services = Self(HashMap::new());
@@ -316,7 +318,7 @@ impl Services {
             let Some((name, addr)) = entry.split_once('=') else {
                 eyre::bail!(
                     "`{entry}` names no service. Every serve entry must be `name=target`, e.g. \
-                     `web=127.0.0.1:8080`, `logs=file:/var/log/app.log`"
+                     `web=tcp:127.0.0.1:8080`, `logs=file:/var/log/app.log`"
                 );
             };
             // Validate the name through the same domain type the wire uses, so an exposed name and a
@@ -452,7 +454,7 @@ impl Services {
     /// Like a keyless shell, a raw-stream source has no auth of its own: it serves a chosen path's bytes (or
     /// the piped stdin) to whoever the gate admits, so [`Exposer`] refuses it behind an [`Gate::Open`]
     /// gate (a public gate over a `file:` source would exfil a secret, over a `stdin:` source the piped
-    /// bytes, to anyone). A local forward (`host:port`/`unix:`) is a service the operator deliberately stood
+    /// bytes, to anyone). A local forward (`tcp:`/`unix:`) is a service the operator deliberately stood
     /// up, so it may still be a public gate; a bare file path or a piped stdin is one keystroke from a
     /// secret, so it may not.
     pub(super) fn raw_stream_names(&self) -> impl Iterator<Item = &str> {
@@ -699,93 +701,117 @@ impl PublicServices {
     }
 }
 
-/// Resolve an exposed service's address to a [`Target`]: `file:<path>` / `fifo:<path>` are the raw-stream
-/// forward (open an existing OS object, splice its bytes to the peer); `echo:` is the built-in loopback
-/// reflector (no argument, no host resource); a bare scheme (a `<name>:` -- a word then a colon with nothing
-/// after) names a handler; anything else must be a socket forward (`host:port` or `unix:<path>`). All
-/// validated here so a typo fails at parse with a teaching message, not at dial time.
+/// Every target scheme tightbeam itself routes, rendered once so the two grammar refusals below (no
+/// scheme, unknown scheme) can never drift from each other or from what [`parse_target`] actually routes.
+///
+/// Public because a consumer that serves its OWN schemes on top of this grammar has to name both sets in
+/// one refusal, and the only alternative is retyping this list somewhere it can rot. It is prose for a
+/// message, not a parseable list: match on the scheme, not on this.
+pub const TARGET_SCHEMES: &str = "`tcp:<host>:<port>`, `unix:<path>`, `file:<path>`, `fifo:<path>`, \
+                              `stdin:`, `echo:`";
+
+/// Resolve an exposed service's address to a [`Target`]. Every target is `<scheme>:<rest>`, so the grammar
+/// is TOTAL and has no fall-through: `tcp:<host>:<port>` and `unix:<path>` are the two local stream
+/// endpoints the built-in forward dials; `file:<path>` / `fifo:<path>` / `stdin:` are the raw-stream sources
+/// (an OS object, or this process's fd 0, spliced toward the peer); `echo:` is the built-in loopback
+/// reflector. A scheme this does not know is refused by name, never guessed at.
+///
+/// Totality is the point. A hostname followed by a colon and a number is syntactically indistinguishable
+/// from a scheme carrying an argument, so as long as one target form was a bare `host:port` the two could
+/// only be told apart by an exact string match, and every near-miss silently became a forward to a host of
+/// that name. With a scheme on every form the ambiguity is gone: a zero-argument scheme refuses a tail
+/// instead of quietly turning into something else. All validated here so a typo fails at parse with a
+/// teaching message, not at dial time.
 fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
     // A trailing `+lossy` is the operator's opt-in to raw-stream FAN-OUT: the
     // source may be reached by MANY consumers at once, and a consumer that falls behind has its bytes DROPPED
-    // rather than stall the producer or the others. It is a claim only the operator can make ("this stream
-    // tolerates loss"), so it is legal ONLY on the live single-writer sources `stdin:`/`fifo:` and REFUSED at
-    // parse on anything else: a `file:` (static bytes, already safe fan-out by re-open, loss would be corruption)
-    // or a `host:port`/`unix:`/built-in (not a raw-stream source at all). Strip it here, then route the
-    // scheme; a source that keeps it (`file:...+lossy`, `web+lossy`) is rejected below.
+    // rather than stall the producer or the others. Strip it here, then route the scheme.
     let (addr, lossy) = match addr.strip_suffix("+lossy") {
         Some(base) => (base, true),
         None => (addr, false),
     };
-    let reject_lossy = |scheme: &str| -> eyre::Result<()> {
-        if lossy {
-            eyre::bail!(
-                "`+lossy` (raw-stream fan-out) is only valid on a `stdin:`/`fifo:` source, not `{scheme}` \
-                 (`{entry}`); drop it, or point the service at a live single-writer source"
-            );
-        }
-        Ok(())
+    let Some((scheme, rest)) = addr.split_once(':') else {
+        eyre::bail!(
+            "`{entry}` names no target scheme. Every target is `<scheme>:<rest>`: {TARGET_SCHEMES}"
+        );
     };
-    // `stdin:` is a raw-stream source with NO tail (this process's fd 0), so it is a zero-arg target routed
-    // FIRST, before any other arm. It shares the raw-stream direction and the public-gate refusal, but
-    // inherits none of the path guards (there is no path). Anything after the colon is a typo: `stdin:` takes
-    // no argument.
-    if addr == "stdin:" {
-        return Ok(Target::RawStream(RawStream::stdin(lossy)?));
+    // `+lossy` is a claim only the operator can make ("this stream tolerates loss"), and only a LIVE
+    // single-writer source can honor it: a `file:` is static bytes (already safe fan-out by re-open, so a
+    // drop would just be corruption) and a forward or the reflector is not a raw-stream source at all.
+    // Refused once, here, rather than in every other arm.
+    if lossy && !matches!(scheme, "stdin" | "fifo") {
+        eyre::bail!(
+            "`+lossy` (raw-stream fan-out) is only valid on a `stdin:`/`fifo:` source, not `{scheme}:` \
+             (`{entry}`); drop it, or point the service at a live single-writer source"
+        );
     }
-    // `echo:` is tightbeam's built-in loopback reflector, now a first-party [`Handler`]
-    // ([`crate::builtins::Echo`]): a zero-arg target (no path, no host resource). It tolerates no `+lossy`
-    // (it is not a raw-stream source) and no tail (`echo:` takes no argument), so both are refused.
-    if addr == "echo:" {
-        reject_lossy("echo:")?;
-        return Ok(Target::Handler(Arc::new(crate::builtins::Echo)));
-    }
-    // A raw-stream route carries a PATH tail (`file:/tmp/x`, `fifo:/tmp/beam`), so it is native, not a
-    // handler. Route it FIRST: the direction (a read-only source toward the peer) is fixed here at parse
-    // time, and a bare `file:`/`fifo:` with no path fails loudly.
-    if let Some(path) = addr.strip_prefix("file:") {
-        reject_lossy("file:")?;
-        return Ok(Target::RawStream(RawStream::file(path, entry)?));
-    }
-    if let Some(path) = addr.strip_prefix("fifo:") {
-        return Ok(Target::RawStream(RawStream::fifo(path, entry, lossy)?));
-    }
-    if let Some(scheme) = addr.strip_suffix(':') {
-        // A bare `<scheme>:` (nothing after the colon) used to name a registry handler. The scheme namespace
-        // left the public API with the Router, so it is a teaching error, never a silently-dangling target:
-        // handlers bind by value. `unix:<path>` and `host:port` carry a tail and fall through to the forward
-        // grammar; a bare `unix:` is caught here too and taught.
-        if !scheme.is_empty()
-            && scheme
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
-        {
-            reject_lossy(addr)?;
-            eyre::bail!(
-                "`{entry}` names a handler scheme (`{addr}`), which is no longer spellable: handlers are bound \
-                 by value, e.g. `.service(\"{scheme}\".parse()?, MyHandler)`. use `--` or a bound service"
-            );
+    match scheme {
+        // The two local stream endpoints, siblings: a TCP socket and a Unix socket. The splice does not care
+        // which, so they share one arm and one validator; `validate_forward` proves the tail, so
+        // `web=tcp:nonsense` fails here rather than at dial time as an opaque reset.
+        "tcp" | "unix" => {
+            validate_forward(addr)?;
+            Ok(Target::Handler(Arc::new(crate::builtins::Forward::new(
+                addr,
+            ))))
         }
+        // The path-carrying raw-stream sources: native targets, not handlers, because the direction (a
+        // read-only source toward the peer) is fixed here at parse time and each carries its own path
+        // guards. A bare `file:`/`fifo:` with no path fails loudly in the constructor.
+        "file" => Ok(Target::RawStream(RawStream::file(rest, entry)?)),
+        "fifo" => Ok(Target::RawStream(RawStream::fifo(rest, entry, lossy)?)),
+        // `stdin:` sources this process's own fd 0 and `echo:` reflects the caller's own bytes back: neither
+        // names a host resource, so neither takes an argument.
+        "stdin" => {
+            no_argument(scheme, rest, entry)?;
+            Ok(Target::RawStream(RawStream::stdin(lossy)?))
+        }
+        "echo" => {
+            no_argument(scheme, rest, entry)?;
+            Ok(Target::Handler(Arc::new(crate::builtins::Echo)))
+        }
+        // Where the bare `host:port` fall-through used to be. A scheme tightbeam does not serve is a
+        // refusal naming the legal set, so an address it cannot resolve is never dialed on a guess. A
+        // handler is not among the schemes because it is not spellable at all: it binds by VALUE through
+        // [`Router::service`], which the grammar's doc teaches once rather than every operator's typo.
+        unknown => eyre::bail!(
+            "`{entry}` names an unknown target scheme `{unknown}:`. Every target is `<scheme>:<rest>`: \
+             {TARGET_SCHEMES}"
+        ),
     }
-    reject_lossy(addr)?;
-    validate_forward(addr)?;
-    Ok(Target::Handler(Arc::new(crate::builtins::Forward::new(
-        addr,
-    ))))
 }
 
-/// Reject a forward addr that is not a real target, so a named service pointed at a bogus addr
-/// (`web=nonsense`) fails at parse with a teaching message instead of pointing at an undialable host.
-/// Valid forwards: `unix:<path>` or a `host:port` (a bare `<name>:` handler scheme is a teaching error).
+/// Refuse a tail on a scheme that takes no argument (`stdin:`, `echo:`), so a typo is a parse error rather
+/// than a silent reinterpretation. This is the guard the bare-`host:port` grammar could not have: with a
+/// scheme on every target, `<word>:<number>` is unambiguously that scheme carrying an argument, and a
+/// zero-argument scheme that tolerated one would be quietly serving something the operator never named.
+fn no_argument(scheme: &str, rest: &str, entry: &str) -> eyre::Result<()> {
+    if rest.is_empty() {
+        return Ok(());
+    }
+    eyre::bail!("`{scheme}:` takes no argument, but `{entry}` gives it `{rest}`")
+}
+
+/// Prove a forward addr names a local stream endpoint, so a service pointed at a bogus one
+/// (`web=tcp:nonsense`) fails at parse with a teaching message instead of at dial time as an opaque reset.
+/// The two endpoints are `tcp:<host>:<port>` and `unix:<path>`; whichever this admits is what
+/// `dial_and_splice` dials, so the grammar and the dial cannot disagree.
 fn validate_forward(addr: &str) -> eyre::Result<()> {
-    let is_host_port = addr
-        .rsplit_once(':')
-        .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
-    if addr.starts_with("unix:") || is_host_port {
+    let endpoint = match addr.split_once(':') {
+        // `tcp:<host>:<port>`: a non-empty host and a real `u16` port, the exact shape `TcpStream::connect`
+        // takes once the scheme is stripped. Split from the RIGHT, so a bracketed IPv6 host keeps its colons.
+        Some(("tcp", rest)) => rest
+            .rsplit_once(':')
+            .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok()),
+        // `unix:<path>`: any non-empty path. Whether it exists is the dial's business, not the grammar's.
+        Some(("unix", path)) => !path.is_empty(),
+        _ => false,
+    };
+    if endpoint {
         return Ok(());
     }
     eyre::bail!(
-        "`{addr}` is not a valid forwarding address (host:port, unix:<path>, file:<path>, fifo:<path>, \
-         or the built-in `echo:`)"
+        "`{addr}` is not a local stream endpoint; expected `tcp:<host>:<port>` or `unix:<path>`"
     )
 }
 

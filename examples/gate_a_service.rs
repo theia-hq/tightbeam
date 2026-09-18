@@ -78,7 +78,7 @@ async fn run() -> eyre::Result<()> {
     tokio::task::spawn_local(async move {
         if let Err(e) = async {
             Router::new(gate)
-                .forward("ssh".parse()?, &echo_addr.to_string())?
+                .forward("ssh".parse()?, &format!("tcp:{echo_addr}"))?
                 .expose()?
                 .run(&exposer, CancellationToken::new())
                 .await

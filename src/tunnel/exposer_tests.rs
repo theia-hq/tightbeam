@@ -89,7 +89,7 @@ fn lossy_service(name: &str, reader: BoxRead) -> Services {
 /// banner.
 #[test]
 fn the_manifest_declares_posture_kind_and_metering() {
-    let services = services(&["web=127.0.0.1:80"])
+    let services = services(&["web=tcp:127.0.0.1:80"])
         .with_handler("fast", AmplifierNoop)
         .expect("`fast` binds");
     let services = services
@@ -138,7 +138,7 @@ fn the_manifest_declares_posture_kind_and_metering() {
 /// and a handler that overrides it reports exactly its own declaration.
 #[test]
 fn metering_defaults_to_unmetered_and_reads_the_override() {
-    let services = services(&["web=127.0.0.1:80"])
+    let services = services(&["web=tcp:127.0.0.1:80"])
         .with_handler("plain", OpenNoop)
         .expect("`plain` binds");
     let services = services
@@ -207,7 +207,7 @@ fn an_exposer_refuses_an_open_gate_over_a_gated_only_handler() {
     );
     // The same handler behind a real gate is fine; only the open-gate pairing is refused. A family gate
     // needs a signet and denylist, so prove the inverse with a plain forward under the open gate.
-    let web = services(&["web=127.0.0.1:80"]);
+    let web = services(&["web=tcp:127.0.0.1:80"]);
     assert!(
         prove(
             web,
@@ -225,7 +225,7 @@ fn an_exposer_refuses_an_open_gate_over_a_gated_only_handler() {
 /// served as a route that answers no one.
 #[test]
 fn a_member_only_route_under_an_open_gate_is_refused_at_construction() {
-    let services = services(&["web=127.0.0.1:80"])
+    let services = services(&["web=tcp:127.0.0.1:80"])
         .member_only("web")
         .expect("`web` is served");
     let Err(error) = prove(
@@ -248,7 +248,7 @@ fn a_member_only_route_under_an_open_gate_is_refused_at_construction() {
 /// `Open` (a posture lie). Refused where the overlay is proven.
 #[test]
 fn a_member_only_route_named_public_is_refused_at_construction() {
-    let services = services(&["web=127.0.0.1:80"])
+    let services = services(&["web=tcp:127.0.0.1:80"])
         .member_only("web")
         .expect("`web` is served");
     let Err(error) = prove(
@@ -310,7 +310,7 @@ fn an_exposer_refuses_a_public_raw_stream() {
     );
     // A raw forward the operator deliberately stood up (host:port) stays open-able; only the no-auth
     // raw-stream source is refused under the open gate.
-    let web = services(&["web=127.0.0.1:80"]);
+    let web = services(&["web=tcp:127.0.0.1:80"]);
     assert!(
         prove(
             web,
@@ -465,7 +465,7 @@ fn public_unsafe_naming_a_handler_or_forward_is_redirected() {
         "a handler named unsafe is redirected to the public overlay: {via_handler}"
     );
 
-    let forward = services(&["web=127.0.0.1:80"]);
+    let forward = services(&["web=tcp:127.0.0.1:80"]);
     let Err(via_forward) = prove(
         forward,
         family_gate("unsafe-forward"),
@@ -668,7 +668,7 @@ async fn an_echo_service_reflects_the_clients_own_bytes() {
 async fn run_returns_gracefully_when_its_cancel_token_fires() {
     let node = Node::new(MemTransport::bind(), NoDiscovery);
     let exposer = Exposer {
-        services: services(&["web=127.0.0.1:80"]),
+        services: services(&["web=tcp:127.0.0.1:80"]),
         gate: Gate::Open,
         public: PublicServices::default(),
         public_unsafe: PublicServices::default(),

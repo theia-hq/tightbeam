@@ -2,6 +2,17 @@
 
 All notable changes to tightbeam, newest first.
 
+## Unreleased
+
+### Changed
+- **Every target carries a scheme: a TCP forward is now `tcp:<host>:<port>`.** The bare `host:port` form is
+  gone, not deprecated. It was the one target without a scheme, which made a hostname followed by a colon
+  and a number indistinguishable from a scheme carrying an argument, so a near-miss on a zero-argument
+  scheme silently became a forward to a host of that name. The grammar is now total: every target is
+  `<scheme>:<rest>`, an unknown scheme is refused by name with the legal set (`tcp:`, `unix:`, `file:`,
+  `fifo:`, `stdin:`, `echo:`), and a scheme that takes no argument refuses a tail. `unix:<path>` is
+  unchanged. Update every `name=host:port` entry and every `Router::forward` addr to `tcp:host:port`.
+
 ## v0.6.0
 
 One concern per file, a router that reads its own gate, and a disabled service that cannot be told from a gated one.

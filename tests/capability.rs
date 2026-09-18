@@ -38,7 +38,7 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
             tokio::task::spawn_local(async move {
                 let gate = tunnel::resolve_gate(Some(signet), empty_denylist().await).unwrap();
                 Router::new(gate)
-                    .parse(&[format!("ssh={echo_addr}")])
+                    .parse(&[format!("ssh=tcp:{echo_addr}")])
                     .unwrap()
                     .expose()
                     .unwrap()

@@ -62,7 +62,7 @@ async fn run() -> eyre::Result<()> {
     tokio::task::spawn_local(async move {
         if let Err(e) = async {
             Router::new(Gate::Open)
-                .forward("echo".parse()?, &echo_addr.to_string())?
+                .forward("echo".parse()?, &format!("tcp:{echo_addr}"))?
                 .expose()?
                 .run(&exposer, CancellationToken::new())
                 .await

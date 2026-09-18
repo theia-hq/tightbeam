@@ -13,8 +13,9 @@ use tokio::io;
 use crate::open_policy::OptIn;
 use crate::tunnel::{BoxRead, BoxWrite, Handler, ServeError, Served, dial_and_splice};
 
-/// The built-in local forward: connect a `host:port` or a `unix:<path>` and splice bytes to it. A socket
-/// the operator deliberately stood up, so it has a legitimate public form
+/// The built-in local forward: connect a `tcp:<host>:<port>` or a `unix:<path>` and splice bytes to it. The
+/// two are siblings, both local stream endpoints, and the splice does not care which. A socket the operator
+/// deliberately stood up, so it has a legitimate public form
 /// ([`Exposure = OptIn`](crate::open_policy::OptIn)); a typo in the addr is refused at bind, not at dial.
 pub struct Forward {
     addr: String,
@@ -26,7 +27,7 @@ impl Forward {
         Self { addr: addr.into() }
     }
 
-    /// The resolved forwarding address (`host:port` or `unix:<path>`).
+    /// The resolved local stream endpoint (`tcp:<host>:<port>` or `unix:<path>`).
     pub fn addr(&self) -> &str {
         &self.addr
     }

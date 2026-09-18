@@ -47,7 +47,7 @@ async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership()
             tokio::task::spawn_local(async move {
                 let gate = tunnel::resolve_gate(Some(work_signet), empty_denylist().await).unwrap();
                 Router::new(gate)
-                    .parse(&[format!("web={echo_addr}")])
+                    .parse(&[format!("web=tcp:{echo_addr}")])
                     .unwrap()
                     .expose()
                     .unwrap()

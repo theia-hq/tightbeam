@@ -13,7 +13,7 @@ use tightbeam::tunnel::{
 
 /// Expose a local service to peers.
 ///
-/// tightbeam's binary is a thin demo of the tunnel: it forwards the raw primitives (`host:port` /
+/// tightbeam's binary is a thin demo of the tunnel: it forwards the raw primitives (`tcp:<host>:<port>` /
 /// `unix:<path>`, and the raw-stream `file:<path>` / `fifo:<path>` that source a path's bytes to the peer)
 /// only. A named handler service is bound by value in a richer consumer (swoosh, or your own embedder), so
 /// it is not served here.
@@ -65,9 +65,10 @@ impl ExposeCmd {
     /// opens, else a family gate on the signet, else a loud error), print tightbeam's OWN banner, and run the
     /// exposer. The core prints nothing; the banner is this CLI's to own.
     ///
-    /// tightbeam's binary is a thin demo of the tunnel: it exposes only the raw primitives (`host:port` /
-    /// `unix:<path>` / `file:` / `fifo:` / `stdin:`), so it binds no handler of its own and names no service
-    /// crate. A bare `<name>:` scheme is a teaching error: a richer consumer binds a handler by value.
+    /// tightbeam's binary is a thin demo of the tunnel: it exposes only the raw primitives
+    /// (`tcp:<host>:<port>` / `unix:<path>` / `file:` / `fifo:` / `stdin:`), so it binds no handler of its
+    /// own and names no service crate. Every target carries a scheme and the set is closed, so an unknown
+    /// one is a teaching error: a richer consumer binds a handler by value.
     pub async fn run<T: Transport, D: bifrost::Discovery>(
         self,
         node: &Node<T, D>,
@@ -87,9 +88,9 @@ impl ExposeCmd {
         } else {
             tunnel::resolve_gate(signet, denylist)?
         };
-        // Assemble the one route table: the `name=target` grammar absorbs the raw primitives (a local forward,
-        // or a `file:`/`fifo:`/`stdin:` raw-stream source; a bare `<scheme>:` is a teaching error now that
-        // handlers bind by value). The bin is the ONLY place the `--public-unsafe` flag string becomes the
+        // Assemble the one route table: the `name=target` grammar absorbs the raw primitives (a
+        // `tcp:`/`unix:` local forward, or a `file:`/`fifo:`/`stdin:` raw-stream source; an unknown scheme
+        // is a teaching error now that handlers bind by value). The bin is the ONLY place the `--public-unsafe` flag string becomes the
         // typed name set. `.expose()` is the one proof door: a raw stream under the whole-node open gate is
         // refused unless named in `--public-unsafe`, and everything else is proven open-safe.
         let router = Router::new(gate).parse(&self.services)?;
