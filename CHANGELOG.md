@@ -2,6 +2,18 @@
 
 All notable changes to tightbeam, newest first.
 
+## v0.8.1
+
+Pins bifrost v0.2.3.
+
+### Changed
+- **bifrost v0.2.3.** A node no longer publishes or hands out an RFC 8981 temporary IPv6 address. The
+  address was scoped `Internet` and so passed the advertisement's own filter, which meant a rotating
+  privacy address went onto every network the node joined; a consumer also handed one to a human, and
+  it is deprecated within about a day. Both manifests move together, because `tightbeam-handler`
+  carries its own `bifrost-core` pin and advancing only the root resolves that crate twice in one
+  graph.
+
 ## v0.8.0
 
 A gate that ran out of time no longer tells a dialer they lack authority.
