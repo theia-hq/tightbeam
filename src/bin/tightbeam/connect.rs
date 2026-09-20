@@ -70,7 +70,12 @@ pub struct ConnectCmd {
     #[arg(long, value_name = "port | - | unix:PATH")]
     pub to: To,
     /// which exposed service to reach
-    #[arg(long, value_name = "service", default_value = "default")]
+    // REQUIRED, with no default. It defaulted to `default`, which stopped being a real name when the
+    // default service name was dropped from the host side (`44bc974`), and the single-service leniency
+    // cannot stand in for it whenever a host exposes more than one. So an omitted `--service` dialed a
+    // name nothing answers to and the far gate refused with a message that named nothing. Naming the
+    // service is now clap's own "required argument" error, before a single packet leaves.
+    #[arg(long, value_name = "service")]
     pub service: String,
     /// present a capability link alongside a raw node id
     #[arg(long, value_name = "link")]
@@ -157,7 +162,32 @@ impl ConnectCmd {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser as _;
+
     use super::To;
+
+    /// `--service` is REQUIRED: there is no `default` to fall back on, so a dial names the service or
+    /// does not leave. This fails the moment a `default_value` comes back, which is the point: the
+    /// phantom default shipped for a year and turned every zero-flag dial into a refusal the host could
+    /// not explain.
+    #[test]
+    fn connect_requires_the_service_name() {
+        let peer = bifrost::NodeId::from_ed25519_secret(&[3u8; 32]).to_string();
+        crate::Cli::try_parse_from([
+            "tightbeam",
+            "connect",
+            &peer,
+            "--service",
+            "web",
+            "--to",
+            "-",
+        ])
+        .expect("a named service parses");
+        assert!(
+            crate::Cli::try_parse_from(["tightbeam", "connect", &peer, "--to", "-"]).is_err(),
+            "a dial with no --service must be refused at the parser, not at the far gate"
+        );
+    }
 
     #[test]
     fn to_parses_each_of_the_three_forms_and_rejects_the_rest() {
