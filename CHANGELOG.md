@@ -2,6 +2,41 @@
 
 All notable changes to tightbeam, newest first.
 
+## v0.9.0
+
+A refusal this build cannot read is reported, never renamed.
+
+### Changed
+- **Picks up bifrost v0.3.0, where `Refusal` became `#[non_exhaustive]`.** This is a breaking change
+  for anyone matching on `Response::Refused`, which carries a `bifrost::Refusal` through `pub mod
+  protocol`: such a match now needs one more arm. It should name the class it cannot read rather
+  than fold it onto a known one.
+
+  One match broke inside tightbeam, and it is the one where guessing is worst. `Response::write` now
+  asks a `refusal_code` helper for the tag before a byte moves. Every code in the wire table is a
+  claim: reusing the not-admitted code for a class this build cannot read would tell a dialer their
+  credential was rejected by a host that ruled no such thing, and reusing the unavailable code would
+  pile arbitrary future classes behind one word a reader cannot unpick. So the arm is an error
+  rather than a substitution, and the write fails. Settling the frame before the first byte also
+  means an unencodable refusal leaves the stream untouched instead of a lone frame marker the peer
+  blocks behind waiting for a code that never arrives.
+
+  Nothing on the wire moved: three classes, three codes, the same magic.
+
+### Fixed
+- **The gate-timeout mapping is no longer labelled an interim.** It has been one since 2026-09-16
+  with no end date, and an interim with no arrival is a lie a reader acts on: it reads as
+  scaffolding about to be replaced. The mapping itself is correct and is unchanged. A gate that ran
+  out of time goes on the refusal that is about THIS HOST because that is what the refusal means,
+  not as a stopgap: that variant deliberately lost its narrower "you got past the gate and then we
+  failed you" reading upstream, because a dialer who can recover the admission bit out of a refusal
+  has been handed an oracle. Whether the outcome eventually earns a code of its own is an open
+  question, and a code of its own would narrow this answer rather than correct it.
+- **Two stale claims in the same documentation block.** "Every cause maps to the same payload-free
+  not-admitted today" had been false since the undecided outcome arrived, and "nauthy is about to
+  gain one, and when that pin moves this match will stop compiling" described something that had
+  already happened.
+
 ## v0.8.2
 
 Names its service, and takes nauthy v0.3.1.
