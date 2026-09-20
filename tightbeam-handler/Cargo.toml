@@ -14,7 +14,7 @@ repository = "https://github.com/theia-hq/tightbeam"
 # features in, cargo features being additive.
 nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "c31a3155bb8f8c17cdf49947c37fdb8fa8708e97", default-features = false }
 # `Refusal` for the typed serve error. `bifrost-core` only: the contract never names a transport backend.
-bifrost-core = { git = "https://github.com/theia-hq/bifrost", rev = "b1638d487e8eac92ce353aadd776df2e92d6bbba" }
+bifrost-core = { git = "https://github.com/theia-hq/bifrost", rev = "b295a7d2d23c2bafd70f7c3b5a93d9bb6810e174" }
 thiserror = "2"
 # The boxed stream halves a handler receives. `io-util` only, no runtime: the contract never spawns.
 tokio = { version = "1", default-features = false, features = ["io-util"] }
