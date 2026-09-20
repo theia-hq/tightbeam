@@ -2,6 +2,46 @@
 
 All notable changes to tightbeam, newest first.
 
+## v0.10.0
+
+A peer on another release is told so, and a catalog has one bound.
+
+### Fixed
+- **A version-skewed dialer got a bare EOF and nothing else.** The magic was compared for exact
+  equality, so a tightbeam peer one release back was indistinguishable from a foreign stream, and
+  the host's "not a tightbeam stream" was both false and never sent: it was raised before any
+  response could be written. The peer learned nothing and the operator learned a falsehood.
+
+  The window is real and it is days, not months: a locally built dialer runs ahead of the newest
+  release, and a node installed from a release cannot speak what an unreleased build speaks.
+
+  `TB04` was already `TB` plus `04`, and nothing parsed it that way. So this reads bytes that
+  already exist: a frozen two-byte identity, and a version compared as its own value. **No wire
+  change**, no new frame, no bump. Three conditions where there was one: a foreign prefix is still
+  refused in silence and the old wording is finally true, a version mismatch is now ANSWERED with
+  both versions named and the action implied, and an i/o error stays an i/o error.
+
+  The response frame is documented as frozen from `TB04` forward, on the type itself, because a
+  host cannot answer a peer it cannot parse unless some part of the wire is stable across versions.
+
+- **The service catalog had no bound at either end.** A client reading a remote node's menu grew a
+  buffer to whatever the peer streamed, so a hostile node could exhaust a client that merely asked
+  what it serves, at one-to-one bandwidth cost. The writer had no bound either, so an honest host
+  did not even provide an implicit ceiling.
+
+  `MAX_CATALOG_BLOB` is derived from the decoder's own limits rather than chosen, so the reader's
+  cap cannot drift away from what the decoder accepts, and a test pins the largest admissible
+  catalog to exactly that size. The encoder now enforces the two field bounds `decode` already
+  enforced, which is stronger than a total: a catalog can sit far under the blob bound and still be
+  refused by the decoder, and an encoder that can emit a frame its own decoder rejects is a defect
+  in its own right.
+
+### Changed
+- **`Request::read` returns a typed error** naming the three conditions above, rather than a single
+  opaque one. **`ServiceCatalog::encode` is fallible**, and `MAX_CATALOG_BLOB` plus
+  `CatalogTooLarge` are exported for the reader that must hold the same bound.
+- Advances to bifrost v0.4.0.
+
 ## v0.9.0
 
 A refusal this build cannot read is reported, never renamed.
