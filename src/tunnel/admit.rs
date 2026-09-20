@@ -5,8 +5,12 @@
 //! (composed with the two open overlays and the public-path caps) and [`serve_request`] carries that
 //! ruling to the wire, writing the payload-free refusal for every class of miss so the wire is no oracle.
 
+use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::{Context, Poll};
 use core::time::Duration;
 use std::collections::HashMap;
+use std::io::IoSlice;
 use std::sync::Arc;
 
 use bifrost::{NodeId, PeerProof, Refusal, RefusalDetail};
@@ -46,6 +50,32 @@ pub fn resolve_gate(signet: Option<NodeId>, denylist: FileDenylist) -> eyre::Res
 /// How long to wait for a connector to send its opening request before dropping the stream. Bounds the
 /// pre-gate work an unauthenticated peer can pin (a slow-loris that opens a stream and never speaks).
 pub(super) const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long an ADMITTED stream may carry no bytes in EITHER direction before the host drops it. Armed when
+/// the halves are handed to the handler, disarmed by the first byte moving either way, so it fires only on
+/// a stream where nothing at all has been said.
+///
+/// [`REQUEST_READ_TIMEOUT`] bounds the same slow-loris on the other side of the gate, and past the gate
+/// there was no bound at all: an admitted peer could open a stream, stay silent, and pin a task, two
+/// buffers, and (on an opened service) one of the node's few
+/// [public-stream permits](super::exposer::PUBLIC_STREAM_PERMITS) for as long as it liked. The two
+/// constants match, but this one is derived rather than inherited, because a peer past the gate has done
+/// more work to get there and is dropped with no refusal to explain it.
+///
+/// The FLOOR is honest silence, which is longer here than before the gate. Every handler either answers
+/// at once, is spoken to first by protocol, or splices a local endpoint that greets, and that last one
+/// sets the floor: a forward to a server-speaks-first endpoint pays a local connect plus whatever the
+/// greeter does before writing, and a greeter that looks its client up first stalls for its resolver,
+/// conventionally five seconds. The CEILING is what the silence costs: the public path is four concurrent
+/// streams node-wide, so four silent streams wedge all of it, and the window is what an attacker has to
+/// keep re-paying to hold that wedge. Ten seconds clears a stalled greeter with room to spare and turns a
+/// permanent wedge into a flood the host can see and the peer must sustain.
+///
+/// Lowering it below a stalled greeter starts cutting honest forwards; raising it costs the node the
+/// difference against an attacker and buys no honest stream anything, because no handler in this family
+/// has a legitimate opening that is silent both ways for even this long. Move it for a measured endpoint,
+/// not for symmetry.
+pub(super) const FIRST_TRAFFIC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Serve one inbound stream: read the request, apply the gate, reply, and pipe on success.
 ///
@@ -239,7 +269,49 @@ where
         Some(Target::Handler(handler)) => match handler.prepare(admitted.witness) {
             Ok(prepared) => {
                 Response::Ok.write(&mut writer).await?;
-                prepared.serve(Box::new(writer), Box::new(reader)).await?;
+                // Arm the post-admission first-traffic deadline AT THE HANDOFF, and disarm it on the
+                // first byte in EITHER direction. This is where the pre-gate `REQUEST_READ_TIMEOUT`
+                // stops applying, and nothing downstream replaces it: a handler is handed two halves
+                // and no clock, so an admitted peer that never speaks parks this task and its buffers
+                // until the session dies. It is enforced HERE, uniformly, and no handler declares it,
+                // because the bound does not vary by handler: one that varies belongs to the service
+                // that varies it, but a bound that is the same for all of them belongs to the one
+                // place that dispatches them all.
+                //
+                // It can only ever fire on a stream where NOTHING has been said in either direction,
+                // so it can never truncate an answer in flight and can never turn a success into a
+                // lie. That is the whole reason it is safe to enforce AFTER `Response::Ok`, where no
+                // refusal is left to send; a bound on anything but silence would not be.
+                //
+                // Both halves are wrapped, never the reader alone. `Forward` splices the peer against
+                // an arbitrary local endpoint, and a server-speaks-first endpoint (an SSH
+                // identification string, an SMTP greeting) legitimately leaves the peer silent until
+                // the local server has spoken. A read-side deadline would drop exactly those streams
+                // for doing the correct thing.
+                let traffic = Arc::new(FirstTraffic::default());
+                let served = prepared.serve(
+                    Box::new(Watched::new(writer, Arc::clone(&traffic))),
+                    Box::new(Watched::new(reader, Arc::clone(&traffic))),
+                );
+                tokio::select! {
+                    // Biased so a serve that finishes in the same instant the deadline elapses is read
+                    // as finished: the handler's own result wins the tie, never the clock.
+                    biased;
+                    result = served => result?,
+                    () = traffic.silent_past(FIRST_TRAFFIC_TIMEOUT) => {
+                        // The success frame is already on the wire, so the enforcement IS the drop:
+                        // the halves go with `served` and the peer sees its stream close after an `Ok`
+                        // it never used. The cause exists only here, which is why it is logged at the
+                        // level a stock serving filter shows rather than at `warn`, where a host
+                        // watching a wedge would never see it.
+                        tracing::error!(
+                            %peer,
+                            service = %service,
+                            after = ?FIRST_TRAFFIC_TIMEOUT,
+                            "admitted stream carried no bytes in either direction; dropping it"
+                        );
+                    }
+                }
             }
             Err(refusal) => {
                 tracing::warn!(
@@ -549,6 +621,114 @@ fn resolve_single_service(requested: Service, services: &HashMap<String, Route>)
     match services.keys().next().map(|only| only.parse::<Service>()) {
         Some(Ok(only)) => only,
         _ => requested,
+    }
+}
+
+/// The one bit an admitted stream's first-traffic deadline turns on: set by whichever [`Watched`] half
+/// first carries a byte, read by [`silent_past`](Self::silent_past) when the deadline elapses. Shared
+/// between the two halves, so either direction disarms both.
+///
+/// `Relaxed` is the ordering this wants and not a shortcut: the bit guards no other data, so there is
+/// nothing for an acquire to publish, and every setter plus the reader are polls of the ONE task that owns
+/// the stream (the dispatch `select!` drives the handler and the timer together), which the runtime
+/// already orders.
+#[derive(Debug, Default)]
+struct FirstTraffic(AtomicBool);
+
+impl FirstTraffic {
+    /// Disarm: a byte crossed this stream, in one direction or the other.
+    fn moved(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Resolve only if `deadline` passes with the stream still silent BOTH ways. On a stream that has
+    /// carried a byte this never resolves, so the serve it races runs to its own end. The timer is set
+    /// once and the bit is read once, when it fires: rearming a clock on every byte would cost a timer
+    /// per byte to enforce a bound that only ever asks whether anything was said at all.
+    async fn silent_past(&self, deadline: Duration) {
+        tokio::time::sleep(deadline).await;
+        if self.0.load(Ordering::Relaxed) {
+            core::future::pending::<()>().await;
+        }
+    }
+}
+
+/// One half of an admitted stream, watched for the first byte it carries. Wrapping BOTH halves is what
+/// makes the dispatcher's bound a first-TRAFFIC deadline rather than a first-READ one, which is the
+/// difference between guarding a silent peer and killing every server-speaks-first forward.
+///
+/// Otherwise transparent: it forwards every method, keeps the inner half's vectored-write capability
+/// (dropping it would split one splice write into many), and counts only bytes that actually moved. An
+/// EOF says nothing and is not traffic, and neither is a flush or a shutdown that carries no bytes.
+struct Watched<T> {
+    half: T,
+    traffic: Arc<FirstTraffic>,
+}
+
+impl<T> Watched<T> {
+    /// Wrap one half against the stream's shared first-traffic bit. Both halves take a clone of the same
+    /// [`FirstTraffic`], which is what makes the disarm bidirectional.
+    fn new(half: T, traffic: Arc<FirstTraffic>) -> Self {
+        Self { half, traffic }
+    }
+}
+
+impl<T: io::AsyncRead + Unpin> io::AsyncRead for Watched<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        // The filled length BEFORE the poll is the only honest reading of "the peer said something":
+        // a ready poll that fills nothing is EOF, and the caller may hand us a buffer that already
+        // holds bytes from an earlier read.
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut this.half).poll_read(cx, buf);
+        if buf.filled().len() > before {
+            this.traffic.moved();
+        }
+        polled
+    }
+}
+
+impl<T: io::AsyncWrite + Unpin> io::AsyncWrite for Watched<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.half).poll_write(cx, buf);
+        if matches!(polled, Poll::Ready(Ok(1..))) {
+            this.traffic.moved();
+        }
+        polled
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.half).poll_write_vectored(cx, bufs);
+        if matches!(polled, Poll::Ready(Ok(1..))) {
+            this.traffic.moved();
+        }
+        polled
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.half.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().half).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().half).poll_shutdown(cx)
     }
 }
 

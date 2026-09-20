@@ -46,6 +46,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
+# `start_paused` for the first-traffic deadline tests. Declared rather than inherited: it resolves
+# today only through feature unification via iroh, so a dependency bump could drop it and break the
+# test build. Every sibling repo using the paused clock declares it explicitly.
+tokio = { version = "1", features = ["test-util"] }
 bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "b295a7d2d23c2bafd70f7c3b5a93d9bb6810e174" }
 
 [lints]

@@ -1,6 +1,7 @@
 //! Tests for admission: the per-service ruling, the public-path caps, the live enable/disable oracle, the
 //! member floor, and the one uniform refusal every miss gets on the wire.
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -9,10 +10,10 @@ use bifrost::{
 };
 use bifrost_mem::MemTransport;
 use nauthy::{Gate, Service};
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::Semaphore;
 
-use super::{Admission, resolve_single_service, serve_request};
+use super::{Admission, FIRST_TRAFFIC_TIMEOUT, resolve_single_service, serve_request};
 use crate::enabled::AllEnabled;
 use crate::open_policy::OptIn;
 use crate::tunnel::exposer::{
@@ -1414,4 +1415,301 @@ fn an_undecided_gate_is_not_the_refusal_that_rules_on_the_dialer() {
              indistinguishable: {rendered}"
         );
     }
+}
+
+// What the first-traffic tests below cannot observe, said plainly rather than left to be assumed. They
+// drive `tokio::io::duplex` halves under a paused clock, so they pin the ORDERING (dropped after the
+// deadline and never before, disarmed by a byte moving either way) and not the wall-clock value: none of
+// them shows that the window is long enough for any particular endpoint, because the greeter in them
+// answers instantly. They do not observe what an overlay peer sees at the transport level, where a duplex
+// half-close stands in for a real stream close, they do not capture the host's log event or its level, and
+// they stand in for the shipped handlers with local doubles, so a handler whose first write happens inside
+// a foreign library is covered by that consumer's own suite and not here.
+
+/// The peer's greeting a server-speaks-first endpoint sends before its client says anything.
+const GREETING: &[u8] = b"220 host ready\r\n";
+
+/// The peer's opening bytes when the peer is the one who speaks first.
+const HELLO: &[u8] = b"hello";
+
+/// A server-speaks-first handler: it writes its greeting the instant it is handed the halves, then waits
+/// on a peer that may never speak. An SSH identification string or an SMTP banner behind a forward is this
+/// shape, and it is the case a read-only first-traffic deadline would kill. `finished` records that the
+/// handler ran to its own end rather than being dropped under it.
+struct Greeter {
+    released: Arc<tokio::sync::Notify>,
+    finished: Arc<AtomicBool>,
+}
+
+impl Handler for Greeter {
+    type Exposure = OptIn;
+    async fn serve(
+        &self,
+        _served: Served<Self>,
+        mut writer: BoxWrite,
+        _reader: BoxRead,
+    ) -> Result<(), ServeError> {
+        writer.write_all(GREETING).await?;
+        writer.flush().await?;
+        self.released.notified().await;
+        self.finished.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// A peer-speaks-first handler: it waits for the peer's opening bytes, signals `heard`, and then holds the
+/// stream open through a long silence (an interactive session that goes quiet after hello). `finished`
+/// records that it ran to its own end rather than being dropped under it.
+struct AfterPeer {
+    heard: Arc<tokio::sync::Notify>,
+    released: Arc<tokio::sync::Notify>,
+    finished: Arc<AtomicBool>,
+}
+
+impl Handler for AfterPeer {
+    type Exposure = OptIn;
+    async fn serve(
+        &self,
+        _served: Served<Self>,
+        _writer: BoxWrite,
+        mut reader: BoxRead,
+    ) -> Result<(), ServeError> {
+        let mut opening = [0u8; HELLO.len()];
+        reader.read_exact(&mut opening).await?;
+        assert_eq!(
+            opening, HELLO,
+            "the watch wrapper forwards the bytes it counts"
+        );
+        self.heard.notify_one();
+        self.released.notified().await;
+        self.finished.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// Send `service`'s opening request and hand the caller the peer's WHOLE duplex end, un-split and open,
+/// plus the host's serving future. [`drive_open`] closes the peer's write half as soon as the request is
+/// sent, and a first-traffic test has to own whether the peer ever speaks again: an EOF is the one thing
+/// a slow-loris never sends. The request is written before the host runs because the duplex buffer holds
+/// it, so the peer can then be genuinely silent.
+async fn dial_and_hold(
+    service: &str,
+    serving: std::sync::Arc<super::Serving>,
+) -> (
+    tokio::io::DuplexStream,
+    impl core::future::Future<Output = eyre::Result<()>> + use<>,
+) {
+    let (mut peer_end, host_end) = tokio::io::duplex(1024);
+    let (host_read, host_write) = tokio::io::split(host_end);
+    crate::protocol::Request {
+        service: service.to_owned(),
+        capability: None,
+        membership: None,
+    }
+    .write(&mut peer_end)
+    .await
+    .expect("write request");
+    let peer = SessionPeer {
+        node: bifrost::NodeId::from_ed25519_secret(&[9u8; 32]),
+        security: PROVEN,
+    };
+    let serve = serve_request(
+        peer,
+        host_write,
+        host_read,
+        serving,
+        std::sync::Arc::new(PublicSession::default()),
+    );
+    (peer_end, serve)
+}
+
+/// A peer that is ADMITTED and then says nothing is dropped. The pre-gate read bound stops at the gate,
+/// and past it a silent stream pinned a task and its buffers for as long as the session lived.
+///
+/// The outer bound is the regression signal, not decoration. Delete the deadline at the dispatch site and
+/// the parked handler never returns: the `timeout` below fires and this test goes red naming the defect,
+/// instead of hanging the suite the way the defect hangs the node.
+#[tokio::test(start_paused = true)]
+async fn an_admitted_stream_that_never_speaks_is_dropped() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    // Never released: the handler holds both halves and touches neither, which is what the host sees when
+    // an admitted peer opens a stream and goes quiet.
+    let services = Services(HashMap::new())
+        .with_handler(
+            "park",
+            Parked {
+                entered: Arc::clone(&entered),
+                release: Arc::new(Semaphore::new(0)),
+            },
+        )
+        .expect("`park` binds");
+    let (mut peer, serve) = dial_and_hold(
+        "park",
+        open_serving(services, Semaphore::new(RAW_STREAM_OPEN_PERMITS)),
+    )
+    .await;
+    let host = tokio::spawn(serve);
+
+    assert_eq!(
+        crate::protocol::Response::read(&mut peer)
+            .await
+            .expect("the response reads"),
+        crate::protocol::Response::Ok,
+        "the stream is admitted first: this bound is what happens AFTER a success, never instead of one"
+    );
+    entered.notified().await;
+    let armed = tokio::time::Instant::now();
+
+    let ended = tokio::time::timeout(FIRST_TRAFFIC_TIMEOUT * 6, host)
+        .await
+        .expect(
+            "a stream that carries no bytes in either direction must be dropped: it was still open long \
+             past the deadline, which is the whole defect this bound closes",
+        );
+    ended
+        .expect("the serving task does not panic")
+        .expect("dropping a silent stream is the host's own bound, not a host error");
+    assert!(
+        armed.elapsed() >= FIRST_TRAFFIC_TIMEOUT,
+        "the deadline is armed at the handoff and not before: an admitted stream gets the whole window"
+    );
+
+    // What the peer observes, pinned: nothing after the `Ok`, then a close.
+    let mut tail = Vec::new();
+    peer.read_to_end(&mut tail)
+        .await
+        .expect("the host closed the stream");
+    assert!(
+        tail.is_empty(),
+        "there is no refusal left to send once `Response::Ok` is on the wire, so the enforcement IS the \
+         close; a late refusal would be a second answer to a request already answered. Got {tail:?}"
+    );
+}
+
+/// The disarm is BIDIRECTIONAL, and this is the half that costs something when it is missed. A stream the
+/// SERVER spoke on is not dropped, though the peer never says a word: a forward to an SSH or SMTP endpoint
+/// is silent from the peer, by protocol, until the greeting arrives.
+///
+/// Wrap only the reader at the dispatch site, which is the simpler and wrong form of this bound, and this
+/// test goes red at "a stream the host has already spoken on is never dropped": the handler is dropped
+/// mid-greeting and every server-speaks-first forward breaks for behaving correctly.
+#[tokio::test(start_paused = true)]
+async fn a_stream_the_server_greets_survives_the_deadline() {
+    let released = Arc::new(tokio::sync::Notify::new());
+    let finished = Arc::new(AtomicBool::new(false));
+    let services = Services(HashMap::new())
+        .with_handler(
+            "greet",
+            Greeter {
+                released: Arc::clone(&released),
+                finished: Arc::clone(&finished),
+            },
+        )
+        .expect("`greet` binds");
+    let (mut peer, serve) = dial_and_hold(
+        "greet",
+        open_serving(services, Semaphore::new(RAW_STREAM_OPEN_PERMITS)),
+    )
+    .await;
+    let host = tokio::spawn(serve);
+
+    assert_eq!(
+        crate::protocol::Response::read(&mut peer)
+            .await
+            .expect("the response reads"),
+        crate::protocol::Response::Ok,
+        "the stream is admitted"
+    );
+    let mut greeting = vec![0u8; GREETING.len()];
+    peer.read_exact(&mut greeting)
+        .await
+        .expect("the greeting reads");
+
+    // The peer now says nothing at all, well past the deadline.
+    tokio::time::sleep(FIRST_TRAFFIC_TIMEOUT * 3).await;
+    assert!(
+        !host.is_finished(),
+        "a stream the host has already spoken on is never dropped: the deadline disarms on the first byte \
+         in EITHER direction, and a read-only disarm would kill every server-speaks-first forward"
+    );
+    assert!(
+        !finished.load(Ordering::Relaxed),
+        "the handler is still serving its stream, not finished with it"
+    );
+    assert_eq!(
+        greeting, GREETING,
+        "the watch wrapper forwards the bytes it counts, unchanged"
+    );
+
+    released.notify_one();
+    tokio::time::timeout(FIRST_TRAFFIC_TIMEOUT, host)
+        .await
+        .expect("the released handler returns")
+        .expect("the serving task does not panic")
+        .expect("a disarmed stream ends on the handler's own terms");
+    assert!(
+        finished.load(Ordering::Relaxed),
+        "the handler ran to its own end rather than being dropped under it"
+    );
+}
+
+/// A peer that speaks promptly is untouched, and stays untouched however long it goes quiet afterwards:
+/// the bound is on a stream that never spoke, never on an idle one, so it can never truncate an exchange
+/// already under way.
+///
+/// Stop counting READ bytes as traffic, the other half of the bidirectional disarm, and this goes red at
+/// the same assertion.
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_speaks_promptly_is_unaffected() {
+    let heard = Arc::new(tokio::sync::Notify::new());
+    let released = Arc::new(tokio::sync::Notify::new());
+    let finished = Arc::new(AtomicBool::new(false));
+    let services = Services(HashMap::new())
+        .with_handler(
+            "after",
+            AfterPeer {
+                heard: Arc::clone(&heard),
+                released: Arc::clone(&released),
+                finished: Arc::clone(&finished),
+            },
+        )
+        .expect("`after` binds");
+    let (mut peer, serve) = dial_and_hold(
+        "after",
+        open_serving(services, Semaphore::new(RAW_STREAM_OPEN_PERMITS)),
+    )
+    .await;
+    let host = tokio::spawn(serve);
+
+    assert_eq!(
+        crate::protocol::Response::read(&mut peer)
+            .await
+            .expect("the response reads"),
+        crate::protocol::Response::Ok,
+        "the stream is admitted"
+    );
+    peer.write_all(HELLO).await.expect("the peer speaks");
+    peer.flush()
+        .await
+        .expect("the peer's bytes are on the wire");
+    heard.notified().await;
+
+    // The exchange now goes quiet for far longer than the first-traffic window.
+    tokio::time::sleep(FIRST_TRAFFIC_TIMEOUT * 3).await;
+    assert!(
+        !host.is_finished(),
+        "a stream that carried the peer's bytes is never dropped for going quiet afterwards: this is a \
+         first-traffic bound, not an idle bound, and an idle bound is not the dispatcher's to set"
+    );
+
+    released.notify_one();
+    tokio::time::timeout(FIRST_TRAFFIC_TIMEOUT, host)
+        .await
+        .expect("the released handler returns")
+        .expect("the serving task does not panic")
+        .expect("a disarmed stream ends on the handler's own terms");
+    assert!(
+        finished.load(Ordering::Relaxed),
+        "the handler ran to its own end rather than being dropped under it"
+    );
 }

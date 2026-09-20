@@ -9,13 +9,13 @@ use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::security::{TransportInsecure, peer_proven};
 
-/// tightbeam's protocol prefix: the bytes every request preamble opens with, at every version, forever.
-/// A stream that does not start with these is not a tightbeam stream, and that is the only thing a
-/// prefix mismatch is allowed to mean.
-const PREFIX: [u8; 2] = *b"TB";
+/// tightbeam's protocol identity: the bytes every request preamble opens with, at every version,
+/// forever. A stream whose identity is not these is not a tightbeam stream, and that is the only thing
+/// an identity mismatch is allowed to mean.
+const IDENTITY: [u8; 2] = *b"TB";
 
-/// The request grammar THIS build speaks, written after [`PREFIX`] and parsed (never compared whole) on
-/// read: together they are the four magic bytes `TB04`.
+/// The request grammar THIS build speaks, written after [`IDENTITY`] and parsed (never compared whole)
+/// on read: together they are the four magic bytes `TB04`.
 ///
 /// `TB04` types the tag-1 response: a refusal code byte plus a bounded detail, replacing the free-form
 /// string. The request layout is unchanged from `TB03` (which added the optional `membership` field
@@ -25,23 +25,62 @@ const PREFIX: [u8; 2] = *b"TB";
 /// break has to announce itself instead of dropping the stream. That is what splitting the magic buys.
 const VERSION: WireVersion = WireVersion(*b"04");
 
-/// The version half of a request preamble: the bytes after `PREFIX`, naming which request grammar the
-/// peer that wrote them speaks.
+/// The magic splits by RULE, not by a remembered offset: the identity is the leading run of capitals,
+/// the version is the digits after it, four bytes in all. Held at build time so a magic that breaks the
+/// rule fails to compile rather than splitting somewhere the next reader would not look. A digit is
+/// never a capital, so "all capitals, then all digits" is exactly "the maximal leading capital run".
+const _: () = assert!(
+    all_between(&IDENTITY, b'A', b'Z')
+        && all_between(VERSION.as_bytes(), b'0', b'9')
+        && IDENTITY.len() + VERSION.as_bytes().len() == 4,
+    "the magic must be four bytes: a run of capitals (the identity) then digits (the version)"
+);
+
+/// Whether `bytes` is non-empty and every byte falls in `lo..=hi`. `const` because its one caller is a
+/// build-time claim about the magic.
+const fn all_between(bytes: &[u8], lo: u8, hi: u8) -> bool {
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] < lo || bytes[at] > hi {
+            return false;
+        }
+        at += 1;
+    }
+    !bytes.is_empty()
+}
+
+/// The version half of a request preamble: the bytes after [`IDENTITY`], naming which request grammar
+/// the peer that wrote them speaks.
 ///
 /// Parsed as a value rather than folded into one four-byte comparison, because the two halves of the
-/// magic answer different questions. A PREFIX mismatch says the stream is not ours and there is nothing
-/// true we could say to whatever is on the other end. A VERSION mismatch says a tightbeam peer on
-/// another rev, which is a fact both ends can act on, so it is answered on the wire
+/// magic answer different questions. An IDENTITY mismatch says the stream is not ours and there is
+/// nothing true we could say to whatever is on the other end. A VERSION mismatch says a tightbeam peer
+/// on another rev, which is a fact both ends can act on, so it is answered on the wire
 /// ([`RequestReadError::refusal`]) rather than dropped.
+///
+/// A value of this type has already proved that the identity run STOPPED before it, which is what makes
+/// "the identity matched" a whole claim rather than a prefix test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WireVersion([u8; 2]);
 
 impl WireVersion {
-    /// Read the version half, after the prefix. The width of the field lives here, in the type that
+    /// Read the version half, after the identity. The width of the field lives here, in the type that
     /// owns it, so the reader and the writer cannot drift apart.
-    async fn read<R: io::AsyncRead + Unpin>(reader: &mut R) -> io::Result<Self> {
+    ///
+    /// The identity is the MAXIMAL leading run of capitals, so matching [`IDENTITY`] against the first
+    /// bytes is only half of it: the run must also END there. A capital in the first byte of this field
+    /// means the peer named a LONGER identity that merely opens with ours, which is a different wire
+    /// owed silence and never another version of this one. `TBH1` arriving at a `TB04` host is that
+    /// case, and answering it would hand this host's wire version to a peer that does not speak this
+    /// wire. The bytes after that one are not held to digits: they are whatever the peer wrote, and an
+    /// unserved version is answered on its own terms whether or not it is printable.
+    async fn read<R: io::AsyncRead + Unpin>(reader: &mut R) -> Result<Self, RequestReadError> {
         let mut bytes = [0u8; 2];
         reader.read_exact(&mut bytes).await?;
+        let [after_identity, ..] = bytes;
+        if after_identity.is_ascii_uppercase() {
+            return Err(RequestReadError::Foreign);
+        }
         Ok(Self(bytes))
     }
 
@@ -57,7 +96,7 @@ impl core::fmt::Display for WireVersion {
     /// two version bytes are arbitrary and need not be printable, so they are escaped rather than
     /// trusted: this string reaches a terminal.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}{}", PREFIX.escape_ascii(), self.0.escape_ascii())
+        write!(f, "{}{}", IDENTITY.escape_ascii(), self.0.escape_ascii())
     }
 }
 
@@ -118,7 +157,7 @@ impl Request {
     /// Write the raw request frame to the stream, unchecked. Crate-internal: every credential-bearing
     /// path goes through [`write_checked`](Self::write_checked).
     pub(crate) async fn write<W: io::AsyncWrite + Unpin>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(&PREFIX).await?;
+        writer.write_all(&IDENTITY).await?;
         writer.write_all(VERSION.as_bytes()).await?;
         write_str(writer, &self.service).await?;
         write_opt(writer, self.capability.as_deref()).await?;
@@ -157,14 +196,14 @@ impl Request {
 
     /// Read a request from the stream.
     ///
-    /// The preamble is parsed as `PREFIX` plus a [`WireVersion`], never compared as four bytes, so
+    /// The preamble is parsed as [`IDENTITY`] plus a [`WireVersion`], never compared as four bytes, so
     /// that "not our protocol" and "our protocol, another rev" stay two facts instead of one. Only the
     /// second is something the peer can act on, and [`RequestReadError::refusal`] is where it gets
     /// answered rather than logged at the wrong end.
     pub async fn read<R: io::AsyncRead + Unpin>(reader: &mut R) -> Result<Self, RequestReadError> {
-        let mut prefix = [0u8; PREFIX.len()];
-        reader.read_exact(&mut prefix).await?;
-        if prefix != PREFIX {
+        let mut identity = [0u8; IDENTITY.len()];
+        reader.read_exact(&mut identity).await?;
+        if identity != IDENTITY {
             return Err(RequestReadError::Foreign);
         }
         let version = WireVersion::read(reader).await?;
@@ -202,8 +241,9 @@ pub enum RequestWriteError {
 /// dialer used to get a bare EOF while the host logged a sentence nobody read.
 #[derive(Debug, thiserror::Error)]
 pub enum RequestReadError {
-    /// The stream did not open with `PREFIX`, so it is not a tightbeam stream. The wording is now
-    /// exactly true: it used to cover a tightbeam peer on another version as well, which it never was.
+    /// The stream's identity is not [`IDENTITY`], so it is not a tightbeam stream: either the leading
+    /// capitals differ, or they run ON past ours into a longer identity that merely opens with ours.
+    /// The wording is exactly true and covers both: a tightbeam peer on another version is never this.
     #[error("not a tightbeam stream")]
     Foreign,
     /// A tightbeam stream from a build that speaks a different request grammar.
@@ -228,8 +268,8 @@ pub enum RequestReadError {
 impl RequestReadError {
     /// The refusal to write back, for the one unreadable frame a peer can act on.
     ///
-    /// A version mismatch is answerable because the prefix already proved the peer speaks tightbeam:
-    /// naming both versions tells them what happened and what to do about it. A foreign prefix gets
+    /// A version mismatch is answerable because the identity already proved the peer speaks tightbeam:
+    /// naming both versions tells them what happened and what to do about it. A foreign identity gets
     /// nothing, since we cannot know what would even be meaningful to whatever is on the other end, and
     /// an I/O failure has no readable frame left to answer into.
     ///
