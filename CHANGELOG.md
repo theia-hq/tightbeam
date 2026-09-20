@@ -2,6 +2,23 @@
 
 All notable changes to tightbeam, newest first.
 
+## v0.8.2
+
+Names its service, and takes nauthy v0.3.1.
+
+### Fixed
+- **`tightbeam connect --service` no longer defaults to `default`.** This crate stopped serving that
+  name in `44bc974` (2026-09-08) and the default outlived it. An unnamed service now refuses at the
+  argument boundary naming the flag, rather than dialing a name no node can serve and collecting
+  the uniform not-admitted refusal, which names nothing and reads identically to a revoked badge or
+  a disabled route.
+
+### Changed
+- **nauthy v0.3.1.** Takes `Cap::expiry()`, so a holder can answer when its own grant dies, and the
+  gate that enforces nauthy's datalog budget funnel. Both manifests move together, because
+  `tightbeam-handler` carries its own nauthy pin and advancing only the root resolves the crate
+  twice in one graph.
+
 ## v0.8.1
 
 Pins bifrost v0.2.3.
