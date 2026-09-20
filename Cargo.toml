@@ -23,7 +23,7 @@ license = "MIT OR Apache-2.0"
 bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "644c7c042bbb59238f72ea116a5b6058c6c2c44f" }
 bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "644c7c042bbb59238f72ea116a5b6058c6c2c44f" }
 bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "644c7c042bbb59238f72ea116a5b6058c6c2c44f" }
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "f2ad714070ced87f91dae5275d30e9b2fa10e3dd" }
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "c31a3155bb8f8c17cdf49947c37fdb8fa8708e97" }
 # The handler contract, in-tree beside its only dispatcher. A path dep (not a git self-dep): the workspace
 # member resolves within this checkout, and the package stays separately pinnable by a consumer.
 tightbeam-handler = { path = "tightbeam-handler" }
