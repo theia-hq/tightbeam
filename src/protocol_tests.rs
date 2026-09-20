@@ -5,7 +5,7 @@ use bifrost::{
     SecurityProfile, Session,
 };
 
-use crate::protocol::{Request, RequestWriteError, Response};
+use crate::protocol::{Request, RequestReadError, RequestWriteError, Response};
 use crate::security::TransportInsecure;
 
 /// A session used only for its declared profile: [`Request::write_checked`] reads the type, never a
@@ -103,7 +103,77 @@ async fn response_roundtrips() {
 #[tokio::test]
 async fn rejects_foreign_stream() {
     let mut buf = b"XXXXnonsense".as_slice();
-    assert!(Request::read(&mut buf).await.is_err());
+    let error = Request::read(&mut buf)
+        .await
+        .expect_err("a foreign prefix is not a tightbeam stream");
+    // A foreign protocol is told nothing: we have no idea what would be meaningful to it, and silence
+    // keeps this path from being a better fingerprint than the session handshake already is.
+    assert!(
+        error.refusal().is_none(),
+        "a foreign stream gets no wire answer, only a host log line"
+    );
+    assert!(matches!(error, RequestReadError::Foreign));
+}
+
+/// The version half of the magic is PARSED, so a tightbeam peer on another rev is a distinguishable
+/// condition with a wire answer, not a foreign stream. Revert the parse to a four-byte comparison and
+/// this goes red at the first assertion.
+#[tokio::test]
+async fn a_version_mismatch_is_not_a_foreign_stream() {
+    let mut buf = Vec::new();
+    Request {
+        service: "svc".to_owned(),
+        capability: None,
+        membership: None,
+    }
+    .write(&mut buf)
+    .await
+    .unwrap();
+    // One well-formed request, one digit of the version changed: the only difference between this and
+    // the frame the host speaks.
+    buf[3] = b'5';
+
+    let error = Request::read(&mut buf.as_slice())
+        .await
+        .expect_err("TB05 is not this build's grammar");
+    assert!(
+        !matches!(error, RequestReadError::Foreign),
+        "a tightbeam peer on another rev is not a foreign protocol"
+    );
+    let refusal = error
+        .refusal()
+        .expect("a version mismatch is answerable on the wire");
+    let Refusal::BadRequest { detail } = &refusal else {
+        panic!("a version mismatch is the peer's grammar, so it is a bad request: {refusal:?}");
+    };
+    // Both versions, so the dialer learns what it speaks AND what the host speaks; one of them alone
+    // leaves them guessing at the other.
+    assert!(detail.as_str().contains("TB05"), "{detail}");
+    assert!(detail.as_str().contains("TB04"), "{detail}");
+}
+
+/// The detail is a wire surface, so it must fit the cap even on the worst input: the version half is two
+/// arbitrary peer-controlled bytes, and escaping expands each one.
+#[tokio::test]
+async fn a_version_refusal_detail_fits_the_wire_cap() {
+    let mut buf = Vec::new();
+    Request {
+        service: "svc".to_owned(),
+        capability: None,
+        membership: None,
+    }
+    .write(&mut buf)
+    .await
+    .unwrap();
+    buf[2..4].copy_from_slice(&[0xff, 0xff]);
+
+    let error = Request::read(&mut buf.as_slice())
+        .await
+        .expect_err("unprintable version bytes are still a version");
+    let Some(Refusal::BadRequest { detail }) = error.refusal() else {
+        panic!("a version mismatch is answerable whatever the bytes say");
+    };
+    assert!(detail.as_str().len() <= RefusalDetail::MAX_LEN, "{detail}");
 }
 
 /// The checked writer refuses a credential over an announced session BEFORE any byte: the writer stays

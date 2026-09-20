@@ -9,12 +9,57 @@ use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::security::{TransportInsecure, peer_proven};
 
-/// Magic + version prefixing a request; a foreign or mismatched-version stream is rejected. `TB04` types
-/// the tag-1 response: a refusal code byte plus a bounded detail, replacing the free-form string. The
-/// request layout is unchanged from `TB03` (which added the optional `membership` field after
-/// `capability`), but the tag-1 meaning changed, so a `TB03` peer is no longer wire compatible, which is
-/// correct: the two ends of one tunnel are one release.
-const MAGIC: [u8; 4] = *b"TB04";
+/// tightbeam's protocol prefix: the bytes every request preamble opens with, at every version, forever.
+/// A stream that does not start with these is not a tightbeam stream, and that is the only thing a
+/// prefix mismatch is allowed to mean.
+const PREFIX: [u8; 2] = *b"TB";
+
+/// The request grammar THIS build speaks, written after [`PREFIX`] and parsed (never compared whole) on
+/// read: together they are the four magic bytes `TB04`.
+///
+/// `TB04` types the tag-1 response: a refusal code byte plus a bounded detail, replacing the free-form
+/// string. The request layout is unchanged from `TB03` (which added the optional `membership` field
+/// after `capability`), but the tag-1 meaning changed, so a `TB03` peer is not wire compatible. The two
+/// ends of one tunnel are built from one rev, so a break here is correct rather than a regression; they
+/// are not necessarily RUNNING one rev (a locally built end dials a released host every day), so the
+/// break has to announce itself instead of dropping the stream. That is what splitting the magic buys.
+const VERSION: WireVersion = WireVersion(*b"04");
+
+/// The version half of a request preamble: the bytes after `PREFIX`, naming which request grammar the
+/// peer that wrote them speaks.
+///
+/// Parsed as a value rather than folded into one four-byte comparison, because the two halves of the
+/// magic answer different questions. A PREFIX mismatch says the stream is not ours and there is nothing
+/// true we could say to whatever is on the other end. A VERSION mismatch says a tightbeam peer on
+/// another rev, which is a fact both ends can act on, so it is answered on the wire
+/// ([`RequestReadError::refusal`]) rather than dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireVersion([u8; 2]);
+
+impl WireVersion {
+    /// Read the version half, after the prefix. The width of the field lives here, in the type that
+    /// owns it, so the reader and the writer cannot drift apart.
+    async fn read<R: io::AsyncRead + Unpin>(reader: &mut R) -> io::Result<Self> {
+        let mut bytes = [0u8; 2];
+        reader.read_exact(&mut bytes).await?;
+        Ok(Self(bytes))
+    }
+
+    /// The bytes as they go on the wire.
+    const fn as_bytes(&self) -> &[u8; 2] {
+        &self.0
+    }
+}
+
+impl core::fmt::Display for WireVersion {
+    /// Renders the WHOLE four-byte tag (`TB04`), because that is the form the source, the docs and the
+    /// changelog use, so a dialer handed one in a refusal can match it against what it reads. A peer's
+    /// two version bytes are arbitrary and need not be printable, so they are escaped rather than
+    /// trusted: this string reaches a terminal.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}{}", PREFIX.escape_ascii(), self.0.escape_ascii())
+    }
+}
 
 /// A connector's opening frame: reach the named service, optionally presenting a capability and, for a
 /// signet-bound slip, a membership badge under the foreign fleet the slip names.
@@ -31,6 +76,20 @@ pub struct Request {
 }
 
 /// The host's reply, sent before any bytes are piped.
+///
+/// **This frame is FROZEN from `TB04` forward.** The tag byte, and the refusal code byte plus bounded
+/// detail behind tag 1, mean the same thing at every version of the REQUEST frame and must keep meaning
+/// it. It is the wire's one version-independent channel, and its whole job is to be readable by a peer
+/// whose request we could not read: a version mismatch is answered with a refusal frame
+/// ([`RequestReadError::refusal`]), which is only possible because a dialer on any version can parse
+/// what comes back. Versioning this frame too would take that away and put every future break back to
+/// the bare EOF it used to be.
+///
+/// So: two stability classes on one wire. The request preamble MAY break with a version bump (it
+/// carries the evolving vocabulary: service, capability, membership). This one may NOT, ever. Growth
+/// here is additive only, and only where an older reader still tells the truth about what it got: a new
+/// refusal CODE is fine (an unknown code reads as "a class this build cannot name"), a new tag or a
+/// changed field is not.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Response {
     /// The service was reached; the byte pipe follows.
@@ -41,6 +100,10 @@ pub enum Response {
 }
 
 /// Wire codes for the [`Refusal`] classes, beside the frame they select.
+///
+/// Additive only: a code may be ADDED (an older peer reads it as a class it cannot name, which is
+/// true), and no existing code may change meaning, because the frame carrying them is frozen for every
+/// version of the request (see [`Response`]).
 ///
 /// [`Refusal`] is non-exhaustive, so a class added upstream no longer stops this file compiling. A
 /// new class needs a code here, an arm in the reader, and an entry in [`refusal_code`]; miss one
@@ -55,7 +118,8 @@ impl Request {
     /// Write the raw request frame to the stream, unchecked. Crate-internal: every credential-bearing
     /// path goes through [`write_checked`](Self::write_checked).
     pub(crate) async fn write<W: io::AsyncWrite + Unpin>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(&MAGIC).await?;
+        writer.write_all(&PREFIX).await?;
+        writer.write_all(VERSION.as_bytes()).await?;
         write_str(writer, &self.service).await?;
         write_opt(writer, self.capability.as_deref()).await?;
         write_opt(writer, self.membership.as_deref()).await
@@ -92,11 +156,20 @@ impl Request {
     }
 
     /// Read a request from the stream.
-    pub async fn read<R: io::AsyncRead + Unpin>(reader: &mut R) -> io::Result<Self> {
-        let mut magic = [0u8; 4];
-        reader.read_exact(&mut magic).await?;
-        if magic != MAGIC {
-            return Err(io::Error::other("not a tightbeam stream"));
+    ///
+    /// The preamble is parsed as `PREFIX` plus a [`WireVersion`], never compared as four bytes, so
+    /// that "not our protocol" and "our protocol, another rev" stay two facts instead of one. Only the
+    /// second is something the peer can act on, and [`RequestReadError::refusal`] is where it gets
+    /// answered rather than logged at the wrong end.
+    pub async fn read<R: io::AsyncRead + Unpin>(reader: &mut R) -> Result<Self, RequestReadError> {
+        let mut prefix = [0u8; PREFIX.len()];
+        reader.read_exact(&mut prefix).await?;
+        if prefix != PREFIX {
+            return Err(RequestReadError::Foreign);
+        }
+        let version = WireVersion::read(reader).await?;
+        if version != VERSION {
+            return Err(RequestReadError::Version { peer: version });
         }
         Ok(Request {
             service: read_str(reader).await?,
@@ -120,6 +193,60 @@ pub enum RequestWriteError {
     /// The frame could not be written.
     #[error("the request frame failed to write")]
     Io(#[from] io::Error),
+}
+
+/// Why a request frame could not be read.
+///
+/// Three failures, kept apart on purpose: only one of them is a fact the peer can act on, and only that
+/// one is answered on the wire (see [`refusal`](Self::refusal)). Collapsing them is how a version-skewed
+/// dialer used to get a bare EOF while the host logged a sentence nobody read.
+#[derive(Debug, thiserror::Error)]
+pub enum RequestReadError {
+    /// The stream did not open with `PREFIX`, so it is not a tightbeam stream. The wording is now
+    /// exactly true: it used to cover a tightbeam peer on another version as well, which it never was.
+    #[error("not a tightbeam stream")]
+    Foreign,
+    /// A tightbeam stream from a build that speaks a different request grammar.
+    ///
+    /// This message goes ON THE WIRE via [`refusal`](Self::refusal), so it is FIXED text plus the two
+    /// version tags and nothing else. Never interpolate host state here: this refusal is written before
+    /// any gate has ruled on anything, and a detail that varied with what the host knows would put a
+    /// channel on a pre-admission refusal.
+    #[error(
+        "tightbeam wire version mismatch: the request is {peer}, this host speaks {VERSION}; run the \
+         same release at both ends"
+    )]
+    Version {
+        /// The version the peer's preamble named.
+        peer: WireVersion,
+    },
+    /// The frame could not be read.
+    #[error("the request frame failed to read")]
+    Io(#[from] io::Error),
+}
+
+impl RequestReadError {
+    /// The refusal to write back, for the one unreadable frame a peer can act on.
+    ///
+    /// A version mismatch is answerable because the prefix already proved the peer speaks tightbeam:
+    /// naming both versions tells them what happened and what to do about it. A foreign prefix gets
+    /// nothing, since we cannot know what would even be meaningful to whatever is on the other end, and
+    /// an I/O failure has no readable frame left to answer into.
+    ///
+    /// [`Refusal::BadRequest`] is the honest class: it means the peer rejected the request SHAPE before
+    /// any policy ran, which is precisely what happened, and its payload is the dialer's own grammar,
+    /// which is public by definition. It is deliberately not [`Refusal::NotAdmitted`]: no gate ran, so
+    /// claiming an authorization outcome would invent a ruling nobody made.
+    pub fn refusal(&self) -> Option<Refusal> {
+        match self {
+            // The detail is this variant's own Display, which is the whole reason that string is held
+            // to fixed-text-plus-versions.
+            Self::Version { .. } => Some(Refusal::BadRequest {
+                detail: RefusalDetail::bounded(self.to_string()),
+            }),
+            Self::Foreign | Self::Io(_) => None,
+        }
+    }
 }
 
 impl Response {
