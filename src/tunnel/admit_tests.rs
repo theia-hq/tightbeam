@@ -1264,21 +1264,24 @@ fn a_not_admitted_refusal_renders_descriptively_never_doubled() {
 /// and go looking for a credential nothing rejected, and a download of theirs turns into a permanent
 /// 403 rather than a retry.
 ///
-/// This is the interim mapping. The ruling is that the answer deserves its own wire code, which is a
-/// format change and not this layer's to make; the test pins the fallback so the day it is upgraded, the
-/// change is deliberate rather than silent. Every other gate cause stays uniform, which is settled and
-/// is not what this reopens.
+/// It goes on the refusal that is about the host, which is what that refusal now means: the reading
+/// that let a dialer recover the admission bit from it was removed upstream as an oracle. Whether the
+/// outcome earns a wire code of its own is an open call, and this test holds under either answer, since
+/// a code of its own would narrow this mapping rather than correct it. Every other gate cause stays
+/// uniform, which is settled and is not what this reopens.
 #[test]
 fn an_undecided_gate_is_not_the_refusal_that_rules_on_the_dialer() {
     let undecided = super::wire_refusal(&super::HostRefusal::Gate(nauthy::Refusal::Undecided));
 
+    // The negative runs FIRST: an inverted mapping must trip the assertion that names the lie, not a
+    // shape check that fails and aborts before it is ever reached.
+    assert!(
+        !undecided.to_string().contains("not admitted"),
+        "never the refusal that tells a dialer they lack authority: {undecided}"
+    );
     assert!(
         matches!(undecided, Refusal::Unavailable { .. }),
         "an answer about this host goes on the refusal that is about this host: {undecided}"
-    );
-    assert!(
-        !undecided.to_string().contains("not admitted"),
-        "and never on the one that tells a dialer they lack authority: {undecided}"
     );
 
     for uniform in [
