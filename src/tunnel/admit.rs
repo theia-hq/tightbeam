@@ -299,15 +299,16 @@ enum HostRefusal {
     },
 }
 
-/// The wire refusal a host cause becomes. Every cause maps to the same payload-free `NotAdmitted` today,
-/// and this function exists so that stays a DECISION rather than a default.
+/// The wire refusal a host cause becomes. Every cause that RULES on the dialer maps to the same
+/// payload-free `NotAdmitted`; the one cause that rules on nothing does not, and this function exists so
+/// that split stays a DECISION rather than a default.
 ///
 /// It is written as an exhaustive match, with the gate's own cause destructured and no wildcard anywhere,
 /// because the alternative failed: a new gate outcome added upstream inherits whatever the fall-through
 /// happened to be, silently, and a uniform refusal is exactly the kind of answer that must never be
-/// inherited. nauthy is about to gain one (an evaluation that ran out of time, which is not a ruling about
-/// the dialer at all), and when that pin moves this match will stop compiling until someone rules on it.
-/// That is the point, and a reviewer who reaches for a wildcard to make it build has thrown the guard away.
+/// inherited. The gate outcome below that is not a ruling arrived exactly that way, and the absence of a
+/// wildcard is what stopped this file compiling until someone ruled on it. A reviewer who reaches for a
+/// wildcard to make it build has thrown the guard away.
 ///
 /// The uniformity itself is settled and is not what this function reopens: a dialer must not be able to
 /// tell a stranger's missing token from a revoked holder's, an absent service from a gated one, or a
@@ -326,12 +327,16 @@ fn wire_refusal(refusal: &HostRefusal) -> Refusal {
             // them they lack a credential nothing rejected, and they act on it, stopping their retries
             // and going to look for a token they already hold.
             //
-            // INTERIM, and named as one. The ruling on this is that it deserves its own wire code, which
-            // is a format change and therefore the founder's call; this is the fallback that same ruling
-            // named as acceptable in the meantime, and it changes no format. The cost is that
-            // `Unavailable` no longer implies the dialer got past the gate, which is why that variant's
-            // own doc was widened rather than left to drift. Taken now because the defect underneath it
-            // is live: on the previous pin a valid device badge was refused about one run in three.
+            // It goes on the refusal that is about THIS HOST, and that is where it belongs by meaning,
+            // not by convenience. `Unavailable` no longer carries the narrower "you got past the gate
+            // and then we failed you": that reading was removed upstream on purpose, because a dialer
+            // who can recover the admission bit out of a refusal has been handed an oracle. What is
+            // left is "this is about us, not about you", which is the whole of what a stalled gate has
+            // to report.
+            //
+            // Whether this outcome eventually earns a wire code of its own is open. That is a format
+            // change and so not this layer's to settle, and it does not bear on the line below either
+            // way: a code of its own would NARROW this answer, never correct it.
             //
             // The detail is FIXED text, never host state. A detail that varied with load would put a
             // channel on a pre-admission refusal, which is the thing the uniform answer exists to deny.

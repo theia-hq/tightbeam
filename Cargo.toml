@@ -20,9 +20,9 @@ license = "MIT OR Apache-2.0"
 # `.cargo/config.toml` still [patch]es these by URL to sibling PATH checkouts, so a `rev` here does not
 # slow local builds (the patch wins locally regardless of the rev); CI resolves the rev from GitHub. All
 # bifrost-* crates live in one repo, so they share one rev. Bump deliberately each release.
-bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "644c7c042bbb59238f72ea116a5b6058c6c2c44f" }
-bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "644c7c042bbb59238f72ea116a5b6058c6c2c44f" }
-bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "644c7c042bbb59238f72ea116a5b6058c6c2c44f" }
+bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "b1638d487e8eac92ce353aadd776df2e92d6bbba" }
+bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "b1638d487e8eac92ce353aadd776df2e92d6bbba" }
+bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "b1638d487e8eac92ce353aadd776df2e92d6bbba" }
 nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "c31a3155bb8f8c17cdf49947c37fdb8fa8708e97" }
 # The handler contract, in-tree beside its only dispatcher. A path dep (not a git self-dep): the workspace
 # member resolves within this checkout, and the package stays separately pinnable by a consumer.
@@ -46,7 +46,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "644c7c042bbb59238f72ea116a5b6058c6c2c44f" }
+bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "b1638d487e8eac92ce353aadd776df2e92d6bbba" }
 
 [lints]
 workspace = true

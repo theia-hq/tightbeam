@@ -40,8 +40,11 @@ pub enum Response {
     Refused(Refusal),
 }
 
-/// Wire codes for the [`Refusal`] variants, beside the frame they
-/// select. A new variant forces a code here and an arm in the reader.
+/// Wire codes for the [`Refusal`] classes, beside the frame they select.
+///
+/// [`Refusal`] is non-exhaustive, so a class added upstream no longer stops this file compiling. A
+/// new class needs a code here, an arm in the reader, and an entry in [`refusal_code`]; miss one
+/// and the host fails the response write rather than sending a code that means something else.
 mod refusal_tag {
     pub const NOT_ADMITTED: u8 = 0;
     pub const BAD_REQUEST: u8 = 1;
@@ -125,17 +128,14 @@ impl Response {
         match self {
             Response::Ok => writer.write_all(&[0]).await,
             Response::Refused(refusal) => {
-                writer.write_all(&[1]).await?;
-                match refusal {
-                    Refusal::NotAdmitted => writer.write_all(&[refusal_tag::NOT_ADMITTED]).await,
-                    Refusal::BadRequest { detail } => {
-                        writer.write_all(&[refusal_tag::BAD_REQUEST]).await?;
-                        write_detail(writer, detail).await
-                    }
-                    Refusal::Unavailable { detail } => {
-                        writer.write_all(&[refusal_tag::UNAVAILABLE]).await?;
-                        write_detail(writer, detail).await
-                    }
+                // The whole frame is settled before a byte moves, so a refusal this codec cannot
+                // encode leaves the stream untouched instead of a lone `1` the peer then blocks
+                // behind waiting for a code that never comes.
+                let (code, detail) = refusal_code(refusal)?;
+                writer.write_all(&[1, code]).await?;
+                match detail {
+                    Some(detail) => write_detail(writer, detail).await,
+                    None => Ok(()),
                 }
             }
         }
@@ -167,6 +167,32 @@ impl Response {
                 "unknown response tag {other:#04x}"
             ))),
         }
+    }
+}
+
+/// The wire code for a refusal class, with the detail that follows it on the wire (a payload-free
+/// class carries none).
+///
+/// Split out of the write so the frame is decided before a byte moves, and so the arm that matters
+/// is visible on its own. [`Refusal`] is non-exhaustive: a newer bifrost can name a class this
+/// build has no code for, and the arm that catches one is deliberately an ERROR rather than a
+/// substitution. Every code in `refusal_tag` is a claim, and a claim this build cannot read is one it
+/// must not invent: quietly reusing `NOT_ADMITTED` would tell a dialer their credential was rejected
+/// by a host that ruled no such thing, and reusing `UNAVAILABLE` would put arbitrary future classes
+/// behind one word a reader has no way to unpick. Failing the write ends the stream instead, and a
+/// dialer reporting a broken stream is telling the truth about what happened.
+///
+/// Reaching this arm means the bifrost pin moved and no code was added here, which is a mistake
+/// made at build time; until the day a new class exists there is nothing to construct, so no test
+/// can reach it and this comment is the whole of the warning.
+fn refusal_code(refusal: &Refusal) -> io::Result<(u8, Option<&RefusalDetail>)> {
+    match refusal {
+        Refusal::NotAdmitted => Ok((refusal_tag::NOT_ADMITTED, None)),
+        Refusal::BadRequest { detail } => Ok((refusal_tag::BAD_REQUEST, Some(detail))),
+        Refusal::Unavailable { detail } => Ok((refusal_tag::UNAVAILABLE, Some(detail))),
+        unencodable => Err(io::Error::other(format!(
+            "no tightbeam refusal code for this class: {unencodable}"
+        ))),
     }
 }
 
