@@ -422,7 +422,12 @@ fn a_catalog_self_lists_the_row_being_built_gated() {
         "the row being built is gated by construction"
     );
     assert_eq!(
-        ServiceCatalog::decode(&catalog.encode()).expect("round-trips"),
+        ServiceCatalog::decode(
+            &catalog
+                .encode()
+                .expect("a real catalog is under the wire bound")
+        )
+        .expect("round-trips"),
         catalog
     );
 }

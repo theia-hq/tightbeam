@@ -79,7 +79,24 @@ where
     // exhaust the node one slow stream at a time. Time out and drop a silent stream.
     let request = match tokio::time::timeout(REQUEST_READ_TIMEOUT, Request::read(&mut reader)).await
     {
-        Ok(result) => result?,
+        Ok(Ok(request)) => request,
+        Ok(Err(error)) => {
+            // An unreadable frame is PRE-GATE: nothing has been decided about this peer, so there is no
+            // policy outcome to protect and the uniform refusal below does not apply (it exists so one
+            // gate miss cannot be told from another; this dialer never reached the gate). The one thing
+            // we can say truthfully is a version mismatch, and saying it is the whole point: a peer
+            // whose grammar we cannot parse otherwise gets a closed stream and no way to learn why,
+            // which is exactly the case where the person at the keyboard has no next move. A foreign
+            // stream still gets silence.
+            tracing::warn!(%peer, %error, "unreadable request frame");
+            return match error.refusal() {
+                Some(refusal) => Response::Refused(refusal)
+                    .write(&mut writer)
+                    .await
+                    .map_err(Into::into),
+                None => Err(error.into()),
+            };
+        }
         Err(_elapsed) => {
             tracing::warn!(%peer, "request read timed out before the gate; dropping the stream");
             return Ok(());

@@ -9,6 +9,7 @@ use bifrost::{
 };
 use bifrost_mem::MemTransport;
 use nauthy::{Gate, Service};
+use tokio::io::AsyncReadExt as _;
 use tokio::sync::Semaphore;
 
 use super::{Admission, resolve_single_service, serve_request};
@@ -146,6 +147,123 @@ fn drive_open_in(
         serve_request(peer, server_write, server_read, serving, session).await
     };
     (client_read, serve)
+}
+
+/// Drive one `serve_request` against `serving` over a hand-built opening frame, returning the client's
+/// read half plus the serving future. Writing the bytes verbatim is the only way to present a preamble
+/// this build cannot write, which is what a peer on another rev is.
+fn drive_frame(
+    frame: Vec<u8>,
+    serving: std::sync::Arc<super::Serving>,
+) -> (
+    tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    impl core::future::Future<Output = eyre::Result<()>>,
+) {
+    let (client, server) = tokio::io::duplex(1024);
+    let (server_read, server_write) = tokio::io::split(server);
+    let (client_read, mut client_write) = tokio::io::split(client);
+    let peer = SessionPeer {
+        node: bifrost::NodeId::from_ed25519_secret(&[9u8; 32]),
+        security: PROVEN,
+    };
+    let serve = async move {
+        tokio::io::AsyncWriteExt::write_all(&mut client_write, &frame)
+            .await
+            .expect("write frame");
+        drop(client_write);
+        serve_request(
+            peer,
+            server_write,
+            server_read,
+            serving,
+            std::sync::Arc::new(PublicSession::default()),
+        )
+        .await
+    };
+    (client_read, serve)
+}
+
+/// One well-formed request with its four magic bytes replaced. Everything after the preamble is exactly
+/// what this build writes, so the only thing under test is how the magic is READ.
+async fn frame_with_magic(magic: &[u8; 4]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    crate::protocol::Request {
+        service: "svc".to_owned(),
+        capability: None,
+        membership: None,
+    }
+    .write(&mut frame)
+    .await
+    .expect("write request");
+    frame[..4].copy_from_slice(magic);
+    frame
+}
+
+/// A node with one ordinary service, for the preamble tests: the refusal lands before dispatch, so what
+/// is exposed cannot matter, and a populated registry says so.
+fn exposing_svc() -> std::sync::Arc<super::Serving> {
+    open_serving(
+        services(&["svc=tcp:127.0.0.1:80"]),
+        Semaphore::new(RAW_STREAM_OPEN_PERMITS),
+    )
+}
+
+/// A dialer built from another rev is ANSWERED, and the answer names BOTH versions, so the person at
+/// the keyboard learns what each end speaks instead of watching a stream close. Revert `Request::read`
+/// to comparing four bytes for equality and the host writes nothing at all: the first assertion goes
+/// red on a bare EOF, which is exactly the bug.
+#[tokio::test]
+async fn a_version_skewed_dialer_is_told_both_versions() {
+    let (mut client, serve) = drive_frame(frame_with_magic(b"TB05").await, exposing_svc());
+    let (served, response) = tokio::join!(serve, crate::protocol::Response::read(&mut client));
+
+    let response = response.expect(
+        "a version-skewed dialer must be answered on the wire; the response frame is frozen across \
+         versions precisely so this one is readable",
+    );
+    assert_ne!(
+        response,
+        crate::protocol::Response::Ok,
+        "a request frame this host cannot parse is never a success"
+    );
+    let detail = match &response {
+        crate::protocol::Response::Refused(Refusal::BadRequest { detail }) => detail.as_str(),
+        other => {
+            panic!("a version skew is the peer's own grammar, so it is a bad request: {other:?}")
+        }
+    };
+    assert!(
+        detail.contains("TB05"),
+        "the refusal names what the DIALER speaks: {detail}"
+    );
+    assert!(
+        detail.contains("TB04"),
+        "the refusal names what the HOST speaks: {detail}"
+    );
+    served.expect("the host answers the skew and ends the stream cleanly");
+}
+
+/// A genuinely foreign protocol keeps the old behaviour: no frame, no version, nothing. This is the
+/// other half of the pair, and the pair is the whole change, which is about telling the two apart. The
+/// frame differs from the one above in the PROTOCOL half of the magic and nowhere else.
+#[tokio::test]
+async fn a_foreign_protocol_is_told_nothing() {
+    let (mut client, serve) = drive_frame(frame_with_magic(b"XX04").await, exposing_svc());
+    let mut seen = Vec::new();
+    let (served, read) = tokio::join!(serve, client.read_to_end(&mut seen));
+
+    read.expect("the host closes the stream");
+    assert!(
+        seen.is_empty(),
+        "a foreign protocol is answered with silence: we have nothing true to say to a protocol we do \
+         not speak, and saying our version would hand a scanner a fingerprint. Got {seen:?}"
+    );
+    let host_error =
+        served.expect_err("a foreign stream stays the host's own error, with no peer to answer");
+    assert!(
+        !host_error.to_string().contains("version"),
+        "a foreign prefix is not a version skew, and the log must not say it is: {host_error}"
+    );
 }
 
 /// The admission core with an unconstrained public pool and a fresh session: the predicate tests care

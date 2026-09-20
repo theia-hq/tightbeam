@@ -72,6 +72,10 @@ pub struct ServiceEntry {
 ///     name       [u8; name_len]   (UTF-8)
 ///     posture    u8               (0 gated, 1 open)
 /// ```
+///
+/// A blob of this wire never exceeds [`MAX_CATALOG_BLOB`], and BOTH ends hold that: the encoder refuses to
+/// emit more, and a reader refuses to read more. Whoever defines a wire owns both sides of it, so the bound
+/// lives here, beside the codec, rather than being restated by each end.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceCatalog(pub(super) Vec<ServiceEntry>);
 
@@ -83,6 +87,70 @@ const MAX_SERVICE_NAME_LEN: usize = 256;
 /// blob. A node serves a handful of services, never thousands.
 const MAX_CATALOG_ENTRIES: usize = 1024;
 
+/// The count the wire opens with: one big-endian `u32`. Named, not spelled `4`, because both the encoder
+/// and [`MAX_CATALOG_BLOB`] are written in terms of it.
+const COUNT_PREFIX_LEN: usize = 4;
+
+/// The fixed framing each entry carries beside its name: the `u16` name length and the `u8` posture tag.
+const ENTRY_OVERHEAD_LEN: usize = 2 + 1;
+
+/// The largest catalog blob this wire admits, in bytes: the size of the biggest catalog
+/// [`ServiceCatalog::decode`] will accept, and not one byte more. A reader bounds its buffer by this BEFORE
+/// the first byte lands.
+///
+/// DERIVED from the wire's own field bounds and framing, never chosen, so it cannot drift away from what the
+/// decoder accepts the way an independent constant can:
+///
+/// ```text
+///     COUNT_PREFIX_LEN                                                    the u32 count
+///   + MAX_CATALOG_ENTRIES * (ENTRY_OVERHEAD_LEN + MAX_SERVICE_NAME_LEN)   u16 len + u8 tag + the name
+///   = 4 + 1024 * (3 + 256)
+///   = 265_220 bytes
+/// ```
+///
+/// Exact rather than round: a rounded bound is one somebody has to justify separately, and this one is just
+/// the arithmetic. A test encodes the largest admissible catalog and asserts the blob is exactly this many
+/// bytes, so a framing change this expression does not follow fails there rather than silently loosening a
+/// reader's cap.
+///
+/// Both ends hold it. [`ServiceCatalog::encode`] refuses a catalog past the field bounds it is derived from,
+/// so an over-large catalog fails on the SERVING side with its own reason; a reader caps its read here, so a
+/// peer that streams forever cannot grow the reader's buffer. The decoder's caps do not help a reader on
+/// their own: by the time `decode` sees a blob, the reader has already allocated all of it.
+pub const MAX_CATALOG_BLOB: u64 =
+    (COUNT_PREFIX_LEN + MAX_CATALOG_ENTRIES * (ENTRY_OVERHEAD_LEN + MAX_SERVICE_NAME_LEN)) as u64;
+
+/// Why a catalog could not be put on the wire: it names more than the wire admits. The encoder enforces
+/// EXACTLY the bounds [`ServiceCatalog::decode`] enforces, so a catalog that encodes is a catalog that
+/// decodes; an encoder that can emit a frame its own decoder refuses is a wire lying about its bounds.
+///
+/// The catalog is the serving node's own route table, so this is a local configuration fault, reported
+/// where it is committed rather than arriving at a reader as a truncated blob it cannot explain.
+#[derive(Debug, thiserror::Error)]
+pub enum CatalogTooLarge {
+    /// More services than the wire's entry bound admits.
+    #[error("the node serves {count} services, more than the catalog wire carries (at most {max})")]
+    TooManyServices {
+        /// How many services the catalog names.
+        count: usize,
+        /// The entry bound it exceeded.
+        max: usize,
+    },
+    /// One service name longer than the wire's per-name bound. The name is the operator's own, so it is
+    /// quoted: an operator needs to know WHICH service to shorten, not just that one is too long.
+    #[error(
+        "service name `{name}` is {len} bytes, longer than the catalog wire carries (at most {max})"
+    )]
+    NameTooLong {
+        /// The offending service name.
+        name: String,
+        /// Its length in bytes.
+        len: usize,
+        /// The per-name bound it exceeded.
+        max: usize,
+    },
+}
+
 impl ServiceCatalog {
     /// The served services, in name order.
     pub fn entries(&self) -> impl Iterator<Item = &ServiceEntry> {
@@ -92,21 +160,46 @@ impl ServiceCatalog {
 
     /// Encode the catalog to its self-delimiting wire form (see the type's layout). The count and each name
     /// are length-prefixed, so a reader delimits every field with no framing around the blob.
-    pub fn encode(&self) -> Vec<u8> {
+    ///
+    /// Fallible against the SAME two bounds [`decode`](Self::decode) enforces, checked before a byte is
+    /// written. A catalog past either of them is one no reader of this wire will take, so it is refused
+    /// here, on the serving side, with a reason an operator can act on, instead of being handed to a writer
+    /// to arrive somewhere as a truncated blob. Enforcing the bounds here is also what makes the two casts
+    /// below true rather than hopeful: a name past `MAX_SERVICE_NAME_LEN` would otherwise wrap the `u16`
+    /// length prefix and emit a frame that decodes as something else entirely.
+    pub fn encode(&self) -> Result<Vec<u8>, CatalogTooLarge> {
         let Self(entries) = self;
-        let mut out = Vec::new();
-        // A node's service count never approaches u32::MAX; the cast is deterministic and the decoder bounds
-        // it at MAX_CATALOG_ENTRIES.
+        if entries.len() > MAX_CATALOG_ENTRIES {
+            return Err(CatalogTooLarge::TooManyServices {
+                count: entries.len(),
+                max: MAX_CATALOG_ENTRIES,
+            });
+        }
+        // Size the buffer from the bounded entries rather than growing it: the total is what
+        // MAX_CATALOG_BLOB is derived from, so this allocates at most that.
+        let mut size = COUNT_PREFIX_LEN;
+        for entry in entries {
+            if entry.name.len() > MAX_SERVICE_NAME_LEN {
+                return Err(CatalogTooLarge::NameTooLong {
+                    name: entry.name.clone(),
+                    len: entry.name.len(),
+                    max: MAX_SERVICE_NAME_LEN,
+                });
+            }
+            size += ENTRY_OVERHEAD_LEN + entry.name.len();
+        }
+
+        let mut out = Vec::with_capacity(size);
+        // Bounded at MAX_CATALOG_ENTRIES above, which is far under u32::MAX.
         out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
         for entry in entries {
             let name = entry.name.as_bytes();
-            // A service name is short (well under u16::MAX, bounded by MAX_SERVICE_NAME_LEN below), so this
-            // cast never truncates.
+            // Bounded at MAX_SERVICE_NAME_LEN above, which is far under u16::MAX.
             out.extend_from_slice(&(name.len() as u16).to_be_bytes());
             out.extend_from_slice(name);
             out.push(entry.posture.tag());
         }
-        out
+        Ok(out)
     }
 
     /// Decode a catalog from the wire form written by [`encode`](Self::encode). Bounds-checked against
