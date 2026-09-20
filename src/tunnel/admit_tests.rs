@@ -1265,10 +1265,10 @@ fn a_not_admitted_refusal_renders_descriptively_never_doubled() {
 /// 403 rather than a retry.
 ///
 /// It goes on the refusal that is about the host, which is what that refusal now means: the reading
-/// that let a dialer recover the admission bit from it was removed upstream as an oracle. Whether the
-/// outcome earns a wire code of its own is an open call, and this test holds under either answer, since
-/// a code of its own would narrow this mapping rather than correct it. Every other gate cause stays
-/// uniform, which is settled and is not what this reopens.
+/// that let a dialer recover the admission bit from it was removed upstream as an oracle. Ruled
+/// unanimously on 2026-09-20 that the outcome earns no wire code of its own, so this mapping is the
+/// answer and not a stand-in for one. Every other gate cause stays uniform, which is settled and is
+/// not what this reopens.
 #[test]
 fn an_undecided_gate_is_not_the_refusal_that_rules_on_the_dialer() {
     let undecided = super::wire_refusal(&super::HostRefusal::Gate(nauthy::Refusal::Undecided));

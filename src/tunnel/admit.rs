@@ -334,9 +334,25 @@ fn wire_refusal(refusal: &HostRefusal) -> Refusal {
             // left is "this is about us, not about you", which is the whole of what a stalled gate has
             // to report.
             //
-            // Whether this outcome eventually earns a wire code of its own is open. That is a format
-            // change and so not this layer's to settle, and it does not bear on the line below either
-            // way: a code of its own would NARROW this answer, never correct it.
+            // RULED 2026-09-20, unanimously, and this is the settled answer rather than a placeholder
+            // for one. Three seats asked whether the outcome earns a wire code of its own and all three
+            // said no, two of them reversing their own earlier position to get there. A refusal class
+            // names the set of DIALER RESPONSES, not the set of host causes, and a dialer's responses
+            // are: retry, do not retry, fix your credential. `Unavailable` already selects the first,
+            // so a distinct class would select nothing new. The finer cause is the host's to log, not
+            // the wire's to carry.
+            //
+            // It is also not merely safe but necessary that the wire stays quiet here. The wall clock
+            // is partly reachable BY A DIALER: biscuit checks its fact and iteration limits only at
+            // evaluation-pass boundaries, so a presented token can burn a pass and trip the clock
+            // without ever tripping a deterministic cap. A distinct code would publish that
+            // partly-attacker-driven bit as a committed wire fact, which is the one thing a uniform
+            // refusal exists to prevent.
+            //
+            // Reopen only on the first `Undecided` producer that is NOT a local wall clock, such as a
+            // network revocation or authority lookup, which would give the outcome a real duration and
+            // so a genuinely different backoff. That cannot arrive quietly: this match and nauthy's
+            // error mapping are both wildcard-free.
             //
             // The detail is FIXED text, never host state. A detail that varied with load would put a
             // channel on a pre-admission refusal, which is the thing the uniform answer exists to deny.
