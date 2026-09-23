@@ -663,6 +663,205 @@ async fn four_public_streams_hold_the_node_wide_pool_and_the_fifth_is_refused() 
         .expect("the serve future returns Ok");
 }
 
+/// A node serving one live `stdin:+lossy`-shaped broadcast, `cam`, to strangers through the unsafe
+/// raw-stream overlay, beside a family-gated `vault`, on a rooted base and the PRODUCTION public pool.
+/// Returns the serving context and the producer's end of the source, so a test decides when bytes flow.
+///
+/// `vault` is load-bearing for the refusal comparisons: a node serving exactly ONE name resolves any
+/// unknown request to it, so without a second route an "absent service" dial would quietly become a
+/// second dial of `cam` and a comparison against it would compare `cam` with itself.
+fn public_lossy_broadcast() -> (Arc<super::Serving>, tokio::io::DuplexStream) {
+    let (producer, source) = tokio::io::duplex(4096);
+    let mut routes = HashMap::new();
+    routes.insert(
+        "cam".to_owned(),
+        crate::tunnel::router::Route::family(crate::tunnel::router::Target::RawStream(
+            crate::raw_stream::RawStream::lossy_from_reader(Box::new(source)),
+        )),
+    );
+    let services = Services(routes)
+        .with_handler("vault", GatedNoop)
+        .expect("`vault` binds");
+    let serving = Arc::new(super::Serving {
+        gate: family_gate("public-lossy"),
+        public: PublicServices::default(),
+        public_unsafe: PublicServices(["cam".to_owned()].into_iter().collect()),
+        services,
+        raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
+        public_pool: PublicPool::new(),
+        enabled: Box::new(AllEnabled),
+    });
+    (serving, producer)
+}
+
+/// Admit one stranger to `cam` on its own session and spawn its splice, returning the client's read half
+/// once the host has answered `Ok` (failing with `why` if it did not). The splice task is returned so a
+/// test can watch it end.
+async fn admit_viewer(
+    serving: &Arc<super::Serving>,
+    why: &str,
+) -> (
+    tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    tokio::task::JoinHandle<eyre::Result<()>>,
+) {
+    let (mut reader, serve) = drive_open_in(
+        "cam",
+        Arc::clone(serving),
+        Arc::new(PublicSession::default()),
+        None,
+    );
+    let splice = tokio::spawn(serve);
+    assert_eq!(
+        crate::protocol::Response::read(&mut reader)
+            .await
+            .expect("the response reads"),
+        crate::protocol::Response::Ok,
+        "{why}"
+    );
+    (reader, splice)
+}
+
+/// Everything the host writes to a stranger dialing `service` on a fresh session: the whole wire answer,
+/// read to the host's close, so two answers can be compared byte for byte rather than as decoded values.
+/// Bounded, because a dial the host wrongly ADMITS never closes: without the bound a broken cap would
+/// hang the suite instead of failing it.
+async fn wire_answer(service: &str, serving: &Arc<super::Serving>) -> Vec<u8> {
+    let (mut reader, serve) = drive_open_in(
+        service,
+        Arc::clone(serving),
+        Arc::new(PublicSession::default()),
+        None,
+    );
+    let mut answer = Vec::new();
+    let answered = async {
+        let (served, read) = tokio::join!(serve, reader.read_to_end(&mut answer));
+        served.expect("the serving future returns after the refusal");
+        read.expect("the host closes the stream after answering");
+    };
+    tokio::time::timeout(core::time::Duration::from_secs(5), answered)
+        .await
+        .expect("a refused dial is answered and closed; a stream still open was admitted");
+    answer
+}
+
+/// A full public stream pool is not an oracle. With four strangers holding every public stream slot on a
+/// live `+lossy` broadcast (the unsafe raw-stream overlay draws the same pool a safe public service does),
+/// the fifth stranger's answer is BYTE-IDENTICAL to what a stranger gets for a service this node does not
+/// serve at all, and for a gated service it holds no credential for. A dialer must not be able to tell
+/// "this service exists and the node is full" from "there is nothing here for you", or the pool becomes a
+/// way to confirm a service and to count its viewers.
+#[tokio::test]
+async fn a_full_public_pool_answers_exactly_like_an_absent_service() {
+    let (serving, _producer) = public_lossy_broadcast();
+    let mut viewers = Vec::new();
+    for _ in 0..PUBLIC_STREAM_PERMITS {
+        viewers.push(
+            admit_viewer(
+                &serving,
+                "a stranger under the public stream cap is admitted",
+            )
+            .await,
+        );
+    }
+
+    let full = wire_answer("cam", &serving).await;
+    assert_eq!(
+        full,
+        wire_answer("nothing-here", &serving).await,
+        "a full public pool must answer byte for byte like an absent service"
+    );
+    assert_eq!(
+        full,
+        wire_answer("vault", &serving).await,
+        "a full public pool must answer byte for byte like a gate miss"
+    );
+    let mut decoded = full.as_slice();
+    assert_eq!(
+        crate::protocol::Response::read(&mut decoded)
+            .await
+            .expect("the answer is one response frame"),
+        crate::protocol::Response::Refused(bifrost::Refusal::NotAdmitted),
+        "the shared answer is the uniform not-admitted refusal"
+    );
+}
+
+/// A viewer that goes away gives its public stream slot back. Four strangers hold the whole pool on a
+/// live `+lossy` broadcast and the fifth is refused; one of the four then disconnects, and once its
+/// splice notices (the next source byte fails to reach it), its slot returns and a new stranger is
+/// admitted and receives the feed. Without the release, the fifth refusal would be permanent: the pool
+/// would stay full of viewers that no longer exist, and nobody could watch until the node restarted.
+///
+/// Scope: this fixture's client has already half-closed its send side (it hangs up after the request),
+/// and an in-process pipe reports a vanished peer as EOF, so this is the viewer the splice notices only
+/// at its next write. A viewer that vanishes with its send half open errors the splice's read at once
+/// over a real transport; no in-process test here can show that, so none claims to.
+#[tokio::test]
+async fn a_viewer_that_disconnects_gives_its_slot_to_the_next_stranger() {
+    tokio::time::timeout(
+        core::time::Duration::from_secs(30),
+        a_viewer_that_disconnects_gives_its_slot_to_the_next_stranger_within_bound(),
+    )
+    .await
+    .expect("every read completes; a hang here is a slot or a feed that never arrived");
+}
+
+async fn a_viewer_that_disconnects_gives_its_slot_to_the_next_stranger_within_bound() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let (serving, mut producer) = public_lossy_broadcast();
+    let mut viewers = Vec::new();
+    for _ in 0..PUBLIC_STREAM_PERMITS {
+        viewers.push(
+            admit_viewer(
+                &serving,
+                "a stranger under the public stream cap is admitted",
+            )
+            .await,
+        );
+    }
+    // Every viewer is live and receiving, not merely admitted.
+    producer.write_all(b"a").await.expect("feed the broadcast");
+    for (reader, _) in &mut viewers {
+        let mut byte = [0u8; 1];
+        reader
+            .read_exact(&mut byte)
+            .await
+            .expect("a viewer reads the feed");
+        assert_eq!(&byte, b"a", "each admitted viewer receives the live feed");
+    }
+    assert_eq!(
+        wire_answer("cam", &serving).await,
+        wire_answer("vault", &serving).await,
+        "the pool is full, so the fifth stranger is refused like any gate miss"
+    );
+
+    // One viewer disconnects. The source is live, so its next byte is where the splice finds the peer
+    // gone: that write fails, the stream ends, and the slot it held drops with it.
+    let (gone, splice) = viewers.swap_remove(0);
+    drop(gone);
+    producer.write_all(b"b").await.expect("feed the broadcast");
+    // The splice's own result is the write it could not make; what matters is that it ENDED.
+    let _broken_pipe = tokio::time::timeout(core::time::Duration::from_secs(5), splice)
+        .await
+        .expect("the departed viewer's splice ends at the next source byte")
+        .expect("the splice task joins");
+
+    let (mut next, _next_splice) = admit_viewer(
+        &serving,
+        "the slot a departed viewer held must return to the pool for the next stranger",
+    )
+    .await;
+    producer.write_all(b"c").await.expect("feed the broadcast");
+    let mut byte = [0u8; 1];
+    next.read_exact(&mut byte)
+        .await
+        .expect("the new viewer reads the feed");
+    assert_eq!(
+        &byte, b"c",
+        "the stranger admitted into the freed slot receives the live feed"
+    );
+}
+
 /// AVAILABILITY: a flood of never-written `fifo:` opens is bounded
 /// by `RAW_STREAM_OPEN_PERMITS` and, crucially, parks NO threads (the open is nonblocking; a writer-less
 /// FIFO is awaited via the reactor, not a blocking-pool thread). With a cap of N, launch N+K concurrent
