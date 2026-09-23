@@ -3794,7 +3794,7 @@ dependencies = [
 
 [[package]]
 name = "tightbeam"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "bifrost",
  "bifrost-iroh",
