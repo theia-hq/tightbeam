@@ -202,22 +202,22 @@ impl Fanout {
     /// first consumer. A late joiner attaches at the current head (a `stdin:` fan-out is a live session, not a
     /// replay), so it sees bytes from now on, never the history other consumers already drained.
     ///
-    /// Returns `None` only once the session is over: the source reader has been taken, no consumer is live,
-    /// and the pump has EXITED (the ring is closed, which is set only after the reader was dropped). While the
-    /// pump is parked, a fresh consumer attaches and revives the session; a `fifo:` caller re-arms on `None`
-    /// with a new open, a non-rewindable `stdin:` caller refuses cleanly rather than hand out a cursor that
-    /// only ever reads EOF.
+    /// Returns `None` once the session is over: the pump has EXITED (the ring is closed, which is set only
+    /// after the reader was dropped), whether or not earlier consumers are still draining the tail. A
+    /// joiner attaches at the live edge, so a cursor handed out now would only ever read EOF. While the pump
+    /// is parked, a fresh consumer attaches and revives the session; a `fifo:` caller re-arms on `None` with
+    /// a new open, a non-rewindable `stdin:` caller refuses cleanly.
     pub(crate) fn open(&self) -> Option<Cursor> {
         let Self(shared) = self;
         let mut life = shared.life.lock().unwrap_or_else(PoisonError::into_inner);
         // The first consumer starts the pump by taking the source. A later consumer finds `source` already
-        // taken (the pump owns it) and simply attaches; but if the source is gone AND no consumer is live,
-        // the session is over only once its pump has exited, so the refusal must read the ring's `closed`
-        // rather than the bare zero count. A zero-consumer instant while the pump is parked was the old
-        // kill switch: reviving it here is what keeps a live `fifo:` session (and a `stdin:` feed) alive.
+        // taken (the pump owns it) and simply attaches, unless the session is over: the refusal reads the
+        // ring's `closed`, never the consumer count. A zero-consumer instant while the pump is parked was the
+        // old kill switch, so a bare zero count must not refuse; and a consumer still draining the tail of an
+        // ended session must not make the joiner's empty stream look live.
         if let Some(source) = life.source.take() {
             spawn_pump(Arc::clone(shared), source);
-        } else if life.consumers == 0 {
+        } else {
             let closed = shared
                 .ring
                 .lock()
@@ -642,6 +642,25 @@ mod tests {
             fanout.open().is_none(),
             "a non-rewindable session that ran and closed hands out no more cursors"
         );
+    }
+
+    /// A joiner after end of input is refused even while an earlier viewer is still draining the tail: it
+    /// would attach at the live edge of an ended stream and read nothing, an empty stream posing as a live
+    /// one.
+    #[tokio::test]
+    async fn a_joiner_after_end_of_input_is_refused_while_another_viewer_drains() {
+        let body: &'static [u8] = b"the whole feed";
+        let fanout = Fanout::new(Box::new(body), Lifetime::UntilEof);
+        let draining = fanout.open().expect("the first viewer attaches");
+        // Let the pump read the feed to its end and close the ring.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            fanout.open().is_none(),
+            "an ended session hands out no cursor, whoever is still attached"
+        );
+        drop(draining);
     }
 
     /// The parked window, and the `closed` check that guards it: a consumer that leaves while the pump is

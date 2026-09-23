@@ -27,6 +27,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
+use crate::protocol::Response;
 use crate::splice_halves;
 use crate::tunnel::{BoxRead, RAW_STREAM_OPEN_TIMEOUT};
 
@@ -43,7 +44,7 @@ use crate::tunnel::{BoxRead, RAW_STREAM_OPEN_TIMEOUT};
 /// The premise can go stale: if the transport's default stream window ever falls below eight times
 /// [`STALL_MIN_BYTES`] (1 MiB), honest readers become preemptible at a higher rate. Re-check it on any
 /// iroh or noq bump that moves the default window, or if bifrost ever sets a window of its own.
-pub(super) const STALL_WINDOW: Duration = Duration::from_secs(90);
+pub(crate) const STALL_WINDOW: Duration = Duration::from_secs(90);
 
 /// The bytes a holder must take within one [`STALL_WINDOW`] to keep its seat against a dialer. Below one
 /// stock credit step, so a single honest grant restarts the window. A floor, never "any progress": an
@@ -290,12 +291,14 @@ struct SeatLink {
 }
 
 impl Seated {
-    /// Splice the lent reader toward the peer until the splice ends or the seat is handed to a dialer. The
-    /// peer-facing writer is metered, which is what lets a dialer see a holder that refuses its bytes.
-    /// Displaced, the splice is dropped where it stands; dropping it drops the lent reader, whose guard
+    /// Serve the seat to its peer: write `Response::Ok`, then splice the lent reader toward it, until the
+    /// splice ends or the seat is handed to a dialer. The peer-facing writer is metered from the first
+    /// byte, the `Ok` included, which is what lets a dialer see a holder that refuses its bytes: a peer
+    /// that grants no credit at all parks the `Ok` write, and that refusal is judged like any other.
+    /// Displaced, the serve is dropped where it stands; dropping it drops the lent reader, whose guard
     /// sends it to the dialer. The displaced peer's stream then ends as a clean close (the transport has no
     /// reset), which is why a live source's end can be false.
-    pub(crate) async fn splice<W, R>(self, writer: W, reader: R) -> io::Result<()>
+    pub(crate) async fn serve<W, R>(self, writer: W, reader: R) -> io::Result<()>
     where
         W: AsyncWrite + Unpin,
         R: AsyncRead + Unpin,
@@ -304,21 +307,26 @@ impl Seated {
             reader: source,
             link: SeatLink { meter, preempted },
         } = self;
-        let writer = Metered {
+        let mut writer = Metered {
             inner: writer,
             meter,
         };
+        let served = async {
+            Response::Ok.write(&mut writer).await?;
+            splice_halves(source, tokio::io::sink(), writer, reader).await
+        };
         tokio::select! {
-            result = splice_halves(source, tokio::io::sink(), writer, reader) => result,
+            result = served => result,
             // A closed channel means the seat moved on without displacing this holder: keep splicing.
             Ok(()) = preempted => Ok(()),
         }
     }
 }
 
-/// The lent reader. Reads pass straight through; `Drop` gives the reader back to its seat, or retires the
-/// seat if the reader reached end of input or failed. Drop, rather than an error arm, is what covers every
-/// way a splice can end: a failed `Ok` write, a splice error, a cancelled serve future, a displacement.
+/// The lent reader. Reads pass straight through; the read that reaches end of input (or fails) retires the
+/// seat at once, and otherwise `Drop` gives the reader back to its seat. Drop, rather than an error arm, is
+/// what covers every way a splice can end: a failed `Ok` write, a splice error, a cancelled serve future, a
+/// displacement.
 pub(crate) struct SeatReader {
     /// `None` once given back, so `Drop` has nothing left to do.
     lent: Option<Lent>,
@@ -329,7 +337,8 @@ pub(crate) struct SeatReader {
 enum Lent {
     /// Still readable: it goes back to the seat.
     Reading(BoxRead),
-    /// It returned end of input or an error, and was dropped: the seat is spent.
+    /// It returned end of input or an error: the seat is spent. Only ever handed to
+    /// [`Seat::put_back`], by the read that saw it.
     Ended,
 }
 
@@ -354,8 +363,12 @@ impl AsyncRead for SeatReader {
             Poll::Ready(Err(_)) => true,
             Poll::Pending => false,
         };
+        // Spend the seat now, not when the guard drops: the holder's splice can outlive the input (it
+        // waits on its peer's close), and every dialer meanwhile should hear that the input ended, not
+        // that it is held.
         if ended {
-            this.lent = Some(Lent::Ended);
+            this.lent = None;
+            this.seat.put_back(Lent::Ended);
         }
         polled
     }

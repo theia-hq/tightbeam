@@ -275,21 +275,18 @@ where
                 }
             };
             match opened {
-                Ok(opened) => {
-                    // A failed write here drops a taken seat, whose guard hands the reader back.
+                // Direction is fixed at parse time: read the source, send its bytes to the peer, and discard
+                // any bytes the peer sends upstream (a read-only source has nowhere to put them). Using
+                // `splice_halves` (never the duplex `splice`) is what makes "write peer bytes back into the
+                // source" unrepresentable.
+                Ok(Opened::Stream(source)) => {
                     Response::Ok.write(&mut writer).await?;
-                    // Direction is fixed at parse time: read the source, send its bytes to the peer, and
-                    // discard any bytes the peer sends upstream (a read-only source has nowhere to put them).
-                    // Using `splice_halves` (never the duplex `splice`) is what makes "write peer bytes back
-                    // into the source" unrepresentable. A `stdin:` seat splices the same way, metered, and
-                    // ends early if a waiting peer takes the seat from a holder that stopped reading.
-                    match opened {
-                        Opened::Stream(source) => {
-                            splice_halves(source, io::sink(), writer, reader).await?;
-                        }
-                        Opened::Seat(seated) => seated.splice(writer, reader).await?,
-                    }
+                    splice_halves(source, io::sink(), writer, reader).await?;
                 }
+                // A `stdin:` seat writes its own `Ok`, metered and preemptible like the rest of its splice:
+                // written here, a peer granting no credit would park on it unjudged and hold the seat for
+                // good. A failed write drops the seat, whose guard hands the reader back.
+                Ok(Opened::Seat(seated)) => seated.serve(writer, reader).await?,
                 Err(error) => {
                     tracing::warn!(%peer, service = %service, %error, "raw-stream open refused");
                     Response::Refused(Refusal::Unavailable {

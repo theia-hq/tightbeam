@@ -60,6 +60,8 @@ mod seat_tests;
 
 #[cfg(all(test, unix))]
 pub(crate) use guarded::{WRITER_WAIT_TEST_LOCK, set_writer_wait_timeout_for_test};
+#[cfg(test)]
+pub(crate) use seat::STALL_WINDOW;
 pub(crate) use seat::Seated;
 
 /// Which OS object types a path-based raw-stream forward accepts. Both fix the direction (a read-only source

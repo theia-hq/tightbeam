@@ -56,8 +56,14 @@ fn continuous(bytes: &[u8]) -> bool {
 /// Returns the splice task and the viewer's end.
 async fn hold(seat: &Seat, peer: NodeId) -> (JoinHandle<io::Result<()>>, DuplexStream) {
     let seated = seat.claim(peer).await.expect("an armed seat is taken");
-    let (host, viewer) = tokio::io::duplex(VIEWER_WINDOW);
-    let splice = tokio::spawn(seated.splice(host, tokio::io::empty()));
+    let (host, mut viewer) = tokio::io::duplex(VIEWER_WINDOW);
+    let splice = tokio::spawn(seated.serve(host, tokio::io::empty()));
+    let mut ok = [0xff];
+    viewer
+        .read_exact(&mut ok)
+        .await
+        .expect("the holder is answered");
+    assert_eq!(ok, [0], "the holder is answered `Ok` before its bytes");
     (splice, viewer)
 }
 
@@ -215,6 +221,22 @@ async fn end_of_input_spends_the_seat_and_never_hands_out_an_empty_stream() {
     }
 }
 
+/// End of input spends the seat at once, while the holder is still attached: a dialer meanwhile hears
+/// that the input ended, never that it is held.
+#[tokio::test]
+async fn end_of_input_spends_the_seat_before_its_holder_leaves() {
+    let seat = Seat::new(Box::new(&b"short"[..]));
+    let mut first = seat.claim(node(1)).await.expect("the armed seat is taken");
+    let mut got = Vec::new();
+    first.reader.read_to_end(&mut got).await.expect("drain");
+    let claimed = seat.claim(node(2)).await.map(drop);
+    assert!(
+        matches!(claimed, Err(SeatRefusal::Spent)),
+        "the input ended, and that is what a dialer hears: {claimed:?}"
+    );
+    drop(first);
+}
+
 /// A holder whose serve future is cancelled mid-splice gives the reader back: cancellation is a drop, and
 /// the drop is what returns it.
 #[tokio::test]
@@ -224,7 +246,7 @@ async fn a_cancelled_splice_gives_the_reader_back() {
     let seated = seat.claim(node(1)).await.expect("the armed seat is taken");
     let (host, _viewer) = tokio::io::duplex(VIEWER_WINDOW);
     {
-        let splice = seated.splice(host, tokio::io::empty());
+        let splice = seated.serve(host, tokio::io::empty());
         tokio::pin!(splice);
         assert!(
             futures::poll!(&mut splice).is_pending(),

@@ -28,7 +28,8 @@ jobs:
         with:
           command: check sources
   # The one non-unix build. Only the guarded path open differs off unix, and nothing else compiles
-  # that twin, so without this job it drifts unseen. A check, not a test run: the fifo tests are unix-only.
+  # that twin, so without this job it drifts unseen. It checks the library and the binary only: the unit
+  # tests are not compiled off unix, because the fifo tests use libc and are not yet gated to unix.
   check-windows:
     runs-on: windows-latest
     steps:
