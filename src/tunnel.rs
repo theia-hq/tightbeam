@@ -15,7 +15,7 @@ use core::time::Duration;
 // contract without taking this crate's tree. The erased bridge is imported, not re-exported: `Target` stores
 // it privately and it is not part of the author-facing surface.
 pub use tightbeam_handler::{
-    BoxRead, BoxWrite, Handler, Metering, RootedAdmitted, ServeError, Served,
+    BoxRead, BoxWrite, Handler, Metering, RootedAdmitted, Serve, ServeError, Served,
 };
 use tokio::io;
 use tokio::net::TcpStream;
