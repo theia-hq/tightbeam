@@ -5,6 +5,7 @@
 //! interlock; [`run`](Exposer::run) then owns the node's accept loop, its session and stream limits, and
 //! the one teardown authority a [`CancellationToken`] clone can request.
 
+use core::pin::pin;
 use std::sync::{Arc, PoisonError};
 
 use bifrost::{Discovery, Node, NodeId, Security, SecurityProfile, Session, Transport};
@@ -381,6 +382,12 @@ impl Exposer {
         // The one sweep timer, only when a cut is wired: an exposer without one arms nothing.
         let mut sweep = serving.cuts.as_ref().map(|_| Cuts::interval());
         let mut sessions = FuturesUnordered::new();
+        // ONE accept future for the life of the loop, re-armed only when it completes. `accept` runs the
+        // transport's handshake, so it is not cancel-safe: a future rebuilt each turn is dropped whenever
+        // another arm wins, and the handshake in flight with it. With the sweep ticking every second that
+        // drops every handshake that straddles a tick, and the dialer is left timing out or holding a
+        // session this node never took. Pinned out here, a turn won by any other arm leaves it mid-flight.
+        let mut accept = pin!(node.accept());
         loop {
             tokio::select! {
                 // Teardown: the cancel token fired (a holder of a clone requested it). Stop accepting and
@@ -390,7 +397,10 @@ impl Exposer {
                 () = cancel.cancelled() => return Ok(()),
                 // Cap concurrent sessions: past the cap, stop polling `accept` so new connections queue at
                 // the transport (backpressure) rather than each pinning a task set, bounding a peer flood.
-                accepted = node.accept(), if sessions.len() < MAX_SESSIONS => {
+                // At the cap the future is kept but not polled: a handshake it holds resumes, rather than
+                // restarts, when a slot frees.
+                accepted = accept.as_mut(), if sessions.len() < MAX_SESSIONS => {
+                    accept.set(node.accept());
                     // The listener outlives any one peer: a transient accept error must not tear down
                     // the sessions already being served, so log it and keep accepting.
                     let session = match accepted {

@@ -540,3 +540,87 @@ async fn a_cut_closes_the_session_rather_than_only_dropping_it() {
         })
         .await;
 }
+
+/// A mem transport whose `accept` spends [`Handshaking::TAKES`] after taking a connection, as a real
+/// transport's handshake does inside `accept`. Dropping the future mid-wait drops the connection with it,
+/// which is exactly what a real handshake cut short does to its dialer.
+struct Handshaking(MemTransport);
+
+impl Handshaking {
+    /// Longer than a sweep, so every handshake straddles a tick.
+    const TAKES: Duration = Duration::from_millis(1500);
+}
+
+const _: () = assert!(Handshaking::TAKES.as_millis() > CUT_SWEEP.as_millis());
+
+impl bifrost::Transport for Handshaking {
+    type Security = <MemTransport as bifrost::Transport>::Security;
+    type Session = <MemTransport as bifrost::Transport>::Session;
+
+    fn node_id(&self) -> bifrost::NodeId {
+        self.0.node_id()
+    }
+
+    fn local_addr(&self) -> bifrost::Addr {
+        self.0.local_addr()
+    }
+
+    fn bound_sockets(&self) -> Vec<core::net::SocketAddr> {
+        self.0.bound_sockets()
+    }
+
+    async fn connect(&self, addr: bifrost::Addr) -> Result<Self::Session, bifrost::Error> {
+        self.0.connect(addr).await
+    }
+
+    async fn accept(&self) -> Result<Self::Session, bifrost::Error> {
+        let session = self.0.accept().await?;
+        tokio::time::sleep(Self::TAKES).await;
+        Ok(session)
+    }
+
+    async fn close(&self) {
+        self.0.close().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_handshake_in_flight_across_a_sweep_is_still_accepted() {
+    // The sweep ticks while `accept` is mid-handshake. The loop must carry that handshake across the
+    // tick; one that rebuilds `accept` each turn drops it, and the dialer holds a session nobody serves.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let exposer = prove(
+                services(&["demo=echo:"]),
+                Gate::Open,
+                PublicRequest::none(),
+                PublicUnsafeRequest::none(),
+            )
+            .expect("an open echo builds")
+            .with_live_cuts(FileDenylist::empty(scratch("handshake")));
+            let node = Node::new(Handshaking(MemTransport::bind()), NoDiscovery);
+            let host = node.node_id();
+            tokio::task::spawn_local(async move {
+                exposer
+                    .run(&node, CancellationToken::new())
+                    .await
+                    .expect("exposer runs");
+            });
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+
+            for dial in 0..3 {
+                let session = consumer.connect(host).await.expect("connect");
+                let served = tokio::time::timeout(WITHIN, async {
+                    let mut stream = ServiceStream::open(&session, "demo").await.ok()?;
+                    still_echoes(&mut stream).await.then_some(())
+                })
+                .await;
+                assert!(
+                    matches!(served, Ok(Some(()))),
+                    "dial {dial} was dropped mid-handshake by a sweep tick"
+                );
+            }
+        })
+        .await;
+}
