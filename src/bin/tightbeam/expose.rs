@@ -4,9 +4,11 @@
 //! [`tightbeam::tunnel`], so this CLI drives the same library core any richer consumer does and differs only
 //! in identity, banner, and surface.
 
+use std::sync::Arc;
+
 use bifrost::{Node, NodeId, Session, Transport};
 use clap::Args;
-use nauthy::{FileDenylist, Service};
+use nauthy::{FileDenylist, Latch, Service};
 use tightbeam::tunnel::{
     self, CancellationToken, ManifestEntry, Posture, RawSource, Router, TargetKind,
 };
@@ -73,7 +75,7 @@ impl ExposeCmd {
         self,
         node: &Node<T, D>,
         signet: Option<NodeId>,
-        denylist: FileDenylist,
+        revocations: Arc<Latch<FileDenylist>>,
     ) -> eyre::Result<()>
     where
         <T::Session as Session>::Write: Send + 'static,
@@ -86,7 +88,7 @@ impl ExposeCmd {
         let gate = if self.public {
             nauthy::Gate::Open
         } else {
-            tunnel::resolve_gate(signet, denylist)?
+            tunnel::resolve_gate(signet, Arc::clone(&revocations))?
         };
         // Assemble the one route table: the `name=target` grammar absorbs the raw primitives (a
         // `tcp:`/`unix:` local forward, or a `file:`/`fifo:`/`stdin:` raw-stream source; an unknown scheme
@@ -105,7 +107,10 @@ impl ExposeCmd {
             router.public_unsafe(names)
         };
         let names: Vec<String> = router.names().map(str::to_owned).collect();
-        let exposer = router.expose()?;
+        // The live cut reads the same store the gate does, so a session admitted on a cap since revoked,
+        // or rooted at a key since disabled, ends itself. Under `--public` nothing is ruled on, so
+        // nothing is ever cut.
+        let exposer = router.expose()?.with_live_cuts(revocations);
         // Prove the transport can carry this gate BEFORE any ready output, mirroring swoosh's serve: a
         // rooted gate over a transport that does not prove the peer refuses here, never after a banner
         // the node cannot honor. The library's `run` re-checks, so the invariant holds however the

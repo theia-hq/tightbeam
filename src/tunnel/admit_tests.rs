@@ -80,6 +80,7 @@ fn open_serving(services: Services, permits: Semaphore) -> std::sync::Arc<super:
         raw_stream_opens: permits,
         public_pool: PublicPool::new(),
         enabled: Box::new(AllEnabled),
+        cuts: None,
     })
 }
 
@@ -145,7 +146,7 @@ fn drive_open_in(
         // (peer -> `io::sink()`) ends on this EOF, so a served stream can actually finish (otherwise the
         // splice's `try_join!` would wait forever for the client to hang up).
         drop(client_write);
-        serve_request(peer, server_write, server_read, serving, session).await
+        serve_request(peer, server_write, server_read, serving, session, None).await
     };
     (client_read, serve)
 }
@@ -178,6 +179,7 @@ fn drive_frame(
             server_read,
             serving,
             std::sync::Arc::new(PublicSession::default()),
+            None,
         )
         .await
     };
@@ -366,6 +368,7 @@ async fn an_open_witness_is_refused_before_ok_for_a_never_handler() {
         raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
         public_pool: PublicPool::new(),
         enabled: Box::new(AllEnabled),
+        cuts: None,
     });
     let (mut client, serve) = drive_open("locked", serving);
     let (served, response) = tokio::join!(serve, crate::protocol::Response::read(&mut client));
@@ -417,6 +420,7 @@ async fn a_saturated_public_pool_never_starves_a_gated_member() {
             streams: Arc::new(Semaphore::new(4)),
         },
         enabled: Box::new(AllEnabled),
+        cuts: None,
     });
 
     // One public session reaches `open` and stays alive, holding the single public-session permit.
@@ -517,6 +521,7 @@ async fn a_public_stream_over_the_cap_is_refused_and_released_when_it_ends() {
             streams: Arc::new(Semaphore::new(1)),
         },
         enabled: Box::new(AllEnabled),
+        cuts: None,
     });
 
     // The first stream is admitted and parks in the handler, holding the one stream permit.
@@ -605,6 +610,7 @@ async fn four_public_streams_hold_the_node_wide_pool_and_the_fifth_is_refused() 
         // The PRODUCTION pool (not the small hand-built ones the other cap tests isolate with).
         public_pool: PublicPool::new(),
         enabled: Box::new(AllEnabled),
+        cuts: None,
     });
 
     // Four public streams on `a`, each parked in the handler, holding one of the four slots for life.
@@ -693,6 +699,7 @@ fn public_lossy_broadcast() -> (Arc<super::Serving>, tokio::io::DuplexStream) {
         raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
         public_pool: PublicPool::new(),
         enabled: Box::new(AllEnabled),
+        cuts: None,
     });
     (serving, producer)
 }
@@ -1022,6 +1029,7 @@ async fn a_disabled_service_is_refused_then_restored_live_on_re_enable() {
         raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
         public_pool: PublicPool::new(),
         enabled: Box::new(enabled),
+        cuts: None,
     });
 
     // Disabled: `serve_request` refuses with the uniform typed refusal, after admission and before any
@@ -1094,6 +1102,7 @@ async fn a_disabled_service_is_refused_after_admission_not_before_the_gate() {
         raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
         public_pool: PublicPool::new(),
         enabled: Box::new(CountingDisabled(Arc::clone(&count))),
+        cuts: None,
     });
 
     // A dialer the rooted gate refuses (no badge): the uniform refusal, and the oracle is never consulted.
@@ -1123,6 +1132,7 @@ async fn a_disabled_service_is_refused_after_admission_not_before_the_gate() {
         raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
         public_pool: PublicPool::new(),
         enabled: Box::new(CountingDisabled(Arc::clone(&count))),
+        cuts: None,
     });
     let (mut admitted_reader, admitted_serve) = drive_open("doc", open);
     let (served, response) = tokio::join!(
@@ -1366,6 +1376,7 @@ async fn an_announced_session_is_refused_at_admission_with_the_uniform_answer() 
         raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
         public_pool: PublicPool::new(),
         enabled: Box::new(AllEnabled),
+        cuts: None,
     });
 
     let (client, server) = tokio::io::duplex(1024);
@@ -1721,6 +1732,7 @@ async fn dial_and_hold(
         host_read,
         serving,
         std::sync::Arc::new(PublicSession::default()),
+        None,
     );
     (peer_end, serve)
 }

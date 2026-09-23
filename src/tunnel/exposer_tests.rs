@@ -570,6 +570,7 @@ async fn a_stdin_source_is_served_to_the_peer_and_a_second_reader_is_refused() {
                 public: PublicServices::default(),
                 public_unsafe: PublicServices::default(),
                 enabled: Box::new(AllEnabled),
+                cuts: None,
             };
             tokio::task::spawn_local(async move {
                 exposer
@@ -673,6 +674,7 @@ async fn run_returns_gracefully_when_its_cancel_token_fires() {
         public: PublicServices::default(),
         public_unsafe: PublicServices::default(),
         enabled: Box::new(AllEnabled),
+        cuts: None,
     };
     let cancel = CancellationToken::new();
 
@@ -724,6 +726,7 @@ async fn a_lossy_source_fans_out_to_many_consumers() {
                 public: PublicServices::default(),
                 public_unsafe: PublicServices::default(),
                 enabled: Box::new(AllEnabled),
+                cuts: None,
             };
             tokio::task::spawn_local(async move {
                 exposer
@@ -816,6 +819,7 @@ async fn an_unadmitted_dialer_gets_one_uniform_refusal_no_reason_no_menu() {
                 public: PublicServices::default(),
                 public_unsafe: PublicServices::default(),
                 enabled: Box::new(AllEnabled),
+                cuts: None,
             };
 
             let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
@@ -913,6 +917,7 @@ async fn an_unknown_service_probe_never_gets_the_menu_even_when_admitted() {
                 public: PublicServices::default(),
                 public_unsafe: PublicServices::default(),
                 enabled: Box::new(AllEnabled),
+                cuts: None,
             };
 
             let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);

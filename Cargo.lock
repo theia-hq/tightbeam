@@ -2192,8 +2192,8 @@ dependencies = [
 
 [[package]]
 name = "nauthy"
-version = "0.5.0"
-source = "git+https://github.com/theia-hq/nauthy?rev=ed96225584372e22ddf3e0d92e1fdaacd886efd5#ed96225584372e22ddf3e0d92e1fdaacd886efd5"
+version = "0.6.0"
+source = "git+https://github.com/theia-hq/nauthy?rev=cd76786de5dba4db295c43aac5a1e931ddb67429#cd76786de5dba4db295c43aac5a1e931ddb67429"
 dependencies = [
  "biscuit-auth",
  "data-encoding",
@@ -3800,7 +3800,9 @@ dependencies = [
  "bifrost-iroh",
  "bifrost-mdns",
  "bifrost-mem",
+ "biscuit-auth",
  "clap",
+ "data-encoding",
  "eyre",
  "futures",
  "keystore",
