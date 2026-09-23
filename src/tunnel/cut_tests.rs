@@ -469,13 +469,13 @@ async fn a_stream_on_a_clock_bound_past_the_clocks_range_is_refused_and_the_node
 }
 
 #[tokio::test]
-async fn a_session_runs_on_while_any_grant_it_was_admitted_on_holds() {
-    // Two streams on one session, one on a grant that expires and one on a grant that does not. The cut
-    // is session-granular, so it waits for the last grant.
+async fn a_session_ends_when_the_first_grant_it_was_admitted_on_runs_out() {
+    // Two streams on one session, one on a grant that expires and one on a grant that lasts. The cut is
+    // session-granular and takes the earliest grant, so the lasting stream ends with the brief one.
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (store, _roots, _denylist) = store("outlived").await;
+            let (store, _roots, _denylist) = store("first-out").await;
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let brief = signet()
@@ -503,11 +503,157 @@ async fn a_session_runs_on_while_any_grant_it_was_admitted_on_holds() {
             )
             .await
             .expect("admitted on the lasting badge");
+            assert!(still_echoes(&mut long).await, "served before the expiry");
+
+            assert!(
+                host_ends(&mut long.reader).await,
+                "a session ends when the first grant it was admitted on runs out"
+            );
+        })
+        .await;
+}
+
+/// A gated exposer with two echo services, so one session can hold grants for different names.
+fn gated_pair(store: &Arc<Latch<FileDenylist>>) -> Exposer {
+    prove(
+        services(&["demo=echo:", "other=echo:"]),
+        Gate::rooted(signet().verifying_key(), Arc::clone(store)),
+        PublicRequest::none(),
+        PublicUnsafeRequest::none(),
+    )
+    .expect("a gated pair builds")
+    .with_live_cuts(Arc::clone(store))
+}
+
+#[tokio::test]
+async fn a_short_grant_is_not_carried_past_its_expiry_by_a_later_grant_for_another_service() {
+    // The attack: a short slip for `demo`, and any later-expiring slip from the same root for another
+    // name. The `demo` stream must end when its own slip does, not ride the later one.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (store, _roots, _denylist) = store("carried").await;
+            let host = serve(gated_pair(&store));
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let short = signet()
+                .mint(&svc("demo"), nauthy::Request::expires_in(SHORT))
+                .expect("mint the short slip");
+            let later = signet()
+                .mint(&svc("other"), hour())
+                .expect("mint the later slip");
+
+            let session = consumer.connect(host).await.expect("connect");
+            let mut stream = ServiceStream::open_with(
+                &session,
+                "demo",
+                Some(short.link().expect("link").to_string()),
+            )
+            .await
+            .expect("admitted to demo on the short slip");
+            let _anchor = ServiceStream::open_with(
+                &session,
+                "other",
+                Some(later.link().expect("link").to_string()),
+            )
+            .await
+            .expect("admitted to other on the later slip");
+            assert!(still_echoes(&mut stream).await, "served before the expiry");
+
+            assert!(
+                host_ends(&mut stream.reader).await,
+                "a stream must not outlive its own grant on the strength of a later one"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn a_stream_refused_after_the_gate_does_not_hold_a_session_open() {
+    // A whole-node badge passes the gate for any name, and a name the node does not expose is refused
+    // only after it. That refused stream's later grant must not keep the short one's session alive.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (store, _roots, _denylist) = store("refused-holds").await;
+            let host = serve(gated_pair(&store));
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let short = signet()
+                .mint(&svc("demo"), nauthy::Request::expires_in(SHORT))
+                .expect("mint the short slip");
+            let lasting = signet()
+                .mint_member(consumer.node_id().verify_key(), hour())
+                .expect("mint the lasting badge");
+
+            let session = consumer.connect(host).await.expect("connect");
+            let mut stream = ServiceStream::open_with(
+                &session,
+                "demo",
+                Some(short.link().expect("link").to_string()),
+            )
+            .await
+            .expect("admitted to demo on the short slip");
+            assert!(
+                ServiceStream::open_with(
+                    &session,
+                    "absent",
+                    Some(lasting.link().expect("link").to_string())
+                )
+                .await
+                .is_err(),
+                "a name the node does not expose is refused past the gate"
+            );
+
+            assert!(
+                host_ends(&mut stream.reader).await,
+                "a refused stream's grant must not hold the session open"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn a_stream_refused_after_the_gate_leaves_the_session_lease_untouched() {
+    // The mirror of the test above: a refused stream on a SHORTER grant must not end a session its own
+    // grant never bounded. Only a stream admission wholly passed shapes the lease.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (store, _roots, _denylist) = store("refused-untouched").await;
+            let host = serve(gated_pair(&store));
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let lasting = signet()
+                .mint(&svc("demo"), hour())
+                .expect("mint the lasting slip");
+            let brief = signet()
+                .mint_member(
+                    consumer.node_id().verify_key(),
+                    nauthy::Request::expires_in(SHORT),
+                )
+                .expect("mint the short badge");
+
+            let session = consumer.connect(host).await.expect("connect");
+            let mut stream = ServiceStream::open_with(
+                &session,
+                "demo",
+                Some(lasting.link().expect("link").to_string()),
+            )
+            .await
+            .expect("admitted to demo on the lasting slip");
+            assert!(
+                ServiceStream::open_with(
+                    &session,
+                    "absent",
+                    Some(brief.link().expect("link").to_string())
+                )
+                .await
+                .is_err(),
+                "a name the node does not expose is refused past the gate"
+            );
 
             tokio::time::sleep(SHORT + CUT_SWEEP * 2).await;
             assert!(
-                still_echoes(&mut long).await,
-                "a session is held open by any grant it was admitted on that still holds"
+                still_echoes(&mut stream).await,
+                "a refused stream's grant must not bound the session"
             );
         })
         .await;
@@ -546,7 +692,9 @@ fn a_stream_reads_its_earliest_expiry_and_fails_closed_on_an_unreadable_one() {
 }
 
 #[test]
-fn a_lease_lapses_after_the_last_stream_and_the_first_cap_of_each() {
+fn a_lease_lapses_at_the_first_grant_of_any_stream() {
+    use super::Lease;
+
     // None: a session no stream was admitted on a grant never lapses.
     assert!(!AdmittedChains::default().lapsed(at(1_000_000)));
 
@@ -561,13 +709,28 @@ fn a_lease_lapses_after_the_last_stream_and_the_first_cap_of_each() {
         "an open stream, ruled on nothing, holds no session open"
     );
 
-    // Many streams: the session is held by the LAST grant, in whichever order they came.
+    // Many streams: the session ends at the FIRST grant to run out, in whichever order they came.
     let mut many = AdmittedChains::default();
     for secs in [20, 30, 10] {
         many.record(&signet().mint(&svc("demo"), at(secs)).expect("mint"));
     }
-    assert!(!many.lapsed(at(29)), "held while the latest grant holds");
-    assert!(many.lapsed(at(31)), "lapsed once every grant has");
+    assert!(!many.lapsed(at(10)), "held through the earliest grant");
+    assert!(many.lapsed(at(11)), "lapsed once any grant has");
+
+    // A grant that never expires bounds nothing: the session is unbounded only when every grant is, and
+    // otherwise ends at its bounded grants' earliest, whichever came first.
+    let never = Lease::default().extend(None);
+    assert_eq!(
+        never,
+        Lease::Unbounded,
+        "one unbounded grant bounds nothing"
+    );
+    assert_eq!(never.extend(None), Lease::Unbounded, "nor do two");
+    assert_eq!(never.extend(Some(at(10))), Lease::Until(at(10)));
+    assert_eq!(
+        Lease::default().extend(Some(at(10))).extend(None),
+        Lease::Until(at(10))
+    );
 
     // One stream ruled on two caps needed both, so its grant ends at the EARLIER.
     let foreign = Identity::from_secret(&[11u8; 32]).expect("valid secret");

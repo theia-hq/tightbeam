@@ -568,7 +568,7 @@ where
                 }
             }
             // The live cut: on a sweep, re-ask about the chains this session was admitted on, and end it
-            // if any was recalled or every grant has expired. Returning drops the session and every
+            // if any was recalled or any grant has expired. Returning drops the session and every
             // stream on it.
             //
             // Guarded by the same liveness the two arms above share. A sweep arm left enabled would keep

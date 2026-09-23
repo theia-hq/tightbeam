@@ -201,26 +201,6 @@ where
                 .map_err(Into::into);
         }
     };
-    // Keep the chains the gate just ruled on, for the live cut, before anything below can return: every
-    // later arm is a refusal or a dispatch, and one that returned first would leave an admitted stream
-    // the cut could never see. Only the ids and roots are kept; the parsed caps drop here.
-    // A session past its ceiling is refused the stream rather than grown: the record is bounded or the
-    // sweep that walks it is not. So is a stream on a cap whose expiry cannot be read, which the cut
-    // could never end on time.
-    if let Some(chains) = &chains {
-        let recorded = chains
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .record_all(&admitted.ruled);
-        if let Err(unrecorded) = recorded {
-            tracing::warn!(%peer, service = %service, %unrecorded, "refused");
-            return Response::Refused(Refusal::NotAdmitted)
-                .write(&mut writer)
-                .await
-                .map_err(Into::into);
-        }
-    }
-
     // Live enable/disable, consulted POST-admission on the RESOLVED name: a service the operator has
     // disabled refuses here, and a re-enable restores it on the next stream with no restart (the oracle
     // re-reads its backing file on change). The check sits AFTER `admit` so every dialer pays the gate
@@ -238,15 +218,38 @@ where
             .map_err(Into::into);
     }
 
+    // Unknown service. The node's OWN log names what it exposes, so a service-name mismatch (the connector
+    // defaulting to `default` while the exposer named `web`) is diagnosable by the operator. It must NOT
+    // cross the wire: enumerating the service menu to a dialer hands an unauthorized peer the node's
+    // capability list before it has proved anything, so the wire gets the same indistinguishable refusal
+    // as any not-admitted dial. A dialer learns a service exists only by being admitted to it; the
+    // teaching hint returns as the gated `control.services` verb, never as a free menu here. (This is
+    // reached only past the gate: an Open node, or a whole-node member badge that admits any name -- so
+    // uniformity here also stops a member from mapping the menu by probing wrong names, keeping the same
+    // rule at every dialer class.) The lookup is hoisted so the floor and the dispatch below read the same
+    // resolved route.
+    let Some(route) = services.get(service.as_str()) else {
+        let mut available: Vec<&str> = services.keys().map(String::as_str).collect();
+        available.sort_unstable();
+        tracing::warn!(
+            %peer,
+            service = %service,
+            exposes = %available.join(", "),
+            "unknown service requested"
+        );
+        return Response::Refused(Refusal::NotAdmitted)
+            .write(&mut writer)
+            .await
+            .map_err(Into::into);
+    };
+
     // The member floor: a route declared `Access::Member` at registration is checked ONCE here,
     // after `admit` and before every `Response::Ok` below, so the check covers every dispatch arm and can
     // still be a WIRE refusal; a handler-side check would run post-`Ok` and the client would read a stopped
     // "success". The witness is BORROWED for `is_member` (`&self`) and stays owned for the single move into
     // the handler, and the refusal is the SAME payload-free class a gate miss gives: the wire never learns
-    // that a route is member-only (no member-vs-slip oracle). The lookup is hoisted so the floor and the
-    // dispatch below read the same resolved route.
-    let route = services.get(service.as_str());
-    if route.is_some_and(|route| route.access == Access::Member) && !admitted.witness.is_member() {
+    // that a route is member-only (no member-vs-slip oracle).
+    if route.access == Access::Member && !admitted.witness.is_member() {
         tracing::warn!(%peer, service = %service, "refused: member-only route");
         return Response::Refused(Refusal::NotAdmitted)
             .write(&mut writer)
@@ -254,13 +257,35 @@ where
             .map_err(Into::into);
     }
 
-    match route.map(|route| &route.target) {
+    // Keep the chains the gate ruled on, for the live cut, once admission has wholly passed and before
+    // anything is served: every arm below is a dispatch, so no admitted stream escapes the cut, and a
+    // stream refused above leaves no trace in the record. A refused stream kept here would still bound
+    // the session by its grant, or count against the ceiling, for a stream never served. Only the ids and
+    // roots are kept; the parsed caps drop here.
+    // A session past its ceiling is refused the stream rather than grown: the record is bounded or the
+    // sweep that walks it is not. So is a stream on a cap whose expiry cannot be read, which the cut
+    // could never end on time.
+    if let Some(chains) = &chains {
+        let recorded = chains
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record_all(&admitted.ruled);
+        if let Err(unrecorded) = recorded {
+            tracing::warn!(%peer, service = %service, %unrecorded, "refused");
+            return Response::Refused(Refusal::NotAdmitted)
+                .write(&mut writer)
+                .await
+                .map_err(Into::into);
+        }
+    }
+
+    match &route.target {
         // tightbeam's own primitive, the raw-stream half: open the source (a guarded file/FIFO, or claim the
         // `stdin:` seat) and splice its bytes toward the peer. `Response::Ok` is written only AFTER the open
         // succeeds, so a peer learns "refused" (not a silent hang or a mid-stream reset) when the target is a
         // device, a directory, a symlink, a FIFO whose writer never appears, or a `stdin:` seat another peer
         // holds or whose input has ended.
-        Some(Target::RawStream(stream)) => {
+        Target::RawStream(stream) => {
             // Take a raw-stream open permit BEFORE opening, as defense-in-depth (the open is nonblocking and
             // cannot park a thread, so this bounds the fds a peer holds mid-open, not a leak): `try_acquire`
             // refuses immediately over the cap rather than admitting one more concurrent open. The permit is
@@ -304,7 +329,7 @@ where
         // gate miss gives (no never-public oracle). The witness is moved into the proof by value (single-use),
         // so a handler can never run for an unauthorized peer; the guarantee holds only because the admit
         // (above) and this serve share one stream frame, never hoisted to session scope.
-        Some(Target::Handler(handler)) => match handler.prepare(admitted.witness) {
+        Target::Handler(handler) => match handler.prepare(admitted.witness) {
             Ok(prepared) => {
                 Response::Ok.write(&mut writer).await?;
                 // Arm the post-admission first-traffic deadline AT THE HANDOFF, and disarm it on the
@@ -363,28 +388,6 @@ where
                     .await?;
             }
         },
-        None => {
-            // Unknown service. The node's OWN log names what it exposes, so a service-name mismatch (the
-            // connector defaulting to `default` while the exposer named `web`) is diagnosable by the
-            // operator. It must NOT cross the wire: enumerating the service menu to a dialer hands an
-            // unauthorized peer the node's capability list before it has proved anything, so the wire gets
-            // the same indistinguishable refusal as any not-admitted dial. A dialer learns a service exists only
-            // by being admitted to it; the teaching hint returns as the gated `control.services` verb, never
-            // as a free menu here. (This arm is reached only past the gate: an Open node, or a whole-node
-            // member badge that admits any name -- so uniformity here also stops a member from mapping the
-            // menu by probing wrong names, keeping the same rule at every dialer class.)
-            let mut available: Vec<&str> = services.keys().map(String::as_str).collect();
-            available.sort_unstable();
-            tracing::warn!(
-                %peer,
-                service = %service,
-                exposes = %available.join(", "),
-                "unknown service requested"
-            );
-            Response::Refused(Refusal::NotAdmitted)
-                .write(&mut writer)
-                .await?;
-        }
     }
     Ok(())
 }
