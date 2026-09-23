@@ -1927,3 +1927,88 @@ async fn a_peer_that_speaks_promptly_is_unaffected() {
         "the handler ran to its own end rather than being dropped under it"
     );
 }
+
+/// A peer writer that never accepts a byte: a QUIC receiver advertising a zero stream window.
+struct NoCredit;
+
+impl tokio::io::AsyncWrite for NoCredit {
+    fn poll_write(
+        self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+        _buf: &[u8],
+    ) -> core::task::Poll<std::io::Result<usize>> {
+        core::task::Poll::Pending
+    }
+
+    fn poll_flush(
+        self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<std::io::Result<()>> {
+        core::task::Poll::Pending
+    }
+
+    fn poll_shutdown(
+        self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<std::io::Result<()>> {
+        core::task::Poll::Pending
+    }
+}
+
+/// A `stdin:` holder that grants no credit at all never takes even its `Ok` byte. It is judged like any
+/// other stalled holder, from that first refused byte, so a contender dialing a window later takes the
+/// seat. An `Ok` written before the seat's metered, preemptible scope would park unjudged and hold the
+/// seat for as long as the connection lived.
+#[tokio::test(start_paused = true)]
+async fn a_stdin_holder_that_never_takes_its_ok_is_displaced_by_a_contender() {
+    let mut map = HashMap::new();
+    map.insert(
+        "cam".to_owned(),
+        crate::tunnel::router::Route::family(crate::tunnel::router::Target::RawStream(
+            crate::raw_stream::RawStream::from_reader(Box::new(tokio::io::repeat(b'x'))),
+        )),
+    );
+    let serving = open_serving(Services(map), Semaphore::new(RAW_STREAM_OPEN_PERMITS));
+
+    let mut request = Vec::new();
+    crate::protocol::Request {
+        service: "cam".to_owned(),
+        capability: None,
+        membership: None,
+    }
+    .write(&mut request)
+    .await
+    .expect("write request");
+    let holder = SessionPeer {
+        node: bifrost::NodeId::from_ed25519_secret(&[8u8; 32]),
+        security: PROVEN,
+    };
+    // The holder's upstream half: its request, then silence, held open for the whole test.
+    let (mut holder_upstream, server_read) = tokio::io::duplex(1024);
+    holder_upstream
+        .write_all(&request)
+        .await
+        .expect("send the request");
+    let holding = tokio::spawn(serve_request(
+        holder,
+        NoCredit,
+        server_read,
+        Arc::clone(&serving),
+        Arc::new(PublicSession::default()),
+        None,
+    ));
+
+    tokio::time::sleep(crate::raw_stream::STALL_WINDOW + core::time::Duration::from_secs(1)).await;
+    let (mut contender, serve) = drive_open("cam", serving);
+    let contending = tokio::spawn(serve);
+    let response = crate::protocol::Response::read(&mut contender)
+        .await
+        .expect("read the response");
+    assert!(
+        matches!(response, crate::protocol::Response::Ok),
+        "a holder that never took its `Ok` is displaced: {response:?}"
+    );
+    contending.abort();
+    holding.abort();
+    drop(holder_upstream);
+}

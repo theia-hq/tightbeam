@@ -45,7 +45,8 @@ pub use router::{ManifestEntry, RawSource, Router, TARGET_SCHEMES, TargetKind};
 /// (a writer connecting/writing) bounded by this timeout; on elapse the fd is dropped (cheap, no parked thread)
 /// and the stream is refused, one layer deeper than the pre-gate
 /// [`REQUEST_READ_TIMEOUT`](admit::REQUEST_READ_TIMEOUT) (which has already elapsed by the time a target
-/// is dialed). A regular-file open has no writer to wait for and is not bounded by this.
+/// is dialed). A regular-file open has no writer to wait for and is not bounded by this. It also bounds a
+/// dialer waiting for a `stdin:` seat it has just taken from a stalled holder.
 ///
 /// It sits at the tunnel root because it bounds a raw-stream OPEN, which [`crate::raw_stream`] performs:
 /// no one submodule here owns it.
