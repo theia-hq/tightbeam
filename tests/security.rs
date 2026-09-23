@@ -110,6 +110,10 @@ impl<S: Session, P: SecurityProfile> Session for ProfiledSession<S, P> {
         self.inner.wait_closed().await
     }
 
+    fn close(&self) {
+        self.inner.close();
+    }
+
     fn conn_info(&self) -> ConnInfo {
         self.inner.conn_info()
     }

@@ -1,6 +1,9 @@
-//! Unit tests for the persisted identity: fail-closed load, mint-on-absence, and the atomic write.
+//! Unit tests for the persisted identity: fail-closed load, mint-on-absence, and a write that never
+//! replaces a different key.
 
 use std::path::{Path, PathBuf};
+
+use keystore::{Error, FormatError};
 
 use crate::identity::{IdentityError, load, write};
 
@@ -62,7 +65,7 @@ async fn absent_file_mints_and_persists_once() {
     let minted = load(Some(&path))
         .await
         .expect("mint on absence")
-        .into_bytes();
+        .with_bytes(|seed| *seed);
     assert_eq!(
         std::fs::read(&path).expect("read the minted key"),
         minted.to_vec(),
@@ -81,7 +84,7 @@ async fn absent_file_mints_and_persists_once() {
 
     let reloaded = load(Some(&path)).await.expect("load the persisted key");
     assert_eq!(
-        reloaded.into_bytes(),
+        reloaded.with_bytes(|seed| *seed),
         minted,
         "a present key is loaded, never re-minted"
     );
@@ -102,7 +105,13 @@ async fn wrong_size_is_refused_and_the_file_survives() {
             panic!("a wrong-size file must be refused");
         };
         assert!(
-            matches!(error, IdentityError::Malformed { size: read, .. } if read == size as u64),
+            matches!(
+                error,
+                IdentityError::Key(Error::Format {
+                    source: FormatError::Size { found },
+                    ..
+                }) if found == size as u64
+            ),
             "unexpected error for {size} bytes: {error}"
         );
         assert_eq!(
@@ -128,7 +137,10 @@ async fn permissive_mode_is_refused_until_tightened() {
         panic!("0644 must be refused");
     };
     assert!(
-        matches!(error, IdentityError::Permissive { mode: 0o644, .. }),
+        matches!(
+            error,
+            IdentityError::Key(Error::Permissive { mode: 0o644, .. })
+        ),
         "unexpected error: {error}"
     );
     assert_eq!(
@@ -140,23 +152,20 @@ async fn permissive_mode_is_refused_until_tightened() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .expect("tighten the mode");
     let loaded = load(Some(&path)).await.expect("a tightened key loads");
-    assert_eq!(loaded.into_bytes(), [5u8; 32]);
+    assert_eq!(loaded.with_bytes(|seed| *seed), [5u8; 32]);
 }
 
-/// The partial-write case: when the sibling stage cannot be created the previous key survives byte for
-/// byte, because the writer never touches the target until the rename.
+/// The partial-write case: when the sibling stage cannot be created nothing lands, and the refusal is
+/// the store's own typed error rather than a half-written key.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_failed_write_leaves_the_previous_key() {
+async fn a_failed_write_leaves_nothing() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let dir = TempDir::new("failed-write");
     let path = dir.key();
-    let previous = [1u8; 32];
-    write(&previous, Some(&path)).await.expect("first write");
 
-    // 0500 on the parent blocks the sibling stage while the target itself stays writable, so an
-    // in-place writer would have truncated it; the atomic one refuses and leaves it alone.
+    // 0500 on the parent blocks the sibling stage.
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))
         .expect("lock the dir");
     let refused = write(&[2u8; 32], Some(&path)).await;
@@ -164,48 +173,37 @@ async fn a_failed_write_leaves_the_previous_key() {
         .expect("unlock the dir");
 
     assert!(
-        matches!(&refused, Err(IdentityError::Write { .. })),
-        "a stage that cannot create is a typed write error, got {refused:?}"
+        matches!(&refused, Err(IdentityError::Key(Error::Io { .. }))),
+        "a stage that cannot create is a typed store error, got {refused:?}"
     );
-    assert_eq!(
-        std::fs::read(&path).expect("read back"),
-        previous.to_vec(),
-        "the previous key survives the failed write"
-    );
+    assert!(!path.exists(), "a failed write lands no key");
 }
 
-/// A write replaces the key through a rename and leaves only the one file: no staging temp survives.
+/// A write into a path that already holds a DIFFERENT key is refused and the key survives byte for byte:
+/// that key may be the only copy there is. Writing the key already there is a no-op, so adopting twice
+/// is harmless.
+///
+/// The survival assertion comes first, so with the refusal removed it is the one that fails.
 #[tokio::test]
-async fn write_replaces_atomically_leaving_one_file() {
+async fn a_write_never_replaces_a_different_key() {
     let dir = TempDir::new("replace");
     let path = dir.key();
     write(&[1u8; 32], Some(&path)).await.expect("first write");
 
-    #[cfg(unix)]
-    let before = {
-        use std::os::unix::fs::MetadataExt as _;
-        std::fs::metadata(&path).expect("stat before").ino()
-    };
-
-    write(&[2u8; 32], Some(&path))
-        .await
-        .expect("replace the key");
+    let refused = write(&[2u8; 32], Some(&path)).await;
     assert_eq!(
         std::fs::read(&path).expect("read back"),
-        [2u8; 32].to_vec(),
-        "the new key is in place"
+        [1u8; 32].to_vec(),
+        "the key already there survives"
+    );
+    assert!(
+        matches!(&refused, Err(IdentityError::Key(Error::Different { .. }))),
+        "a different key is refused by name, got {refused:?}"
     );
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        let after = std::fs::metadata(&path).expect("stat after").ino();
-        assert_ne!(
-            before, after,
-            "the target is a renamed new inode, not a truncated one"
-        );
-    }
-
+    write(&[1u8; 32], Some(&path))
+        .await
+        .expect("writing the key already there is a no-op");
     let entries: Vec<_> = std::fs::read_dir(dir.path())
         .expect("list the dir")
         .map(|entry| entry.expect("dir entry").file_name())
@@ -213,7 +211,32 @@ async fn write_replaces_atomically_leaving_one_file() {
     assert_eq!(
         entries,
         vec![std::ffi::OsString::from("identity.key")],
-        "the temp was renamed, not left behind"
+        "no staging file is left behind"
+    );
+}
+
+/// A sealed key file is refused, never read as absent: minting over it would destroy the key it seals.
+#[tokio::test]
+async fn a_sealed_key_is_refused_and_survives() {
+    let dir = TempDir::new("sealed");
+    let path = dir.key();
+    let passphrase =
+        keystore::Passphrase::new(zeroize::Zeroizing::new(b"hunter2".to_vec())).expect("non-empty");
+    let secret = keystore::Secret::take(&mut [3u8; 32]);
+    keystore::KeyFile::from(path.as_path())
+        .write(&secret, keystore::Protection::Passphrase(&passphrase))
+        .expect("seal a key");
+    let sealed = std::fs::read(&path).expect("read the sealed file");
+
+    let refused = load(Some(&path)).await;
+    assert_eq!(
+        std::fs::read(&path).expect("read back"),
+        sealed,
+        "the sealed file survives"
+    );
+    assert!(
+        matches!(&refused, Err(IdentityError::Sealed { .. })),
+        "a sealed file is refused as sealed"
     );
 }
 
@@ -231,4 +254,22 @@ async fn a_directory_is_refused() {
         matches!(error, IdentityError::Directory { .. }),
         "unexpected error: {error}"
     );
+}
+
+/// A mint under a fresh directory creates it owner-only, like the key inside it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fresh_key_directory_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TempDir::new("fresh-dir");
+    let path = dir.path().join("nested").join("identity.key");
+    load(Some(&path))
+        .await
+        .expect("mint under a fresh directory");
+    let mode = std::fs::metadata(dir.path().join("nested"))
+        .expect("stat the directory")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700, "the key's directory is owner-only");
 }

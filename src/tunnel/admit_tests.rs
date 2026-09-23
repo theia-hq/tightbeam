@@ -328,6 +328,9 @@ impl Session for AnnouncedSession {
     }
 
     async fn wait_closed(&self) {}
+
+    /// A double that carries nothing has nothing to end.
+    fn close(&self) {}
 }
 
 #[test]
