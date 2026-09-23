@@ -333,6 +333,17 @@ async fn a_session_is_cut_at_a_narrowed_expiry_not_the_issuers() {
 /// `cap` with `datalog` appended as a block, the way a holder narrows a cap outside nauthy's own API:
 /// decode the link, append with biscuit's block builder (no secret needed), and encode it again.
 fn with_raw_block(cap: &nauthy::Cap, datalog: &str) -> nauthy::Cap {
+    with_block(
+        cap,
+        biscuit_auth::builder::BlockBuilder::new()
+            .code(datalog)
+            .expect("datalog"),
+    )
+}
+
+/// `cap` with `block` appended, the same way as [`with_raw_block`], for a block datalog text cannot
+/// spell (a date past RFC 3339's range, set through a parameter).
+fn with_block(cap: &nauthy::Cap, block: biscuit_auth::builder::BlockBuilder) -> nauthy::Cap {
     use data_encoding::BASE32_NOPAD;
 
     let link = cap.link().expect("link").to_string();
@@ -343,11 +354,7 @@ fn with_raw_block(cap: &nauthy::Cap, datalog: &str) -> nauthy::Cap {
             .expect("base32"),
     )
     .expect("a token")
-    .append(
-        biscuit_auth::builder::BlockBuilder::new()
-            .code(datalog)
-            .expect("datalog"),
-    )
+    .append(block)
     .expect("append")
     .to_vec()
     .expect("encode");
@@ -398,6 +405,65 @@ async fn a_stream_on_a_cap_whose_expiry_cannot_be_read_is_refused() {
                 .is_ok(),
                 "the plain badge is admitted"
             );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn a_stream_on_a_clock_bound_past_the_clocks_range_is_refused_and_the_node_serves_on() {
+    // A holder appends `check if time($t), $t <= Date(u64::MAX)` to a badge the gate admits. Reading
+    // that date once panicked inside the admission path, on the one task that runs the whole exposer,
+    // so one stream took the node down for everyone. It must be refused like any unreadable expiry, and
+    // the node must go on serving other peers.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (store, _roots, _denylist) = store("far-date").await;
+            let host = serve(gated_echo(&store));
+            let hostile = Node::new(MemTransport::bind(), NoDiscovery);
+            let badge = signet()
+                .mint_member(hostile.node_id().verify_key(), hour())
+                .expect("mint badge");
+            let far = with_block(
+                &badge,
+                biscuit_auth::builder::BlockBuilder::new()
+                    .code_with_params(
+                        "check if time($t), $t <= {bound};",
+                        std::collections::HashMap::from([(
+                            "bound".to_owned(),
+                            biscuit_auth::builder::Term::Date(u64::MAX),
+                        )]),
+                        std::collections::HashMap::new(),
+                    )
+                    .expect("datalog"),
+            );
+
+            let session = hostile.connect(host).await.expect("connect");
+            assert!(
+                ServiceStream::open_with(
+                    &session,
+                    "demo",
+                    Some(far.link().expect("link").to_string())
+                )
+                .await
+                .is_err(),
+                "a stream on a date past the clock's range is refused"
+            );
+
+            // Another peer, on a fresh session, is still served: the node did not go down.
+            let other = Node::new(MemTransport::bind(), NoDiscovery);
+            let plain = signet()
+                .mint_member(other.node_id().verify_key(), hour())
+                .expect("mint badge");
+            let session = other.connect(host).await.expect("the node still accepts");
+            let mut stream = ServiceStream::open_with(
+                &session,
+                "demo",
+                Some(plain.link().expect("link").to_string()),
+            )
+            .await
+            .expect("the node still admits");
+            assert!(still_echoes(&mut stream).await, "the node still serves");
         })
         .await;
 }

@@ -2193,7 +2193,7 @@ dependencies = [
 [[package]]
 name = "nauthy"
 version = "0.5.0"
-source = "git+https://github.com/theia-hq/nauthy?rev=2a82cb9e3194fa85ba0031060d74f3c29f39f587#2a82cb9e3194fa85ba0031060d74f3c29f39f587"
+source = "git+https://github.com/theia-hq/nauthy?rev=b12ff7ce272488cb9efecb58bd5f07dc0c67f42f#b12ff7ce272488cb9efecb58bd5f07dc0c67f42f"
 dependencies = [
  "biscuit-auth",
  "data-encoding",
