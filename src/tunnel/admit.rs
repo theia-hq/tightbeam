@@ -23,6 +23,7 @@ use super::exposer::{PublicPool, PublicSession, Serving, SessionPeer};
 use super::router::{Access, PublicServices, Route, Services, Target};
 use crate::identity::AsVerifyKey as _;
 use crate::protocol::{Request, Response};
+use crate::raw_stream::Opened;
 use crate::security::{peer_proven, proof_label};
 use crate::splice_halves;
 
@@ -253,11 +254,11 @@ where
     }
 
     match route.map(|route| &route.target) {
-        // tightbeam's own primitive, the raw-stream half: open the source (a guarded file/FIFO, or take fd 0
-        // for `stdin:`) and splice its bytes toward the peer. `Response::Ok` is written only AFTER the open
+        // tightbeam's own primitive, the raw-stream half: open the source (a guarded file/FIFO, or claim the
+        // `stdin:` seat) and splice its bytes toward the peer. `Response::Ok` is written only AFTER the open
         // succeeds, so a peer learns "refused" (not a silent hang or a mid-stream reset) when the target is a
-        // device, a directory, a symlink, a FIFO whose writer never appears, or a `stdin:` already taken by a
-        // concurrent connection (the single-consumer refusal).
+        // device, a directory, a symlink, a FIFO whose writer never appears, or a `stdin:` seat another peer
+        // holds or whose input has ended.
         Some(Target::RawStream(stream)) => {
             // Take a raw-stream open permit BEFORE opening, as defense-in-depth (the open is nonblocking and
             // cannot park a thread, so this bounds the fds a peer holds mid-open, not a leak): `try_acquire`
@@ -265,7 +266,7 @@ where
             // held only across the open (the splice below holds none) and dropped when `_permit` leaves scope.
             // See `RAW_STREAM_OPEN_PERMITS`.
             let opened = match raw_stream_opens.try_acquire() {
-                Ok(_permit) => stream.open().await,
+                Ok(_permit) => stream.open(peer.node).await,
                 Err(_at_cap) => {
                     tracing::warn!(%peer, service = %service, "raw-stream open cap reached; refusing");
                     Err(eyre::eyre!(
@@ -274,14 +275,18 @@ where
                 }
             };
             match opened {
-                Ok(source) => {
+                // Direction is fixed at parse time: read the source, send its bytes to the peer, and discard
+                // any bytes the peer sends upstream (a read-only source has nowhere to put them). Using
+                // `splice_halves` (never the duplex `splice`) is what makes "write peer bytes back into the
+                // source" unrepresentable.
+                Ok(Opened::Stream(source)) => {
                     Response::Ok.write(&mut writer).await?;
-                    // Direction is fixed at parse time: read the source, send its bytes to the peer, and
-                    // discard any bytes the peer sends upstream (a read-only source has nowhere to put them).
-                    // Using `splice_halves` (never the duplex `splice`) is what makes "write peer bytes back
-                    // into the source" unrepresentable.
                     splice_halves(source, io::sink(), writer, reader).await?;
                 }
+                // A `stdin:` seat writes its own `Ok`, metered and preemptible like the rest of its splice:
+                // written here, a peer granting no credit would park on it unjudged and hold the seat for
+                // good. A failed write drops the seat, whose guard hands the reader back.
+                Ok(Opened::Seat(seated)) => seated.serve(writer, reader).await?,
                 Err(error) => {
                     tracing::warn!(%peer, service = %service, %error, "raw-stream open refused");
                     Response::Refused(Refusal::Unavailable {
