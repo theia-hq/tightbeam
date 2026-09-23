@@ -204,14 +204,15 @@ where
     // later arm is a refusal or a dispatch, and one that returned first would leave an admitted stream
     // the cut could never see. Only the ids and roots are kept; the parsed caps drop here.
     // A session past its ceiling is refused the stream rather than grown: the record is bounded or the
-    // sweep that walks it is not.
+    // sweep that walks it is not. So is a stream on a cap whose expiry cannot be read, which the cut
+    // could never end on time.
     if let Some(chains) = &chains {
         let recorded = chains
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .record_all(&admitted.ruled);
-        if let Err(full) = recorded {
-            tracing::warn!(%peer, service = %service, %full, "refused");
+        if let Err(unrecorded) = recorded {
+            tracing::warn!(%peer, service = %service, %unrecorded, "refused");
             return Response::Refused(Refusal::NotAdmitted)
                 .write(&mut writer)
                 .await

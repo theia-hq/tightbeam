@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
-use nauthy::{Cap, FileDenylist, Latch, RevocationId, Revocations, VerifyKey};
+use nauthy::{Cap, CapError, FileDenylist, Latch, RevocationId, Revocations, VerifyKey};
 use tokio::sync::watch;
 use tokio::time::{Interval, MissedTickBehavior};
 
@@ -85,34 +85,37 @@ impl AdmittedChains {
     pub(super) fn record(&mut self, cap: &Cap) {
         self.roots.insert(cap.root());
         self.ids.extend(cap.revocation_ids());
-        self.lease = self
-            .lease
-            .extend(Lease::of_stream(core::slice::from_ref(cap)));
+        let until =
+            Lease::of_stream(core::slice::from_ref(cap)).expect("a fixture cap's expiry reads");
+        self.lease = self.lease.extend(until);
     }
 
     /// Whether every grant this session was admitted on has run out by `now`. Never for a session no
-    /// stream was admitted on a grant, and never for one holding a grant whose expiry cannot be read.
+    /// stream was admitted on a grant, and never for one holding a grant that never expires.
     pub(super) fn lapsed(&self, now: SystemTime) -> bool {
         self.lease.lapsed(now)
     }
 
     /// Keep what the cut will need of every cap one stream was admitted on, or keep nothing and refuse
-    /// when that would take this session past [`MAX_SESSION_CHAIN_IDS`]. All or nothing, so a refused
-    /// stream leaves no trace in the record.
-    pub(super) fn record_all(&mut self, ruled: &[Cap]) -> Result<(), ChainsFull> {
+    /// the stream: when a cap's expiry cannot be read, or when keeping it would take this session past
+    /// [`MAX_SESSION_CHAIN_IDS`]. All or nothing, so a refused stream leaves no trace in the record.
+    pub(super) fn record_all(&mut self, ruled: &[Cap]) -> Result<(), Unrecorded> {
+        // Fail closed: a grant whose end cannot be read is treated as already over, so the stream it
+        // would admit is refused here rather than served on a lease nobody can bound.
+        let until = Lease::of_stream(ruled).map_err(Unrecorded::UnreadableExpiry)?;
         let fresh: HashSet<RevocationId> = ruled
             .iter()
             .flat_map(Cap::revocation_ids)
             .filter(|id| !self.ids.contains(id))
             .collect();
         if self.ids.len() + fresh.len() > MAX_SESSION_CHAIN_IDS {
-            return Err(ChainsFull);
+            return Err(Unrecorded::Full);
         }
         self.ids.extend(fresh);
         self.roots.extend(ruled.iter().map(Cap::root));
         // An open stream rules on nothing, so it holds the session open on no grant.
         if !ruled.is_empty() {
-            self.lease = self.lease.extend(Lease::of_stream(ruled));
+            self.lease = self.lease.extend(until);
         }
         Ok(())
     }
@@ -128,8 +131,9 @@ impl AdmittedChains {
 ///
 /// One stream is admitted only while every cap it was ruled on holds (the foreign path ANDs a slip and a
 /// badge), so a stream's grant runs out at the EARLIEST of their expiries. The session is still held by
-/// any stream's grant, so it lapses at the LATEST of those. Read from each cap's [`Cap::expiry`], the
-/// issuer's own expiry: a holder's narrower attenuation is enforced at the next admission, not here.
+/// any stream's grant, so it lapses at the LATEST of those. Each cap's expiry is [`Cap::valid_until`],
+/// the earliest bound anywhere in its chain, so a holder who narrowed a grant and passed it on is cut at
+/// the narrower instant.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Lease {
     /// No stream was admitted on a grant: nothing here can run out.
@@ -137,19 +141,30 @@ enum Lease {
     Unruled,
     /// Every grant a stream was admitted on has run out once this instant passes.
     Until(SystemTime),
-    /// Some stream was admitted on grants none of which states its expiry, so time alone never ends
-    /// this session. A recall still does.
+    /// Some stream was admitted on grants none of which ever expires, so time alone never ends this
+    /// session. A recall still does.
     Unbounded,
 }
 
 impl Lease {
-    /// The expiry of one stream's grant, from the caps it was ruled on: the earliest any of them states,
-    /// or `None` when none states one. A cap whose expiry fact is absent or unreadable adds no bound.
-    fn of_stream(ruled: &[Cap]) -> Option<SystemTime> {
-        ruled
-            .iter()
-            .filter_map(|cap| cap.expiry().ok().flatten())
-            .min()
+    /// The expiry of one stream's grant, from the caps it was ruled on.
+    fn of_stream(ruled: &[Cap]) -> Result<Option<SystemTime>, CapError> {
+        Self::earliest(ruled.iter().map(Cap::valid_until))
+    }
+
+    /// The earliest of one stream's expiry reads: `None` when no cap ever expires, and an error when any
+    /// read failed, because an unreadable expiry is treated as expired and never as absent.
+    fn earliest(
+        reads: impl IntoIterator<Item = Result<Option<SystemTime>, CapError>>,
+    ) -> Result<Option<SystemTime>, CapError> {
+        reads
+            .into_iter()
+            .try_fold(None, |earliest: Option<SystemTime>, read| {
+                Ok(match (earliest, read?) {
+                    (Some(held), Some(until)) => Some(held.min(until)),
+                    (held, until) => held.or(until),
+                })
+            })
     }
 
     /// This lease widened by one more admitted stream whose grant runs out at `stream`.
@@ -186,10 +201,16 @@ impl core::fmt::Display for Cut {
     }
 }
 
-/// A stream's chains would take its session past [`MAX_SESSION_CHAIN_IDS`].
+/// Why a stream's chains were not kept, which refuses the stream.
 #[derive(Debug, thiserror::Error)]
-#[error("this session already keeps {MAX_SESSION_CHAIN_IDS} revocation ids for the live cut")]
-pub(super) struct ChainsFull;
+pub(super) enum Unrecorded {
+    /// They would take the session past [`MAX_SESSION_CHAIN_IDS`].
+    #[error("this session already keeps {MAX_SESSION_CHAIN_IDS} revocation ids for the live cut")]
+    Full,
+    /// A cap's expiry cannot be read, so it is treated as already expired.
+    #[error("a capability's expiry cannot be read, so the live cut treats it as expired")]
+    UnreadableExpiry(#[source] CapError),
+}
 
 impl LiveCuts for FileDenylist {
     fn cuts(&self, chains: &AdmittedChains) -> bool {

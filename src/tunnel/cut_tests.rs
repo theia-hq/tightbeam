@@ -297,6 +297,112 @@ async fn a_session_is_cut_once_the_grant_it_was_admitted_on_expires() {
 }
 
 #[tokio::test]
+async fn a_session_is_cut_at_a_narrowed_expiry_not_the_issuers() {
+    // The holder narrowed an hour-long badge to seconds and passed it on. The session admitted on it must
+    // end at the narrower instant: the chain's earliest bound, not the one the signet signed.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (store, _roots, _denylist) = store("narrowed").await;
+            let host = serve(gated_echo(&store));
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let narrowed = signet()
+                .mint_member(consumer.node_id().verify_key(), hour())
+                .expect("mint badge")
+                .attenuate(None, Some(nauthy::Request::expires_in(SHORT)))
+                .expect("narrow the badge");
+
+            let session = consumer.connect(host).await.expect("connect");
+            let mut stream = ServiceStream::open_with(
+                &session,
+                "demo",
+                Some(narrowed.link().expect("link").to_string()),
+            )
+            .await
+            .expect("the narrowed badge is admitted");
+            assert!(still_echoes(&mut stream).await, "served before the expiry");
+
+            assert!(
+                host_ends(&mut stream.reader).await,
+                "a session must end at the narrowed expiry, not run on to the issuer's"
+            );
+        })
+        .await;
+}
+
+/// `cap` with `datalog` appended as a block, the way a holder narrows a cap outside nauthy's own API:
+/// decode the link, append with biscuit's block builder (no secret needed), and encode it again.
+fn with_raw_block(cap: &nauthy::Cap, datalog: &str) -> nauthy::Cap {
+    use data_encoding::BASE32_NOPAD;
+
+    let link = cap.link().expect("link").to_string();
+    let (root, token) = link.split_once('.').expect("a link is root.token");
+    let token = biscuit_auth::UnverifiedBiscuit::from(
+        BASE32_NOPAD
+            .decode(token.to_uppercase().as_bytes())
+            .expect("base32"),
+    )
+    .expect("a token")
+    .append(
+        biscuit_auth::builder::BlockBuilder::new()
+            .code(datalog)
+            .expect("datalog"),
+    )
+    .expect("append")
+    .to_vec()
+    .expect("encode");
+    let link = format!("{root}.{}", BASE32_NOPAD.encode(&token).to_lowercase());
+    nauthy::Cap::parse(&link).expect("the appended cap still verifies")
+}
+
+#[tokio::test]
+async fn a_stream_on_a_cap_whose_expiry_cannot_be_read_is_refused() {
+    // The gate admits this badge: its extra check (`<` rather than `<=`) passes now. But the cut cannot
+    // read when it ends, so it treats it as already expired and the stream is refused, never served on
+    // a lease nothing bounds.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (store, _roots, _denylist) = store("unreadable").await;
+            let host = serve(gated_echo(&store));
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let badge = signet()
+                .mint_member(consumer.node_id().verify_key(), hour())
+                .expect("mint badge");
+            let odd = with_raw_block(&badge, "check if time($t), $t < 2100-01-01T00:00:00Z;");
+            assert!(
+                matches!(odd.valid_until(), Err(nauthy::CapError::UnreadableExpiry)),
+                "the fixture is a cap whose expiry cannot be read"
+            );
+
+            let session = consumer.connect(host).await.expect("connect");
+            assert!(
+                ServiceStream::open_with(
+                    &session,
+                    "demo",
+                    Some(odd.link().expect("link").to_string())
+                )
+                .await
+                .is_err(),
+                "a stream on an unreadable expiry is refused"
+            );
+            // The same badge without the odd block is admitted on the same session: only the read
+            // refused it.
+            assert!(
+                ServiceStream::open_with(
+                    &session,
+                    "demo",
+                    Some(badge.link().expect("link").to_string())
+                )
+                .await
+                .is_ok(),
+                "the plain badge is admitted"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn a_session_runs_on_while_any_grant_it_was_admitted_on_holds() {
     // Two streams on one session, one on a grant that expires and one on a grant that does not. The cut
     // is session-granular, so it waits for the last grant.
@@ -344,6 +450,33 @@ async fn a_session_runs_on_while_any_grant_it_was_admitted_on_holds() {
 /// A whole second far in the future, so a grant minted for it states exactly this instant.
 fn at(secs: u64) -> std::time::SystemTime {
     std::time::UNIX_EPOCH + Duration::from_secs(4_000_000_000 + secs)
+}
+
+#[test]
+fn a_stream_reads_its_earliest_expiry_and_fails_closed_on_an_unreadable_one() {
+    use nauthy::CapError;
+
+    use super::Lease;
+
+    // None: a stream ruled on no cap, or on caps that never expire, has no bound.
+    assert_eq!(Lease::earliest([]).ok(), Some(None));
+    assert_eq!(Lease::earliest([Ok(None), Ok(None)]).ok(), Some(None));
+    // Many: the earliest bound any cap sets, whatever the order; a cap that never expires adds none.
+    assert_eq!(
+        Lease::earliest([Ok(Some(at(30))), Ok(None), Ok(Some(at(10)))]).ok(),
+        Some(Some(at(10)))
+    );
+    // Error: one unreadable expiry fails the whole stream, before or after a readable one, and is never
+    // read as "no bound".
+    for reads in [
+        [Ok(Some(at(10))), Err(CapError::UnreadableExpiry)],
+        [Err(CapError::UnreadableExpiry), Ok(None)],
+    ] {
+        assert!(
+            matches!(Lease::earliest(reads), Err(CapError::UnreadableExpiry)),
+            "an unreadable expiry is treated as expired"
+        );
+    }
 }
 
 #[test]
