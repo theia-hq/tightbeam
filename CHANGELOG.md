@@ -2,6 +2,29 @@
 
 All notable changes to tightbeam, newest first.
 
+## v0.12.0
+
+A service can be typed, and nothing is forced through a codec.
+
+### Added
+- **A typed layer over the handler contract, opt-in and additive.** `Frame` names the obligation every
+  engine already hand-rolls: encode into and decode from a length-delimited frame. `Service` carries a
+  typed request. `Serve<S>` adapts one to `Handler`, so an engine can hand back a value where it used to
+  hand back a reader, and an engine that would rather keep the reader changes nothing at all.
+
+  The two kinds coexist. A typed service and a raw handler sit in one dispatcher side by side, which is
+  what makes this an option rather than a migration.
+
+  **The control preamble is framed; the raw halves come back untouched.** A service that splices a
+  session or streams a body is never pushed through the codec, because a codec that buffers reads past
+  the frame it was asked for: after an eight-byte preamble on a stream carrying thirty-two body bytes,
+  a buffering reader holds those thirty-two and the raw phase has to replay them. The exact-read shape
+  every engine already uses holds none. A shell session cannot tolerate that at all, since the SSH
+  library must own the stream from its first byte.
+
+  The open-safety ceiling forwards through the adapter as a type, so the author's choice stays the
+  author's and stays checked at compile time.
+
 ## v0.11.0
 
 The wire is a specification, and a neighbouring protocol is no longer answered as a version of this
