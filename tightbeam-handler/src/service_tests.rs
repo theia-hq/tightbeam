@@ -3,6 +3,9 @@
 //! sealed exposure ceiling forwards through the adapter unchanged, and the raw halves reach the service
 //! positioned at the payload's first byte with nothing stranded.
 
+// `Cursor` lives in `std::io`: the lint's `core::io` spelling is still unstable (rustc 1.97).
+#![allow(clippy::std_instead_of_core)]
+
 use core::future::Future;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
