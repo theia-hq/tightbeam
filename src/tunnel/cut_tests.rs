@@ -659,6 +659,63 @@ async fn a_stream_refused_after_the_gate_leaves_the_session_lease_untouched() {
         .await;
 }
 
+#[tokio::test]
+async fn a_raw_stream_whose_open_is_refused_leaves_the_session_lease_untouched() {
+    // Admission passes and only the open fails: the target is a directory, which a raw stream refuses.
+    // Nothing was served, so that stream's shorter grant must not end the session.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (store, _roots, _denylist) = store("open-refused").await;
+            let directory = std::env::temp_dir();
+            let host = serve(
+                prove(
+                    services(&["demo=echo:", &format!("dir=file:{}", directory.display())]),
+                    Gate::rooted(signet().verifying_key(), Arc::clone(&store)),
+                    PublicRequest::none(),
+                    PublicUnsafeRequest::none(),
+                )
+                .expect("an echo and a raw stream build")
+                .with_live_cuts(Arc::clone(&store)),
+            );
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let lasting = signet()
+                .mint(&svc("demo"), hour())
+                .expect("mint the lasting slip");
+            let brief = signet()
+                .mint(&svc("dir"), nauthy::Request::expires_in(SHORT))
+                .expect("mint the short slip");
+
+            let session = consumer.connect(host).await.expect("connect");
+            let mut stream = ServiceStream::open_with(
+                &session,
+                "demo",
+                Some(lasting.link().expect("link").to_string()),
+            )
+            .await
+            .expect("admitted to demo on the lasting slip");
+            assert!(
+                matches!(
+                    ServiceStream::open_with(
+                        &session,
+                        "dir",
+                        Some(brief.link().expect("link").to_string())
+                    )
+                    .await,
+                    Err(bifrost::Refusal::Unavailable { .. })
+                ),
+                "a directory is admitted past the gate and refused at the open"
+            );
+
+            tokio::time::sleep(SHORT + CUT_SWEEP * 2).await;
+            assert!(
+                still_echoes(&mut stream).await,
+                "a stream refused at its open must not bound the session"
+            );
+        })
+        .await;
+}
+
 /// A whole second far in the future, so a grant minted for it states exactly this instant.
 fn at(secs: u64) -> std::time::SystemTime {
     std::time::UNIX_EPOCH + Duration::from_secs(4_000_000_000 + secs)
