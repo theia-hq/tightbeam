@@ -22,6 +22,10 @@ use crate::tunnel::{CancellationToken, Exposer};
 /// that a cut that never comes fails the suite rather than hanging it.
 const WITHIN: Duration = Duration::from_secs(5);
 
+/// A grant that runs out mid-test: long enough to be admitted and echo once, short enough that its
+/// expiry plus a sweep lands well inside [`WITHIN`].
+const SHORT: Duration = Duration::from_secs(2);
+
 /// A unique scratch path per test, with every sibling a store writes cleared first.
 fn scratch(tag: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("tb-cut-{tag}-{}", std::process::id()));
@@ -256,6 +260,133 @@ async fn a_session_nothing_recalled_keeps_running_across_sweeps() {
             );
         })
         .await;
+}
+
+#[tokio::test]
+async fn a_session_is_cut_once_the_grant_it_was_admitted_on_expires() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (store, _roots, _denylist) = store("expired").await;
+            let host = serve(gated_echo(&store));
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let badge = signet()
+                .mint_member(
+                    consumer.node_id().verify_key(),
+                    nauthy::Request::expires_in(SHORT),
+                )
+                .expect("mint badge");
+
+            let session = consumer.connect(host).await.expect("connect");
+            let mut stream = ServiceStream::open_with(
+                &session,
+                "demo",
+                Some(badge.link().expect("link").to_string()),
+            )
+            .await
+            .expect("the member is admitted");
+            assert!(still_echoes(&mut stream).await, "served before the expiry");
+
+            // Nothing is revoked or disabled: only the clock moves.
+            assert!(
+                host_ends(&mut stream.reader).await,
+                "a session must not outlive the only grant it was admitted on"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn a_session_runs_on_while_any_grant_it_was_admitted_on_holds() {
+    // Two streams on one session, one on a grant that expires and one on a grant that does not. The cut
+    // is session-granular, so it waits for the last grant.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (store, _roots, _denylist) = store("outlived").await;
+            let host = serve(gated_echo(&store));
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let brief = signet()
+                .mint_member(
+                    consumer.node_id().verify_key(),
+                    nauthy::Request::expires_in(SHORT),
+                )
+                .expect("mint the short badge");
+            let lasting = signet()
+                .mint_member(consumer.node_id().verify_key(), hour())
+                .expect("mint the lasting badge");
+
+            let session = consumer.connect(host).await.expect("connect");
+            let _short = ServiceStream::open_with(
+                &session,
+                "demo",
+                Some(brief.link().expect("link").to_string()),
+            )
+            .await
+            .expect("admitted on the short badge");
+            let mut long = ServiceStream::open_with(
+                &session,
+                "demo",
+                Some(lasting.link().expect("link").to_string()),
+            )
+            .await
+            .expect("admitted on the lasting badge");
+
+            tokio::time::sleep(SHORT + CUT_SWEEP * 2).await;
+            assert!(
+                still_echoes(&mut long).await,
+                "a session is held open by any grant it was admitted on that still holds"
+            );
+        })
+        .await;
+}
+
+/// A whole second far in the future, so a grant minted for it states exactly this instant.
+fn at(secs: u64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + Duration::from_secs(4_000_000_000 + secs)
+}
+
+#[test]
+fn a_lease_lapses_after_the_last_stream_and_the_first_cap_of_each() {
+    // None: a session no stream was admitted on a grant never lapses.
+    assert!(!AdmittedChains::default().lapsed(at(1_000_000)));
+
+    // One: good through its expiry instant, lapsed strictly after.
+    let mut one = AdmittedChains::default();
+    one.record(&signet().mint(&svc("demo"), at(10)).expect("mint"));
+    assert!(!one.lapsed(at(10)), "a grant is good through its expiry");
+    assert!(one.lapsed(at(11)), "and lapsed after it");
+    one.record_all(&[]).expect("an open stream keeps nothing");
+    assert!(
+        one.lapsed(at(11)),
+        "an open stream, ruled on nothing, holds no session open"
+    );
+
+    // Many streams: the session is held by the LAST grant, in whichever order they came.
+    let mut many = AdmittedChains::default();
+    for secs in [20, 30, 10] {
+        many.record(&signet().mint(&svc("demo"), at(secs)).expect("mint"));
+    }
+    assert!(!many.lapsed(at(29)), "held while the latest grant holds");
+    assert!(many.lapsed(at(31)), "lapsed once every grant has");
+
+    // One stream ruled on two caps needed both, so its grant ends at the EARLIER.
+    let foreign = Identity::from_secret(&[11u8; 32]).expect("valid secret");
+    let slip = signet()
+        .mint_authority_slip(&svc("demo"), foreign.verifying_key(), at(40))
+        .expect("mint slip");
+    let badge = foreign
+        .mint_member(signet().verifying_key(), at(15))
+        .expect("mint badge");
+    let mut paired = AdmittedChains::default();
+    paired
+        .record_all(&[slip, badge])
+        .expect("under the ceiling");
+    assert!(!paired.lapsed(at(15)), "held while both caps hold");
+    assert!(
+        paired.lapsed(at(16)),
+        "a stream that needed both caps ends with the first to expire"
+    );
 }
 
 #[tokio::test]

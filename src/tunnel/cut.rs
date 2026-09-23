@@ -1,11 +1,12 @@
-//! The live cut: a session admitted on a capability that is later recalled ends itself, rather than
-//! running on until its peer leaves.
+//! The live cut: a session admitted on a capability that is later recalled, or whose every grant has run
+//! out, ends itself, rather than running on until its peer leaves.
 //!
 //! Admission rules per stream, at the moment the stream opens, so a recall written after that moment has
 //! no stream left to refuse. The cut closes that gap without a registry of who is connected: each session
 //! keeps the chains it was admitted on, in its own frame, and re-asks the oracle whenever the exposer's one
-//! sweep ticks. A session that finds itself recalled returns, which drops it and every stream on it. The
-//! oracle holds only rules, never a session, so nothing here can list, count, or name the live peers.
+//! sweep ticks. A session that finds itself recalled or expired returns, which drops it and every stream on
+//! it. The oracle holds only rules, never a session, so nothing here can list, count, or name the live
+//! peers.
 //!
 //! The unit is the SESSION: a recall ends every stream on it, including streams admitted under other caps,
 //! because a dropped stream alone leaves a handler's detached work running.
@@ -13,6 +14,7 @@
 use core::time::Duration;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::SystemTime;
 
 use nauthy::{Cap, FileDenylist, Latch, RevocationId, Revocations, VerifyKey};
 use tokio::sync::watch;
@@ -20,8 +22,9 @@ use tokio::time::{Interval, MissedTickBehavior};
 
 /// How often a live session re-checks the chains it was admitted on. A recall ends the sessions it hits
 /// within one sweep plus the store's own refresh debounce, about a second on the serving node; never at
-/// the moment it is written. Shorter buys nothing a human would notice and multiplies the per-session
-/// checks; longer leaves a recalled peer inside for longer.
+/// the moment it is written. An expiry ends its session within one sweep of the instant it passes.
+/// Shorter buys nothing a human would notice and multiplies the per-session checks; longer leaves a
+/// recalled peer inside for longer.
 ///
 /// Every sweep runs on the node's one serving task, so its cost is paid by every session and admission
 /// on the node. [`MAX_SESSION_CHAIN_IDS`] is what bounds it: at most that many id lookups per session, so
@@ -52,8 +55,8 @@ pub trait LiveCuts: Send + Sync {
     fn cuts(&self, chains: &AdmittedChains) -> bool;
 }
 
-/// Every root key and revocation id of every capability the gate ruled on to admit a session's streams:
-/// the facts the cut re-checks, kept instead of the caps themselves.
+/// Every root key and revocation id of every capability the gate ruled on to admit a session's streams,
+/// and how long those grants hold it: the facts the cut re-checks, kept instead of the caps themselves.
 ///
 /// A parsed cap is the whole token; the ids and the root are all a revocation or a disabled root ever
 /// matches. Held as a union per session: the cut is session-granular, so which stream carried which cap
@@ -62,6 +65,7 @@ pub trait LiveCuts: Send + Sync {
 pub struct AdmittedChains {
     roots: HashSet<VerifyKey>,
     ids: HashSet<RevocationId>,
+    lease: Lease,
 }
 
 impl AdmittedChains {
@@ -81,6 +85,15 @@ impl AdmittedChains {
     pub(super) fn record(&mut self, cap: &Cap) {
         self.roots.insert(cap.root());
         self.ids.extend(cap.revocation_ids());
+        self.lease = self
+            .lease
+            .extend(Lease::of_stream(core::slice::from_ref(cap)));
+    }
+
+    /// Whether every grant this session was admitted on has run out by `now`. Never for a session no
+    /// stream was admitted on a grant, and never for one holding a grant whose expiry cannot be read.
+    pub(super) fn lapsed(&self, now: SystemTime) -> bool {
+        self.lease.lapsed(now)
     }
 
     /// Keep what the cut will need of every cap one stream was admitted on, or keep nothing and refuse
@@ -97,6 +110,10 @@ impl AdmittedChains {
         }
         self.ids.extend(fresh);
         self.roots.extend(ruled.iter().map(Cap::root));
+        // An open stream rules on nothing, so it holds the session open on no grant.
+        if !ruled.is_empty() {
+            self.lease = self.lease.extend(Lease::of_stream(ruled));
+        }
         Ok(())
     }
 
@@ -104,6 +121,68 @@ impl AdmittedChains {
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.ids.len()
+    }
+}
+
+/// How long a session's grants hold it open: until the LAST of its streams' grants runs out.
+///
+/// One stream is admitted only while every cap it was ruled on holds (the foreign path ANDs a slip and a
+/// badge), so a stream's grant runs out at the EARLIEST of their expiries. The session is still held by
+/// any stream's grant, so it lapses at the LATEST of those. Read from each cap's [`Cap::expiry`], the
+/// issuer's own expiry: a holder's narrower attenuation is enforced at the next admission, not here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Lease {
+    /// No stream was admitted on a grant: nothing here can run out.
+    #[default]
+    Unruled,
+    /// Every grant a stream was admitted on has run out once this instant passes.
+    Until(SystemTime),
+    /// Some stream was admitted on grants none of which states its expiry, so time alone never ends
+    /// this session. A recall still does.
+    Unbounded,
+}
+
+impl Lease {
+    /// The expiry of one stream's grant, from the caps it was ruled on: the earliest any of them states,
+    /// or `None` when none states one. A cap whose expiry fact is absent or unreadable adds no bound.
+    fn of_stream(ruled: &[Cap]) -> Option<SystemTime> {
+        ruled
+            .iter()
+            .filter_map(|cap| cap.expiry().ok().flatten())
+            .min()
+    }
+
+    /// This lease widened by one more admitted stream whose grant runs out at `stream`.
+    fn extend(self, stream: Option<SystemTime>) -> Self {
+        match (self, stream) {
+            (Self::Unbounded, _) | (_, None) => Self::Unbounded,
+            (Self::Unruled, Some(until)) => Self::Until(until),
+            (Self::Until(held), Some(until)) => Self::Until(held.max(until)),
+        }
+    }
+
+    /// Whether the lease has run out at `now`. A cap is good through its expiry instant (the gate checks
+    /// `time <= expiry`), so it lapses only strictly after.
+    fn lapsed(self, now: SystemTime) -> bool {
+        matches!(self, Self::Until(until) if now > until)
+    }
+}
+
+/// Why the cut ended a session, for the node's own log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Cut {
+    /// A cap it was admitted on is revoked, or the root one was issued under is disabled.
+    Recalled,
+    /// Every grant it was admitted on has expired.
+    Expired,
+}
+
+impl core::fmt::Display for Cut {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Recalled => "a capability it was admitted on is revoked or its root disabled",
+            Self::Expired => "every capability it was admitted on has expired",
+        })
     }
 }
 
@@ -173,10 +252,14 @@ impl Cuts {
         }
     }
 
-    /// Whether the session behind `cut` must end now.
-    pub(super) fn cuts(&self, cut: &SessionCut) -> bool {
+    /// Whether the session behind `cut` must end at `now`, and why. Expiry is checked here, beside the
+    /// oracle rather than inside it, so every oracle a caller wires gets it and none can forget it.
+    pub(super) fn cuts(&self, cut: &SessionCut, now: SystemTime) -> Option<Cut> {
         let chains = cut.chains.lock().unwrap_or_else(PoisonError::into_inner);
-        self.oracle.cuts(&chains)
+        if self.oracle.cuts(&chains) {
+            return Some(Cut::Recalled);
+        }
+        chains.lapsed(now).then_some(Cut::Expired)
     }
 }
 

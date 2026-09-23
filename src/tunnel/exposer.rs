@@ -7,6 +7,7 @@
 
 use core::pin::pin;
 use std::sync::{Arc, PoisonError};
+use std::time::SystemTime;
 
 use bifrost::{Discovery, Node, NodeId, Security, SecurityProfile, Session, Transport};
 use futures::StreamExt as _;
@@ -567,7 +568,8 @@ where
                 }
             }
             // The live cut: on a sweep, re-ask about the chains this session was admitted on, and end it
-            // if any was recalled. Returning drops the session and every stream on it.
+            // if any was recalled or every grant has expired. Returning drops the session and every
+            // stream on it.
             //
             // Guarded by the same liveness the two arms above share. A sweep arm left enabled would keep
             // this select from ever reaching `else`, so a session whose peer left and whose streams drained
@@ -575,15 +577,12 @@ where
             // connect-and-close cycles would stop the node accepting at all.
             true = cut::swept(&mut cut), if accepting || !pipes.is_empty() => {
                 if let (Some(cuts), Some(cut)) = (&serving.cuts, &cut)
-                    && cuts.cuts(cut)
+                    && let Some(why) = cuts.cuts(cut, SystemTime::now())
                 {
                     // Close, not just drop: a stream a handler handed to a detached task can hold a
                     // connection open past the session value, and a cut must end the peer's reach.
                     session.close();
-                    tracing::warn!(
-                        %peer,
-                        "session cut: a capability it was admitted on is revoked or its root disabled"
-                    );
+                    tracing::warn!(%peer, %why, "session cut");
                     return Ok(());
                 }
             }
