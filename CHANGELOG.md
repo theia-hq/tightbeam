@@ -2,6 +2,23 @@
 
 All notable changes to tightbeam, newest first.
 
+## v0.14.1
+
+A live session now ends when its first grant expires, and a refused stream no longer touches it.
+
+### Fixed
+- **A session could outlive a grant.** v0.14.0 ended a live session only once every grant it was
+  admitted on had expired, so its streams lasted as long as its longest grant. A peer holding a short
+  grant for one service and any longer grant from the same root, even one for another service, could
+  keep its streams to the first service open past that grant's expiry, for as long as the longer grant
+  lasted, or forever if it never expired. A session now ends when its first grant expires, the same
+  way one revoked capability already ends it. A client that presents one capability per session, as
+  tightbeam's own does, is not affected.
+- **A refused stream could extend a session.** A stream's grant was recorded for the session before
+  the last checks ran, so a stream then refused (a disabled service, a member-only route, a name the
+  node does not expose, or a raw stream that failed to open) still counted toward how long the session
+  lived. Only a stream that is served now counts.
+
 ## v0.14.0
 
 A live session ends when its access does, and `stdin:` is handed on instead of used up.
@@ -13,7 +30,8 @@ A live session ends when its access does, and `stdin:` is handed on instead of u
   - a capability it was admitted on is revoked;
   - its root key is disabled; or
   - every grant it was admitted on has expired. Expiry is read from the whole chain, so a holder's
-    narrower attenuation ends the session at its own instant.
+    narrower attenuation ends the session at its own instant. Waiting for every grant was a defect:
+    v0.14.1 ends the session when its first grant expires.
 
   `LiveCuts` is the rule and `AdmittedChains` what a session keeps for it; both are exported from
   `tightbeam::tunnel`. `LiveCuts` is implemented for nauthy's `FileDenylist`, for `Latch` and for an
