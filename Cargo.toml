@@ -23,6 +23,9 @@ license = "MIT OR Apache-2.0"
 bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "b295a7d2d23c2bafd70f7c3b5a93d9bb6810e174" }
 bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "b295a7d2d23c2bafd70f7c3b5a93d9bb6810e174" }
 bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "b295a7d2d23c2bafd70f7c3b5a93d9bb6810e174" }
+# The key file store, in bifrost's repo beside the identity it stores. No released rev carries it yet, so
+# this rev resolves only through the local path patch until the cascade publishes one.
+keystore = { git = "https://github.com/theia-hq/bifrost", rev = "b295a7d2d23c2bafd70f7c3b5a93d9bb6810e174" }
 nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "e148cb899dc8752a2403564ccbd8228e2b246dd0" }
 # The handler contract, in-tree beside its only dispatcher. A path dep (not a git self-dep): the workspace
 # member resolves within this checkout, and the package stays separately pinnable by a consumer.

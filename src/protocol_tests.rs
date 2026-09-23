@@ -30,6 +30,9 @@ impl<P: SecurityProfile> Session for StubSession<P> {
     }
 
     async fn wait_closed(&self) {}
+
+    /// A double that carries nothing has nothing to end.
+    fn close(&self) {}
 }
 
 /// A credential-bearing request: a capability link in slot 1.

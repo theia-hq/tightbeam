@@ -196,15 +196,28 @@ async fn bind_node(
     // Offline (implied by a fixed --bind-addr) binds iroh's minimal preset: no n0, no relays, reachable
     // only via the --peer hints below. Otherwise bind under n0 discovery, with hints as a direct-path
     // shortcut. A fixed bind address defaults to an ephemeral port, which suits a dial-only client.
+    // Each bind borrows the seed through `with_bytes` and returns a future that holds only what it
+    // derived, so the seed never leaves its wiping owner, which drops once the endpoint is bound.
     let endpoint = if offline || bind_addr.is_some() {
         let addr = bind_addr.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-        Endpoint::bind_offline(secret.into_bytes(), addr).await?
+        secret
+            .with_bytes(|seed| Endpoint::bind_offline(seed, addr))
+            .await?
     } else {
         match role {
-            BindRole::Serving => Endpoint::bind_reachable_with_secret(secret.into_bytes()).await?,
-            BindRole::Dialing => Endpoint::bind_dialing_with_secret(secret.into_bytes()).await?,
+            BindRole::Serving => {
+                secret
+                    .with_bytes(Endpoint::bind_reachable_with_secret)
+                    .await?
+            }
+            BindRole::Dialing => {
+                secret
+                    .with_bytes(Endpoint::bind_dialing_with_secret)
+                    .await?
+            }
         }
     };
+    drop(secret);
     // Compose local discovery (--peer hints + LAN mDNS) so a nearby peer is reached directly; under n0
     // it keeps the internet as the fallback for a remote peer with no local hint.
     let discovery = Peer::discovery(&endpoint, peers);

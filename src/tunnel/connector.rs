@@ -208,6 +208,7 @@ impl Connector {
 /// #     async fn open_bi(&self) -> Result<(Self::Write, Self::Read), Error> { unimplemented!() }
 /// #     async fn accept_bi(&self) -> Result<(Self::Write, Self::Read), Error> { unimplemented!() }
 /// #     async fn wait_closed(&self) {}
+/// #     fn close(&self) {}
 /// # }
 /// #
 /// # fn dial(node: &Node<AnnouncedTransport, NoDiscovery>, link: &Link, service: Service) {
@@ -392,6 +393,11 @@ impl<S: Session> Session for ServiceSession<S> {
 
     async fn wait_closed(&self) {
         self.session.wait_closed().await
+    }
+
+    /// Closes the wrapped session: a gated view ends the same connection it rides on.
+    fn close(&self) {
+        self.session.close();
     }
 
     fn conn_info(&self) -> ConnInfo {
