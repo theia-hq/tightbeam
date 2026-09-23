@@ -42,6 +42,10 @@ mod duration_tests;
 #[cfg(test)]
 mod identity_tests;
 #[cfg(test)]
+mod log_capture;
+#[cfg(test)]
+mod log_capture_tests;
+#[cfg(test)]
 mod peer_tests;
 #[cfg(test)]
 mod protocol_tests;

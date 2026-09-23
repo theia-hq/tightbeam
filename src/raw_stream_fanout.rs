@@ -754,41 +754,13 @@ mod tests {
         );
     }
 
-    /// A host-log sink for the lag test: every line the subscriber formats lands in one shared buffer.
+    /// The `dropped_bytes` of every lag warning `log` captured, in order.
     #[cfg(unix)]
-    #[derive(Clone, Default)]
-    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    #[cfg(unix)]
-    impl std::io::Write for Captured {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            let Self(lines) = self;
-            lines
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[cfg(unix)]
-    impl Captured {
-        /// The `dropped_bytes` of every lag warning logged so far, in order.
-        fn lag_warnings(&self) -> Vec<String> {
-            let Self(lines) = self;
-            let lines = lines
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            String::from_utf8_lossy(&lines)
-                .lines()
-                .filter(|line| line.contains("lossy consumer lagged"))
-                .filter_map(|line| line.split("dropped_bytes=").nth(1).map(str::to_owned))
-                .collect()
-        }
+    fn lag_warnings(log: &crate::log_capture::Captured) -> Vec<String> {
+        log.lines("lossy consumer lagged")
+            .iter()
+            .filter_map(|line| line.split("dropped_bytes=").nth(1).map(str::to_owned))
+            .collect()
     }
 
     /// Push `bytes` into the source and wait until the pump has appended all of them, so the ring's state
@@ -826,15 +798,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_viewer_loses_nothing_at_the_ceiling_and_one_byte_past_it_logs_one_lapse() {
-        let log = Captured::default();
-        let sink = log.clone();
-        let _subscriber = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_max_level(tracing::Level::WARN)
-                .with_writer(move || sink.clone())
-                .finish(),
-        );
+        let log = crate::log_capture::Captured::default();
+        let _capture = log.install();
 
         // Bounded as a whole: a ceiling off by one parks a read forever, and that must fail, not hang.
         let run = async {
@@ -851,7 +816,7 @@ mod tests {
                 .expect("read the full ring");
             assert_eq!(all[0], 0, "a viewer exactly one ring behind loses nothing");
             assert!(
-                log.lag_warnings().is_empty(),
+                lag_warnings(&log).is_empty(),
                 "no bytes were dropped, so nothing is logged"
             );
 
@@ -871,7 +836,7 @@ mod tests {
                 "one byte past the ceiling drops exactly offset 0"
             );
             assert_eq!(
-                log.lag_warnings(),
+                lag_warnings(&log),
                 ["1"],
                 "the lapse is logged once, with its count"
             );
@@ -883,7 +848,7 @@ mod tests {
                 .await
                 .expect("read past the second lap");
             assert_eq!(
-                log.lag_warnings(),
+                lag_warnings(&log),
                 ["1"],
                 "one episode logs once, however often it is lapped"
             );
@@ -901,7 +866,7 @@ mod tests {
                 .await
                 .expect("read past the new lapse");
             assert_eq!(
-                log.lag_warnings(),
+                lag_warnings(&log),
                 ["1", "5"],
                 "a viewer that caught up and was lapped again starts a new episode"
             );
