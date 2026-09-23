@@ -2,6 +2,50 @@
 
 All notable changes to tightbeam, newest first.
 
+## v0.14.0
+
+A live session ends when its access does, and `stdin:` is handed on instead of used up.
+
+### Added
+- **A live session is cut when its access ends.** Before, a revocation only refused the next stream,
+  and a session already open ran until its peer left. Now `Exposer::with_live_cuts(cuts)` re-checks every
+  live session about once a second and closes it, with every stream on it, when:
+  - a capability it was admitted on is revoked;
+  - its root key is disabled; or
+  - every grant it was admitted on has expired. Expiry is read from the whole chain, so a holder's
+    narrower attenuation ends the session at its own instant.
+
+  `LiveCuts` is the rule and `AdmittedChains` what a session keeps for it; both are exported from
+  `tightbeam::tunnel`. `LiveCuts` is implemented for nauthy's `FileDenylist`, for `Latch` and for an
+  `Arc` of either. Without `with_live_cuts` nothing is armed and sessions end as before. A session keeps
+  at most 1,024 revocation ids; a stream past that is refused as a gate miss is. A cap whose expiry reads
+  in a shape nauthy never writes, or past the clock's range, is refused at admission.
+- **`tightbeam expose` loads `~/.config/tightbeam/disabled_roots`** beside `revoked`, gates on both, and
+  cuts live sessions from the same store. Under `--public` nothing is ruled on, so nothing is cut.
+
+### Changed
+- **`stdin:` is handed to the next peer when a viewer leaves.** One peer reads it at a time. When that
+  peer leaves, however it leaves, the next one to dial gets the stream from about where the last one
+  stopped; bytes written while nobody was attached are not replayed. A peer that connects, reads nothing
+  and leaves no longer uses up the input.
+  - **A paused viewer keeps the stream** for as long as nobody else wants it. It loses it only when a
+    different peer dials while it has taken less than about 128 KiB in 90 seconds, and that peer gets
+    the stream at once. A reading viewer keeps it against any dialer, and a peer re-dialing never
+    displaces itself.
+  - **The refusals say which case it is:** "stdin: is held by another peer and serves one at a time;
+    retry, or serve it as `stdin:+lossy` to fan out", and, once input has ended, "stdin: has reached end
+    of input; restart to serve again". A late dialer is never handed an empty stream.
+- **`stdin:+lossy` pumps for the life of the process.** Viewers come and go; a joiner after end of input
+  is refused. `fifo:+lossy` still lets go of its fifo when nobody is watching.
+- **`resolve_gate` takes any revocation store** (`impl Revocations`), so a caller can pass a `Latch`.
+
+### Fixed
+- **A handshake in flight is no longer dropped by the exposer's loop.** `accept` was rebuilt on every
+  turn of the select loop, so a handshake that straddled a turn was lost. The accept future is now kept
+  until it completes.
+- **The non-unix build compiles,** checked on Windows in CI.
+- Requires nauthy v0.6.0.
+
 ## v0.13.0
 
 The key file goes through bifrost's keystore, and the public stream limits say what they cover.
