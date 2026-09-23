@@ -20,16 +20,29 @@
 //! depends on it and re-exports every author-facing item at its original path, so a service crate
 //! implements the contract without taking tightbeam's own non-optional backends and CLI tree.
 //!
+//! A service whose callers open with a control frame of its own may take the TYPED door instead:
+//! implement [`Service`], state the frame as a [`wire::Frame`], and bind [`Serve`], which reads exactly
+//! that one frame and hands the service its decoded request plus the RAW halves by value. It is a
+//! library, never a tax: the floor stays [`Handler`], a service with no bytes of its own implements it
+//! directly and pays nothing, and both kinds store side by side in one erased route table.
+//!
 //! The erased bridge in [`bridge`] is the dispatcher's view (heterogeneous storage plus the pre-`Ok`
 //! preparation split); a service author never names it, and it is not part of the re-exported set.
 
 pub mod bridge;
 mod contract;
 pub mod open_policy;
+mod service;
+pub mod wire;
 
 #[cfg(test)]
 mod contract_tests;
 #[cfg(test)]
 mod open_policy_tests;
+#[cfg(test)]
+mod service_tests;
+#[cfg(test)]
+mod wire_tests;
 
 pub use contract::{BoxRead, BoxWrite, Handler, Metering, RootedAdmitted, ServeError, Served};
+pub use service::{Serve, Service};
