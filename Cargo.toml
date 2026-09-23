@@ -20,10 +20,13 @@ license = "MIT OR Apache-2.0"
 # `.cargo/config.toml` still [patch]es these by URL to sibling PATH checkouts, so a `rev` here does not
 # slow local builds (the patch wins locally regardless of the rev); CI resolves the rev from GitHub. All
 # bifrost-* crates live in one repo, so they share one rev. Bump deliberately each release.
-bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "b295a7d2d23c2bafd70f7c3b5a93d9bb6810e174" }
-bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "b295a7d2d23c2bafd70f7c3b5a93d9bb6810e174" }
-bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "b295a7d2d23c2bafd70f7c3b5a93d9bb6810e174" }
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "e148cb899dc8752a2403564ccbd8228e2b246dd0" }
+bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "7e2702af2c6b7a8986c60f492042bcc7f6107438" }
+bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "7e2702af2c6b7a8986c60f492042bcc7f6107438" }
+bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "7e2702af2c6b7a8986c60f492042bcc7f6107438" }
+# The key file store, in bifrost's repo beside the identity it stores. No released rev carries it yet, so
+# this rev resolves only through the local path patch until the cascade publishes one.
+keystore = { git = "https://github.com/theia-hq/bifrost", rev = "7e2702af2c6b7a8986c60f492042bcc7f6107438" }
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "ed96225584372e22ddf3e0d92e1fdaacd886efd5" }
 # The handler contract, in-tree beside its only dispatcher. A path dep (not a git self-dep): the workspace
 # member resolves within this checkout, and the package stays separately pinnable by a consumer.
 tightbeam-handler = { path = "tightbeam-handler" }
@@ -50,7 +53,7 @@ zeroize = { version = "1", features = ["derive"] }
 # today only through feature unification via iroh, so a dependency bump could drop it and break the
 # test build. Every sibling repo using the paused clock declares it explicitly.
 tokio = { version = "1", features = ["test-util"] }
-bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "b295a7d2d23c2bafd70f7c3b5a93d9bb6810e174" }
+bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "7e2702af2c6b7a8986c60f492042bcc7f6107438" }
 
 [lints]
 workspace = true
