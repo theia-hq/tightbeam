@@ -615,13 +615,19 @@ mod tests {
         );
     }
 
-    /// A-2: a zero-consumer instant does NOT end a live session. With the pump parked on the source read (the
-    /// writer half held open, so the session is live), dropping the only cursor and reopening must hand out a
-    /// fresh cursor that receives the bytes written afterwards. Refusing on the bare zero count was the
-    /// kill switch: it turned one viewer leaving into a dead service for the node's lifetime. This is the
-    /// mechanism-level pin for the re-arm (`raw_stream.rs` pins the served `fifo:` path end to end).
+    /// The parked window, and the `closed` check that guards it: a consumer that leaves while the pump is
+    /// parked on the source read, followed by a new consumer BEFORE the pump wakes, does not end the
+    /// session. The new consumer attaches and receives the bytes written after it did. Refusing on the bare
+    /// zero count, rather than on `closed`, turned exactly this into a dead service. This pins that window
+    /// only; a zero-consumer instant the pump DOES observe still ends the session (the two pins below).
+    ///
+    /// The yields are the test. Without them the pump task is never polled between the open, the drop,
+    /// and the reopen, so the test would only ever see a pump that had not started. On this
+    /// single-threaded runtime the first yield runs the pump until it parks on the empty source, and the
+    /// second gives it every chance to notice the departure; it cannot, because it is parked on the
+    /// SOURCE, which is exactly the window the revival covers.
     #[tokio::test]
-    async fn a_zero_consumer_instant_does_not_end_a_live_lossy_session() {
+    async fn a_consumer_returning_while_the_pump_is_parked_revives_the_session() {
         use tokio::io::AsyncWriteExt as _;
 
         let body: &'static [u8] = b"bytes after the zero-consumer instant";
@@ -629,7 +635,9 @@ mod tests {
         let fanout = Fanout::new(Box::new(reader));
 
         let cursor = fanout.open().expect("a live source hands out a cursor");
+        tokio::task::yield_now().await; // the pump starts and parks on the empty source
         drop(cursor); // zero consumers while the pump is parked on the source read
+        tokio::task::yield_now().await; // the pump is still parked: nothing woke it
 
         let mut revived = fanout
             .open()
@@ -648,23 +656,285 @@ mod tests {
         );
     }
 
-    /// N1: the ring's byte ceiling is exact. `append` of a full ring plus one pump chunk leaves the buffer at
-    /// `RING_BYTES` with `base` advanced by the overflow, because the eviction runs BEFORE the extend. The old
-    /// extend-then-evict order peaked at `RING_BYTES + PUMP_CHUNK`.
+    /// CURRENT behaviour, pinned so it cannot change unnoticed: a consumer that leaves before the pump's
+    /// first poll ends the session. The pump checks for consumers before its first read, finds none,
+    /// drops the source, and closes, so the next `open` is refused. For a `stdin:` fan-out that is the
+    /// whole feed gone for good after one connection. Whether a non-rewindable source should instead keep
+    /// its pump running is an open decision; when it lands, this assertion flips with it.
+    #[tokio::test]
+    async fn a_consumer_leaving_before_the_pump_starts_ends_the_session() {
+        let (_writer, reader) = tokio::io::duplex(4096);
+        let fanout = Fanout::new(Box::new(reader));
+
+        let cursor = fanout.open().expect("a live source hands out a cursor");
+        drop(cursor); // gone before the pump was ever polled
+        tokio::task::yield_now().await; // the pump runs, finds no consumer, and closes
+        tokio::task::yield_now().await;
+        assert!(
+            fanout.open().is_none(),
+            "today a departure the pump sees before its first read ends the session"
+        );
+    }
+
+    /// CURRENT behaviour, the other half: a consumer that leaves while the pump is parked ends the session
+    /// as soon as the source produces its next byte, because the pump appends it, loops, and finds no
+    /// consumer. The source is still live, and a later `open` is refused anyway. Same open decision as the
+    /// pin above; this flips with it.
+    #[tokio::test]
+    async fn a_consumer_gone_when_the_next_byte_arrives_ends_the_session() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let fanout = Fanout::new(Box::new(reader));
+
+        let cursor = fanout.open().expect("a live source hands out a cursor");
+        tokio::task::yield_now().await; // the pump parks on the empty source
+        drop(cursor);
+        writer.write_all(b"x").await.expect("feed the live source");
+        tokio::task::yield_now().await; // the pump appends, loops, finds no consumer, and closes
+        tokio::task::yield_now().await;
+        assert!(
+            fanout.open().is_none(),
+            "today a departure the pump sees after a read ends the session, though the source is live"
+        );
+    }
+
+    /// The ring's byte ceiling, at the boundary rather than comfortably inside it. Filled the way the pump fills it
+    /// (one `PUMP_CHUNK` at a time), the ring holds EXACTLY `RING_BYTES` with nothing evicted; the very next
+    /// byte evicts exactly one; and a sustained stream past the ceiling never grows the buffer's
+    /// allocation beyond what the ceiling itself needed. The last assertion is the one that sees the
+    /// evict-first ORDER: extend-then-evict ends every append at `RING_BYTES` too, so length alone cannot tell the
+    /// two apart, but it has to grow the allocation to hold `RING_BYTES + PUMP_CHUNK` on the way.
     #[test]
-    fn ring_append_holds_the_byte_ceiling_exactly() {
+    fn the_ring_holds_exactly_its_ceiling_and_evicts_from_one_byte_past_it() {
         let mut ring = super::Ring::new();
-        let chunk = vec![7u8; super::RING_BYTES + super::PUMP_CHUNK];
-        ring.append(&chunk);
+        let chunk = vec![7u8; super::PUMP_CHUNK];
+        for _ in 0..super::RING_BYTES / super::PUMP_CHUNK {
+            ring.append(&chunk);
+        }
         assert_eq!(
             ring.buf.len(),
             super::RING_BYTES,
-            "the sustained ceiling is exactly RING_BYTES, not RING_BYTES + PUMP_CHUNK"
+            "the ring fills to its ceiling"
+        );
+        assert_eq!(
+            ring.base, 0,
+            "a ring filled exactly to its ceiling has evicted nothing"
+        );
+        let allocated_at_ceiling = ring.buf.capacity();
+        // The order assertion below is only as good as this: with no headroom at the ceiling, an
+        // extend-first append MUST reallocate. If `VecDeque`'s growth policy ever leaves headroom, this
+        // fails loudly instead of the order assertion going quietly green.
+        assert_eq!(
+            allocated_at_ceiling,
+            super::RING_BYTES,
+            "no headroom at the ceiling, so an extend-first append must reallocate"
+        );
+
+        ring.append(&[9u8]);
+        assert_eq!(
+            ring.buf.len(),
+            super::RING_BYTES,
+            "one byte past the ceiling keeps the ring at its ceiling"
+        );
+        assert_eq!(ring.base, 1, "one byte past the ceiling evicts exactly one");
+
+        for _ in 0..64 {
+            ring.append(&chunk);
+        }
+        assert_eq!(
+            ring.buf.len(),
+            super::RING_BYTES,
+            "a sustained stream holds the ceiling"
+        );
+        assert_eq!(
+            ring.buf.capacity(),
+            allocated_at_ceiling,
+            "evicting BEFORE extending never needs more room than the ceiling itself"
+        );
+    }
+
+    /// A host-log sink for the lag test: every line the subscriber formats lands in one shared buffer.
+    #[cfg(unix)]
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[cfg(unix)]
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let Self(lines) = self;
+            lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    impl Captured {
+        /// The `dropped_bytes` of every lag warning logged so far, in order.
+        fn lag_warnings(&self) -> Vec<String> {
+            let Self(lines) = self;
+            let lines = lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            String::from_utf8_lossy(&lines)
+                .lines()
+                .filter(|line| line.contains("lossy consumer lagged"))
+                .filter_map(|line| line.split("dropped_bytes=").nth(1).map(str::to_owned))
+                .collect()
+        }
+    }
+
+    /// Push `bytes` into the source and wait until the pump has appended all of them, so the ring's state
+    /// is exactly what the test produced before the cursor looks at it.
+    async fn produce(
+        writer: &mut tokio::io::DuplexStream,
+        fanout: &Fanout,
+        bytes: usize,
+        head: &mut u64,
+    ) {
+        use tokio::io::AsyncWriteExt as _;
+        let body: Vec<u8> = (*head..*head + bytes as u64)
+            .map(|offset| (offset % 251) as u8)
+            .collect();
+        writer.write_all(&body).await.expect("feed the source");
+        *head += bytes as u64;
+        let Fanout(shared) = fanout;
+        while shared
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .head()
+            != *head
+        {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The consumer-visible side of the ceiling, and the one-warn-per-lapse log. A viewer parked while
+    /// exactly `RING_BYTES` are produced loses nothing; one byte more and it loses exactly that one byte
+    /// (the next thing it reads is offset 1), with one warning carrying the count. Lapped AGAIN before it
+    /// catches up, it is still in the same episode and logs nothing more; once it reaches the live edge the
+    /// episode is over, and the next lap is a new one with its own warning. The source bytes encode their
+    /// own offset, so what was dropped is read off the data, not inferred.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_viewer_loses_nothing_at_the_ceiling_and_one_byte_past_it_logs_one_lapse() {
+        let log = Captured::default();
+        let sink = log.clone();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || sink.clone())
+                .finish(),
+        );
+
+        // Bounded as a whole: a ceiling off by one parks a read forever, and that must fail, not hang.
+        let run = async {
+            // Exactly at the ceiling: the parked viewer reads every byte from offset 0.
+            let (mut writer, reader) = tokio::io::duplex(super::PUMP_CHUNK);
+            let fanout = Fanout::new(Box::new(reader));
+            let mut viewer = fanout.open().expect("a live source hands out a cursor");
+            let mut head = 0;
+            produce(&mut writer, &fanout, super::RING_BYTES, &mut head).await;
+            let mut all = vec![0u8; super::RING_BYTES];
+            viewer
+                .read_exact(&mut all)
+                .await
+                .expect("read the full ring");
+            assert_eq!(all[0], 0, "a viewer exactly one ring behind loses nothing");
+            assert!(
+                log.lag_warnings().is_empty(),
+                "no bytes were dropped, so nothing is logged"
+            );
+
+            // One byte past the ceiling, on a fresh session: exactly the first byte is gone, and it is logged.
+            let (mut writer, reader) = tokio::io::duplex(super::PUMP_CHUNK);
+            let fanout = Fanout::new(Box::new(reader));
+            let mut viewer = fanout.open().expect("a live source hands out a cursor");
+            let mut head = 0;
+            produce(&mut writer, &fanout, super::RING_BYTES + 1, &mut head).await;
+            let mut some = [0u8; 10];
+            viewer
+                .read_exact(&mut some)
+                .await
+                .expect("read past the lapse");
+            assert_eq!(
+                some[0], 1,
+                "one byte past the ceiling drops exactly offset 0"
+            );
+            assert_eq!(
+                log.lag_warnings(),
+                ["1"],
+                "the lapse is logged once, with its count"
+            );
+
+            // Lapped again before catching up: the same episode, so no second line.
+            produce(&mut writer, &fanout, 100, &mut head).await;
+            viewer
+                .read_exact(&mut some)
+                .await
+                .expect("read past the second lap");
+            assert_eq!(
+                log.lag_warnings(),
+                ["1"],
+                "one episode logs once, however often it is lapped"
+            );
+
+            // Catch up to the live edge, ending the episode; the next lap is a new one.
+            let behind = usize::try_from(head).expect("fits") - 111;
+            let mut rest = vec![0u8; behind];
+            viewer
+                .read_exact(&mut rest)
+                .await
+                .expect("catch up to the live edge");
+            produce(&mut writer, &fanout, super::RING_BYTES + 5, &mut head).await;
+            viewer
+                .read_exact(&mut some)
+                .await
+                .expect("read past the new lapse");
+            assert_eq!(
+                log.lag_warnings(),
+                ["1", "5"],
+                "a viewer that caught up and was lapped again starts a new episode"
+            );
+        };
+        tokio::time::timeout(core::time::Duration::from_secs(30), run)
+            .await
+            .expect("every read and every append completes; a hang here is a broken ceiling");
+    }
+
+    /// An append larger than the whole ring keeps only its NEWEST `RING_BYTES`, and the prefix it could
+    /// never hold still advances `base`, so `buf[0]` stays the byte at absolute offset `base`. This pins
+    /// the oversized-append trim, not the evict-first order (length and base end the same either way; the
+    /// order is pinned by the capacity assertion in the ring-edge test above).
+    #[test]
+    fn an_append_larger_than_the_ring_keeps_its_newest_bytes() {
+        let mut ring = super::Ring::new();
+        let total = super::RING_BYTES + super::PUMP_CHUNK;
+        let bytes: Vec<u8> = (0..total).map(|offset| (offset % 251) as u8).collect();
+        ring.append(&bytes);
+        assert_eq!(
+            ring.buf.len(),
+            super::RING_BYTES,
+            "an oversized append is trimmed to the ring"
         );
         assert_eq!(
             ring.base,
             super::PUMP_CHUNK as u64,
-            "the evicted overflow is the leading bytes, so base advances by exactly the overflow"
+            "the prefix the ring could not hold advances base by exactly its length"
+        );
+        assert_eq!(
+            ring.buf.front().copied(),
+            Some((super::PUMP_CHUNK % 251) as u8),
+            "the ring keeps the NEWEST bytes, so its front is the byte at offset base"
         );
     }
 }

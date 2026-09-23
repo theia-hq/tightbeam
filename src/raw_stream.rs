@@ -128,7 +128,10 @@ impl Stdin {
 /// consumer) because a `fifo:` open is async and fallible and must not run until someone actually connects;
 /// the [`Opener`] is what to open. Once opened, the [`Fanout`] is memoized, so every later consumer attaches
 /// to the SAME ring. A `fifo:` session that ends (its pump exited) re-arms for the next consumer, matching
-/// plain `fifo:` re-open-per-dial; a `stdin:` session is one session, ever (fd 0 cannot rewind). The
+/// plain `fifo:` re-open-per-dial; a `stdin:` session is one session, ever (fd 0 cannot rewind). And a
+/// session ends not only at EOF: the pump stops once it finds no consumer attached (before its first read,
+/// or after any read), so for `stdin:` one viewer that connects and leaves can end the feed for every
+/// later viewer until the process restarts, and on a public route that viewer can be any stranger. The
 /// lazy-open transition is behind a `tokio::sync::Mutex` so "first consumer opens, the rest attach" is a
 /// single critical section; the banner-facing [`RawSource`] is recorded ALONGSIDE it at construction so a
 /// manifest read needs no async lock (and stays valid after the opener is taken).

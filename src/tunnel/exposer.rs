@@ -56,8 +56,32 @@ const PUBLIC_SESSION_PERMITS: usize = 32;
 
 /// The maximum number of concurrent public streams, taken at the public-admit seam. Single
 /// digits because one public stream is already a stranger's whole session of work; 4 bounds the aggregate
-/// public drain to four in-flight streams while leaving room for a handful of honest dials. Over the cap
-/// REFUSES (never queues): queuing would park one stranger's stream behind another's.
+/// public drain to four in-flight streams. Over the cap REFUSES (never queues: queuing would park one
+/// stranger's stream behind another's), before any `Response::Ok` and with the same answer a gate miss
+/// gets, so a full pool reads exactly like a service that is not there.
+///
+/// What four slots do NOT bound, written here because this is the whole of what the public path can be
+/// made to do:
+///
+/// - The slots are node-wide and service-blind. One public broadcast with four viewers holds all of them
+///   and every other public service refuses until one ends: the room for honest dials is room across
+///   time, never across services.
+/// - A slot is held for its stream's whole life, busy or idle. A handler stream silent both ways is
+///   dropped by the first-traffic deadline, but a raw stream has none, so four idle raw streams on any
+///   public service hold the pool for as long as they stay connected.
+/// - A raw stream's slot returns when its splice ends, and the splice ends when a write to the viewer
+///   fails or a read from it errors (a reset or a lost connection), so a viewer that simply goes away is
+///   noticed at once. A viewer that closed its own send half BEFORE it left reads as a clean EOF, which
+///   the splice waits past: that one is noticed only at the next write, so on an idle source it keeps
+///   its slot until the source speaks again or ends. (The in-process tests reach only the second case;
+///   their pipes report a vanished peer as EOF, never as the error a real transport returns.)
+/// - Raw streams served through the unsafe overlay and every public `+lossy` viewer draw these same four
+///   slots.
+///   [`RAW_STREAM_OPEN_PERMITS`] is no second bound on them: it covers an open in flight, never a splice.
+/// - The session slots beside this pool are activity-independent (see [`PUBLIC_SESSION_PERMITS`]).
+///
+/// Not per peer (a stranger mints identities for free, so a per-peer cap bounds nobody) and not a
+/// lifetime (that would cut every long-lived public handler to catch the idle ones).
 pub(super) const PUBLIC_STREAM_PERMITS: usize = 4;
 
 /// An exposer: the proven services to publish and the gate that decides who may reach them. Accepts overlay
