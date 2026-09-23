@@ -21,12 +21,13 @@
 use core::future::Future;
 use core::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use bifrost::Node;
 use bifrost_iroh::Endpoint;
 use clap::{CommandFactory, Parser, Subcommand};
-use nauthy::FileDenylist;
-use tightbeam::config::{load_signet, revoked_path};
+use nauthy::{DisabledRoots, FileDenylist, Latch};
+use tightbeam::config::{disabled_roots_path, load_signet, revoked_path};
 use tightbeam::identity::{self, Secret};
 use tightbeam::peer::{Discovery, Peer};
 
@@ -129,9 +130,14 @@ async fn run() -> eyre::Result<()> {
         Command::Expose(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
             let signet = load_signet().await?;
-            // Load tightbeam's own denylist here in the adapter and pass it as a value; the core takes the
-            // loaded list, never a path (the same interface any richer consumer drives on its own store).
-            let denylist = FileDenylist::load(revoked_path()?).await?;
+            // Load tightbeam's own denylist and disabled roots here in the adapter and pass them as one
+            // composed value; the core takes the loaded store, never a path (the same interface any richer
+            // consumer drives on its own store). Shared, because the gate and the live cut must read the
+            // one instance.
+            let revocations = Arc::new(Latch::new(
+                DisabledRoots::load(disabled_roots_path()?).await?,
+                FileDenylist::load(revoked_path()?).await?,
+            ));
             let node = bind_node(
                 secret,
                 cli.peer,
@@ -140,7 +146,7 @@ async fn run() -> eyre::Result<()> {
                 BindRole::Serving,
             )
             .await?;
-            let outcome = run_until_signalled(cmd.run(&node, signet, denylist)).await;
+            let outcome = run_until_signalled(cmd.run(&node, signet, revocations)).await;
             node.close().await;
             outcome
         }

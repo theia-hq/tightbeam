@@ -18,6 +18,7 @@ pub use tokio_util::sync::CancellationToken;
 
 use super::admit::serve_request;
 use super::catalog::Posture;
+use super::cut::{self, Cuts, LiveCuts};
 use super::router::{
     ManifestEntry, PublicRequest, PublicServices, PublicUnsafeRequest, Services, Target,
 };
@@ -110,6 +111,10 @@ pub struct Exposer {
     /// [`with_enabled`](Exposer::with_enabled). Boxed like the gate's own [`Revocations`](nauthy::Revocations)
     /// store, so a consumer may plug any oracle over its own state.
     enabled: Box<dyn EnabledServices + Send + Sync>,
+    /// The live cut oracle, or `None` until a caller wires one with
+    /// [`with_live_cuts`](Exposer::with_live_cuts). `None` arms nothing: no sweep timer, no subscription, and
+    /// every session ends exactly as it always has.
+    cuts: Option<Box<dyn LiveCuts>>,
 }
 
 impl Exposer {
@@ -217,6 +222,7 @@ impl Exposer {
             // Nothing is disabled until a caller wires a real oracle. Live enable/disable is the deliberate
             // `with_enabled` opt-in below.
             enabled: Box::new(AllEnabled),
+            cuts: None,
         })
     }
 
@@ -232,6 +238,19 @@ impl Exposer {
     /// never more exposed than the launch set. That is why it needs no interlock against the unsafe overlay.
     pub fn with_enabled(mut self, enabled: impl EnabledServices + Send + Sync + 'static) -> Self {
         self.enabled = Box::new(enabled);
+        self
+    }
+
+    /// Wire the live cut: every live session is re-checked against `cuts` once per sweep, and one admitted
+    /// on a capability since revoked, or rooted at a key since disabled, ends itself. Without it a recall
+    /// refuses only the next stream, and a session already open runs on until its peer leaves.
+    ///
+    /// Pass the same instance the gate was resolved over (an `Arc` of it serves both), so admission and
+    /// the cut read one store and cannot disagree. Nothing here checks that: an oracle over a different
+    /// store cuts on that store's answers, not the gate's. Like [`with_enabled`](Exposer::with_enabled) it can only
+    /// take service away, never grant it, so it needs no interlock.
+    pub fn with_live_cuts(mut self, cuts: impl LiveCuts + 'static) -> Self {
+        self.cuts = Some(Box::new(cuts));
         self
     }
 
@@ -340,6 +359,7 @@ impl Exposer {
             public,
             public_unsafe,
             enabled,
+            cuts,
         } = self;
         // Cap concurrent raw-stream opens across the whole node (all sessions share this one semaphore) as
         // cheap defense-in-depth: the nonblocking open cannot park a thread, so this bounds the fds held
@@ -356,7 +376,10 @@ impl Exposer {
             raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
             public_pool: PublicPool::new(),
             enabled,
+            cuts: cuts.map(Cuts::new),
         });
+        // The one sweep timer, only when a cut is wired: an exposer without one arms nothing.
+        let mut sweep = serving.cuts.as_ref().map(|_| Cuts::interval());
         let mut sessions = FuturesUnordered::new();
         loop {
             tokio::select! {
@@ -384,6 +407,13 @@ impl Exposer {
                         tracing::warn!(%error, "session ended");
                     }
                 }
+                // Wake every live session to re-check itself. The run loop decides nothing here; each
+                // session asks about its own chains and ends itself, so this arm is one O(1) signal.
+                () = cut::tick(&mut sweep) => {
+                    if let Some(cuts) = &serving.cuts {
+                        cuts.sweep();
+                    }
+                }
             }
         }
     }
@@ -406,6 +436,8 @@ pub(super) struct Serving {
     /// The live enable/disable oracle, consulted per stream at admission, beside the gate: a
     /// disabled service is refused with the same indistinguishable refusal a gate miss gives.
     pub(super) enabled: Box<dyn EnabledServices + Send + Sync>,
+    /// The live cut, `None` when no caller wired one, and then no session subscribes or re-checks.
+    pub(super) cuts: Option<Cuts>,
 }
 
 /// The node's public-path capacity: the two permit pools that bound what strangers can
@@ -492,6 +524,8 @@ where
     // The per-session half of the public cap: created empty, classified by the first stream
     // that reaches an opened service, and dropped with the session (which releases its permit, if any).
     let public_session = Arc::new(PublicSession::default());
+    // This session's half of the live cut, owned by this frame alone: `None` when no cut is wired.
+    let mut cut = serving.cuts.as_ref().map(Cuts::watch);
     let mut pipes = FuturesUnordered::new();
     // Stop accepting new streams once `accept_bi` errors (the session is closing): drain the in-flight
     // pipes rather than reaping them with `?`, the same courtesy `connect` gives its local listener.
@@ -509,6 +543,7 @@ where
                         reader,
                         Arc::clone(&serving),
                         Arc::clone(&public_session),
+                        cut.as_ref().map(cut::SessionCut::chains),
                     )),
                     Err(error) => {
                         tracing::warn!(%peer, %error, "accept_bi failed; draining in-flight streams");
@@ -519,6 +554,27 @@ where
             Some(result) = pipes.next(), if !pipes.is_empty() => {
                 if let Err(error) = result {
                     tracing::warn!(%error, "pipe ended");
+                }
+            }
+            // The live cut: on a sweep, re-ask about the chains this session was admitted on, and end it
+            // if any was recalled. Returning drops the session and every stream on it.
+            //
+            // Guarded by the same liveness the two arms above share. A sweep arm left enabled would keep
+            // this select from ever reaching `else`, so a session whose peer left and whose streams drained
+            // would park until the next tick, and the next, forever, holding its `MAX_SESSIONS` slot; enough
+            // connect-and-close cycles would stop the node accepting at all.
+            true = cut::swept(&mut cut), if accepting || !pipes.is_empty() => {
+                if let (Some(cuts), Some(cut)) = (&serving.cuts, &cut)
+                    && cuts.cuts(cut)
+                {
+                    // Close, not just drop: a stream a handler handed to a detached task can hold a
+                    // connection open past the session value, and a cut must end the peer's reach.
+                    session.close();
+                    tracing::warn!(
+                        %peer,
+                        "session cut: a capability it was admitted on is revoked or its root disabled"
+                    );
+                    return Ok(());
                 }
             }
             // No more streams to accept and none in flight: the session is done.
