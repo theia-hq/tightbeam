@@ -19,12 +19,13 @@
 //!   the lag is NEVER injected in-band (that would corrupt the exact-content case): the consumer sees a
 //!   silent discontinuity on the wire, and the host log gets one `warn` per lag episode carrying the
 //!   dropped-byte count (never one per read).
-//! - **Lazy-open on first consumer, shared while >=1, close on the last leaving.** The pump starts when the
-//!   first cursor is handed out and stops when the last cursor drops (the source reader is dropped with it).
-//!   The reader is dropped BEFORE the ring is marked closed, so a session that ended can be re-armed without
-//!   ever having two readers of one source: a `fifo:` fan-out serves the next consumer from a fresh open
-//!   (plain `fifo:` semantics), while a `stdin:` fan-out is one non-rewindable session, ever. A late joiner
-//!   attaches at the live edge, it does not replay history.
+//! - **Lazy-open on first consumer, then a lifetime the caller chose.** The pump starts when the first
+//!   cursor is handed out. A [`Lifetime::WhileWatched`] pump stops when the last cursor drops (the source
+//!   reader is dropped with it); a [`Lifetime::UntilEof`] pump runs to end of input however many viewers
+//!   come and go. The reader is dropped BEFORE the ring is marked closed, so a session that ended can be
+//!   re-armed without ever having two readers of one source: a `fifo:` fan-out serves the next consumer from
+//!   a fresh open (plain `fifo:` semantics), while a `stdin:` fan-out is one non-rewindable session, ever.
+//!   A late joiner attaches at the live edge, it does not replay history.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -54,8 +55,8 @@ const RING_BYTES: usize = 1 << 20;
 /// granularity from the source reader into the ring.
 const PUMP_CHUNK: usize = 64 * 1024;
 
-/// A `+lossy` fan-out over one source: lazy-opens the source on the first consumer, shares one bounded ring
-/// while at least one consumer is attached, and closes on the last leaving. Cheap to clone (an `Arc` to the
+/// A `+lossy` fan-out over one source: lazy-opens the source on the first consumer, shares one bounded ring,
+/// and stops when its [`Lifetime`] says. Cheap to clone (an `Arc` to the
 /// shared state); `RawStream` holds one and hands each `open()` a fresh [`Cursor`] reader.
 #[derive(Clone)]
 pub(crate) struct Fanout(Arc<Shared>);
@@ -64,6 +65,19 @@ impl core::fmt::Debug for Fanout {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Fanout").finish_non_exhaustive()
     }
+}
+
+/// When a fan-out's pump lets go of its source.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Lifetime {
+    /// At end of input only, whether or not anyone is watching. For a source that cannot be re-opened (fd
+    /// 0): letting go of it frees nothing, and ends the feed for every viewer after. The memory is the same
+    /// either way, one ring plus one pump chunk, however many viewers attach.
+    UntilEof,
+    /// Once no consumer is attached, as well as at end of input. For a source the next session re-opens (a
+    /// FIFO), where holding the reader with nobody watching would leave a second reader splitting the
+    /// FIFO's bytes when the next session opens it.
+    WhileWatched,
 }
 
 /// The state shared by every consumer of one fan-out source: the ring itself, a notifier that wakes parked
@@ -78,14 +92,27 @@ struct Shared {
 }
 
 /// The lifecycle half of the shared state: the not-yet-taken source reader (moved out when the pump starts)
-/// and the count of live cursors, which drives lazy-open (0 -> 1 starts the pump) and close-on-last (1 -> 0
-/// drops the source).
+/// and the count of live cursors, which drives lazy-open (0 -> 1 starts the pump) and, for a
+/// [`Lifetime::WhileWatched`] pump, close-on-last (1 -> 0 drops the source).
 struct Life {
     /// The source reader, taken by the first consumer to start the pump. `None` once the pump owns it, and
     /// never put back: one [`Fanout`] is one session (the caller's `fifo:` re-arm builds a fresh `Fanout`).
     source: Option<BoxRead>,
-    /// How many cursors are attached. The pump runs while this is >= 1 and stops when it reaches 0.
+    /// How many cursors are attached. A [`Lifetime::WhileWatched`] pump stops when this reaches 0.
     consumers: usize,
+    /// When the pump lets go of the source.
+    lifetime: Lifetime,
+}
+
+impl Life {
+    /// Whether the pump should let go of the source now: only a [`Lifetime::WhileWatched`] pump, and only
+    /// with no consumer attached.
+    fn released(&self) -> bool {
+        match self.lifetime {
+            Lifetime::UntilEof => false,
+            Lifetime::WhileWatched => self.consumers == 0,
+        }
+    }
 }
 
 /// One consumer's independent view of the ring: an absolute byte position that only ever advances (either by
@@ -157,15 +184,16 @@ impl Ring {
 }
 
 impl Fanout {
-    /// Arm a fan-out over `source`. The source is NOT opened here: it is held until the first [`Fanout::open`]
-    /// hands out a cursor, matching the "lazy-open on the first consumer" lifecycle.
-    pub(crate) fn new(source: BoxRead) -> Self {
+    /// Arm a fan-out over `source`, pumped for `lifetime`. The source is NOT opened here: it is held until
+    /// the first [`Fanout::open`] hands out a cursor, matching the "lazy-open on the first consumer" lifecycle.
+    pub(crate) fn new(source: BoxRead, lifetime: Lifetime) -> Self {
         Self(Arc::new(Shared {
             ring: Mutex::new(Ring::new()),
             wake: Notify::new(),
             life: Mutex::new(Life {
                 source: Some(source),
                 consumers: 0,
+                lifetime,
             }),
         }))
     }
@@ -217,18 +245,19 @@ impl Fanout {
 
 /// Start the pump: copy the source into the shared ring until EOF or error, waking parked cursors on every
 /// append and once at close. The pump NEVER waits on a consumer, so a slow or silent consumer cannot stall
-/// it; it stops the moment the source ends (or the last consumer left, checked each iteration).
+/// it; it stops the moment the source ends, or, for a [`Lifetime::WhileWatched`] pump, once the last
+/// consumer has left (checked each iteration).
 fn spawn_pump(shared: Arc<Shared>, mut source: BoxRead) {
     tokio::spawn(async move {
         let mut chunk = vec![0u8; PUMP_CHUNK];
         loop {
-            // Stop early if every consumer has left: close-on-last, so the source reader is dropped here.
+            // Close-on-last, for a pump that lets go once nobody watches: the source reader is dropped
+            // here. An until-EOF pump keeps reading into the ring with nobody attached.
             if shared
                 .life
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .consumers
-                == 0
+                .released()
             {
                 break;
             }
@@ -274,8 +303,8 @@ impl Drop for Cursor {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         life.consumers = life.consumers.saturating_sub(1);
-        // Close-on-last is enforced by the pump, which re-checks this count at the top of each iteration and
-        // stops at 0. No wake is needed (or possible) here: the pump is parked on the SOURCE read, not on
+        // Close-on-last, where the lifetime asks for it, is enforced by the pump, which re-checks this count
+        // at the top of each iteration and stops at 0. No wake is needed (or possible) here: the pump is parked on the SOURCE read, not on
         // `wake`, so it observes the departure after its current read returns (the next byte, or the source's
         // own close), then drops the source. `source` is never put back: a `stdin:` session is non-rewindable.
     }
@@ -394,7 +423,7 @@ mod tests {
 
     use tokio::io::{AsyncRead, AsyncReadExt as _, ReadBuf};
 
-    use super::Fanout;
+    use super::{Fanout, Lifetime};
 
     /// An `AsyncRead` that delivers a fixed total of bytes, pausing once per `window` bytes emitted, so a test
     /// can pace a source: a consumer that drains a window within the pause stays inside the ring, one that
@@ -461,7 +490,7 @@ mod tests {
     #[tokio::test]
     async fn fans_out_to_many_consumers_each_receiving_the_bytes() {
         let body: &'static [u8] = b"broadcast these bytes to every consumer of the lossy source";
-        let fanout = Fanout::new(Box::new(body));
+        let fanout = Fanout::new(Box::new(body), Lifetime::UntilEof);
 
         // Open several cursors, then read each to EOF. The pump starts on the first open and closes on EOF.
         let mut cursors = Vec::new();
@@ -501,7 +530,7 @@ mod tests {
             CHUNKS,
             core::time::Duration::from_millis(15),
         );
-        let fanout = Fanout::new(Box::new(paced));
+        let fanout = Fanout::new(Box::new(paced), Lifetime::UntilEof);
 
         let mut fast = fanout.open().expect("fast cursor");
         let mut slow = fanout.open().expect("slow cursor");
@@ -567,7 +596,7 @@ mod tests {
             WINDOWS,
             core::time::Duration::from_millis(15),
         );
-        let fanout = Fanout::new(Box::new(paced));
+        let fanout = Fanout::new(Box::new(paced), Lifetime::UntilEof);
 
         // A silent consumer: opens, then never reads. It holds a cursor for the whole run but drains nothing.
         let _silent = fanout.open().expect("silent cursor");
@@ -599,7 +628,7 @@ mod tests {
     #[tokio::test]
     async fn a_finished_session_hands_out_no_more_cursors() {
         let body: &'static [u8] = b"one live session";
-        let fanout = Fanout::new(Box::new(body));
+        let fanout = Fanout::new(Box::new(body), Lifetime::UntilEof);
 
         let mut cursor = fanout.open().expect("first cursor");
         let mut got = Vec::new();
@@ -619,7 +648,8 @@ mod tests {
     /// parked on the source read, followed by a new consumer BEFORE the pump wakes, does not end the
     /// session. The new consumer attaches and receives the bytes written after it did. Refusing on the bare
     /// zero count, rather than on `closed`, turned exactly this into a dead service. This pins that window
-    /// only; a zero-consumer instant the pump DOES observe still ends the session (the two pins below).
+    /// only; on a `fifo:`-shaped pump a zero-consumer instant the pump DOES observe still ends the session
+    /// (the two `fifo` pins below).
     ///
     /// The yields are the test. Without them the pump task is never polled between the open, the drop,
     /// and the reopen, so the test would only ever see a pump that had not started. On this
@@ -632,7 +662,7 @@ mod tests {
 
         let body: &'static [u8] = b"bytes after the zero-consumer instant";
         let (mut writer, reader) = tokio::io::duplex(4096);
-        let fanout = Fanout::new(Box::new(reader));
+        let fanout = Fanout::new(Box::new(reader), Lifetime::WhileWatched);
 
         let cursor = fanout.open().expect("a live source hands out a cursor");
         tokio::task::yield_now().await; // the pump starts and parks on the empty source
@@ -656,15 +686,13 @@ mod tests {
         );
     }
 
-    /// CURRENT behaviour, pinned so it cannot change unnoticed: a consumer that leaves before the pump's
-    /// first poll ends the session. The pump checks for consumers before its first read, finds none,
-    /// drops the source, and closes, so the next `open` is refused. For a `stdin:` fan-out that is the
-    /// whole feed gone for good after one connection. Whether a non-rewindable source should instead keep
-    /// its pump running is an open decision; when it lands, this assertion flips with it.
+    /// A `fifo:`-shaped pump lets go once nobody watches, before its first read: a consumer that leaves
+    /// before the pump's first poll ends the session, so the next `open` is refused and the caller re-opens
+    /// the path. Holding the reader here would leave it splitting the FIFO with the next session's reader.
     #[tokio::test]
-    async fn a_consumer_leaving_before_the_pump_starts_ends_the_session() {
+    async fn a_fifo_pump_lets_go_when_its_viewer_leaves_before_the_first_read() {
         let (_writer, reader) = tokio::io::duplex(4096);
-        let fanout = Fanout::new(Box::new(reader));
+        let fanout = Fanout::new(Box::new(reader), Lifetime::WhileWatched);
 
         let cursor = fanout.open().expect("a live source hands out a cursor");
         drop(cursor); // gone before the pump was ever polled
@@ -672,20 +700,19 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(
             fanout.open().is_none(),
-            "today a departure the pump sees before its first read ends the session"
+            "a fifo pump with no viewer lets go of its source, so the next session re-opens it"
         );
     }
 
-    /// CURRENT behaviour, the other half: a consumer that leaves while the pump is parked ends the session
-    /// as soon as the source produces its next byte, because the pump appends it, loops, and finds no
-    /// consumer. The source is still live, and a later `open` is refused anyway. Same open decision as the
-    /// pin above; this flips with it.
+    /// The other half for `fifo:`: a consumer that leaves while the pump is parked ends the session as
+    /// soon as the source produces its next byte, because the pump appends it, loops, and finds no
+    /// consumer.
     #[tokio::test]
-    async fn a_consumer_gone_when_the_next_byte_arrives_ends_the_session() {
+    async fn a_fifo_pump_lets_go_at_the_next_byte_after_its_viewer_left() {
         use tokio::io::AsyncWriteExt as _;
 
         let (mut writer, reader) = tokio::io::duplex(4096);
-        let fanout = Fanout::new(Box::new(reader));
+        let fanout = Fanout::new(Box::new(reader), Lifetime::WhileWatched);
 
         let cursor = fanout.open().expect("a live source hands out a cursor");
         tokio::task::yield_now().await; // the pump parks on the empty source
@@ -695,7 +722,75 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(
             fanout.open().is_none(),
-            "today a departure the pump sees after a read ends the session, though the source is live"
+            "a fifo pump lets go once it sees nobody watching"
+        );
+    }
+
+    /// A `stdin:`-shaped pump runs to end of input: a viewer that leaves before the pump's first poll, and
+    /// a byte the source writes with nobody watching, do not end the session. The next viewer attaches and
+    /// reads what the source writes after it did.
+    #[tokio::test]
+    async fn a_stdin_pump_outlives_a_viewer_that_left_before_the_first_read() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let fanout = Fanout::new(Box::new(reader), Lifetime::UntilEof);
+
+        let cursor = fanout.open().expect("a live source hands out a cursor");
+        drop(cursor); // gone before the pump was ever polled
+        tokio::task::yield_now().await; // the pump runs with nobody attached
+        writer
+            .write_all(b"unwatched")
+            .await
+            .expect("feed the source with nobody watching");
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let mut next = fanout
+            .open()
+            .expect("a stdin pump is still running, so the next viewer attaches");
+        let body: &'static [u8] = b"bytes for the next viewer";
+        writer.write_all(body).await.expect("feed the source");
+        drop(writer);
+        let mut got = Vec::new();
+        next.read_to_end(&mut got)
+            .await
+            .expect("read the live session");
+        assert_eq!(
+            got, body,
+            "the next viewer reads from the live edge it attached at"
+        );
+    }
+
+    /// The other half for `stdin:`: a viewer that leaves while the pump is parked, then a byte from the
+    /// source, does not end the session.
+    #[tokio::test]
+    async fn a_stdin_pump_outlives_a_viewer_gone_when_the_next_byte_arrives() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let fanout = Fanout::new(Box::new(reader), Lifetime::UntilEof);
+
+        let cursor = fanout.open().expect("a live source hands out a cursor");
+        tokio::task::yield_now().await; // the pump parks on the empty source
+        drop(cursor);
+        writer.write_all(b"x").await.expect("feed the live source");
+        tokio::task::yield_now().await; // the pump appends and loops with nobody attached
+        tokio::task::yield_now().await;
+
+        let mut next = fanout
+            .open()
+            .expect("a stdin pump is still running, so the next viewer attaches");
+        let body: &'static [u8] = b"after the unwatched byte";
+        writer.write_all(body).await.expect("feed the source");
+        drop(writer);
+        let mut got = Vec::new();
+        next.read_to_end(&mut got)
+            .await
+            .expect("read the live session");
+        assert_eq!(
+            got, body,
+            "the next viewer reads from the live edge it attached at"
         );
     }
 
@@ -840,7 +935,7 @@ mod tests {
         let run = async {
             // Exactly at the ceiling: the parked viewer reads every byte from offset 0.
             let (mut writer, reader) = tokio::io::duplex(super::PUMP_CHUNK);
-            let fanout = Fanout::new(Box::new(reader));
+            let fanout = Fanout::new(Box::new(reader), Lifetime::UntilEof);
             let mut viewer = fanout.open().expect("a live source hands out a cursor");
             let mut head = 0;
             produce(&mut writer, &fanout, super::RING_BYTES, &mut head).await;
@@ -857,7 +952,7 @@ mod tests {
 
             // One byte past the ceiling, on a fresh session: exactly the first byte is gone, and it is logged.
             let (mut writer, reader) = tokio::io::duplex(super::PUMP_CHUNK);
-            let fanout = Fanout::new(Box::new(reader));
+            let fanout = Fanout::new(Box::new(reader), Lifetime::UntilEof);
             let mut viewer = fanout.open().expect("a live source hands out a cursor");
             let mut head = 0;
             produce(&mut writer, &fanout, super::RING_BYTES + 1, &mut head).await;

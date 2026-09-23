@@ -15,7 +15,7 @@ use core::time::Duration;
 // contract without taking this crate's tree. The erased bridge is imported, not re-exported: `Target` stores
 // it privately and it is not part of the author-facing surface.
 pub use tightbeam_handler::{
-    BoxRead, BoxWrite, Handler, Metering, RootedAdmitted, ServeError, Served,
+    BoxRead, BoxWrite, Handler, Metering, RootedAdmitted, Serve, ServeError, Served,
 };
 use tokio::io;
 use tokio::net::TcpStream;
@@ -25,6 +25,7 @@ use crate::splice;
 mod admit;
 mod catalog;
 mod connector;
+mod cut;
 mod exposer;
 mod router;
 
@@ -34,6 +35,7 @@ mod fixtures;
 pub use admit::resolve_gate;
 pub use catalog::{CatalogTooLarge, MAX_CATALOG_BLOB, Posture, ServiceCatalog, ServiceEntry};
 pub use connector::{Connector, DialRefused, PortForward, PresentingConnector, ServiceSession};
+pub use cut::{AdmittedChains, LiveCuts};
 pub use exposer::{CancellationToken, Exposer};
 pub use router::{ManifestEntry, RawSource, Router, TARGET_SCHEMES, TargetKind};
 
@@ -43,7 +45,8 @@ pub use router::{ManifestEntry, RawSource, Router, TARGET_SCHEMES, TargetKind};
 /// (a writer connecting/writing) bounded by this timeout; on elapse the fd is dropped (cheap, no parked thread)
 /// and the stream is refused, one layer deeper than the pre-gate
 /// [`REQUEST_READ_TIMEOUT`](admit::REQUEST_READ_TIMEOUT) (which has already elapsed by the time a target
-/// is dialed). A regular-file open has no writer to wait for and is not bounded by this.
+/// is dialed). A regular-file open has no writer to wait for and is not bounded by this. It also bounds a
+/// dialer waiting for a `stdin:` seat it has just taken from a stalled holder.
 ///
 /// It sits at the tunnel root because it bounds a raw-stream OPEN, which [`crate::raw_stream`] performs:
 /// no one submodule here owns it.

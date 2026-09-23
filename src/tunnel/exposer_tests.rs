@@ -545,11 +545,12 @@ fn an_exposer_refuses_a_public_stdin() {
 }
 
 /// The full served path: an exposer over a `stdin:`-shaped source, a connector reaching it over the
-/// in-process transport, and the peer receiving the source's EXACT bytes. Drives the same take-once +
-/// `Target::RawStream` splice the served path uses, with an injected reader in place of the real fd 0. A second
-/// concurrent connection finds the source taken and is refused cleanly (not a corrupted second read).
+/// in-process transport, and the peer receiving the source's EXACT bytes. Drives the same seat +
+/// `Target::RawStream` splice the served path uses, with an injected reader in place of the real fd 0. Once
+/// that peer has read to end of input and left, the next is refused with the end, never handed an empty
+/// stream.
 #[tokio::test]
-async fn a_stdin_source_is_served_to_the_peer_and_a_second_reader_is_refused() {
+async fn a_stdin_source_is_served_to_the_peer_and_after_its_end_the_next_is_refused() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -563,13 +564,14 @@ async fn a_stdin_source_is_served_to_the_peer_and_a_second_reader_is_refused() {
             // Drive the SERVE path directly. `Exposer::new`'s public-gate refusal for a raw-stream source
             // is covered separately (`an_exposer_refuses_a_public_stdin`); here we construct the exposer
             // past that door so the open gate keeps the peer admitted with no token, and the test isolates
-            // the take-once + splice path a `stdin:` source runs.
+            // the seat + splice path a `stdin:` source runs.
             let exposer = Exposer {
                 services,
                 gate: Gate::Open,
                 public: PublicServices::default(),
                 public_unsafe: PublicServices::default(),
                 enabled: Box::new(AllEnabled),
+                cuts: None,
             };
             tokio::task::spawn_local(async move {
                 exposer
@@ -586,20 +588,104 @@ async fn a_stdin_source_is_served_to_the_peer_and_a_second_reader_is_refused() {
             let got = service.read_all().await.expect("read the piped bytes");
             assert_eq!(got, body, "the reaching peer gets the source's exact bytes");
 
-            // Second CONCURRENT connection: the source is taken, so the host refuses cleanly with the
-            // single-consumer reason, never a racing (corrupting) second read.
+            // The next connection, once the first has left: the input has ended, so the host refuses
+            // with the end, never an `Ok` over an empty stream.
             let session2 = consumer.connect(exposer_id).await.expect("second connect");
-            let Err(refusal) = ServiceStream::open(&session2, "cam").await else {
-                panic!("the second reader must be refused, not a racing second read");
-            };
-            let bifrost::Refusal::Unavailable { detail } = &refusal else {
-                panic!("the second reader must be refused as unavailable, got: {refusal:?}");
+            let Err(refusal) = dial_until_released(&session2, "cam").await else {
+                panic!("a source past end of input must refuse, not serve an empty stream");
             };
             assert!(
-                detail
-                    .as_str()
-                    .contains("single-consumer source, already in use"),
-                "the refusal must name the single-consumer contract: {detail}"
+                refusal.contains("reached end of input"),
+                "the refusal names the end: {refusal}"
+            );
+        })
+        .await;
+}
+
+/// Dial `service` until the seat is not held by a peer that is still leaving: a host notices a departure
+/// only when its splice ends, a moment after the peer has gone. Returns the admitted stream, or the
+/// refusal detail once it is anything but Held. Bounded, so a seat that never comes back fails the test.
+async fn dial_until_released<S>(
+    session: &S,
+    service: &str,
+) -> Result<ServiceStream<S::Write, S::Read>, String>
+where
+    S: bifrost::Session,
+    S::Write: tokio::io::AsyncWrite + Unpin,
+    S::Read: tokio::io::AsyncRead + Unpin,
+{
+    let dial = async {
+        loop {
+            match ServiceStream::open(session, service).await {
+                Ok(stream) => return Ok(stream),
+                Err(bifrost::Refusal::Unavailable { detail })
+                    if detail.as_str().contains("is held by another peer") =>
+                {
+                    tokio::time::sleep(core::time::Duration::from_millis(10)).await;
+                }
+                Err(bifrost::Refusal::Unavailable { detail }) => {
+                    return Err(detail.as_str().to_owned());
+                }
+                Err(refusal) => panic!("a raw-stream refusal is unavailable, got: {refusal:?}"),
+            }
+        }
+    };
+    tokio::time::timeout(core::time::Duration::from_secs(10), dial)
+        .await
+        .expect("the seat comes back once its holder has left")
+}
+
+/// A peer that connects, reads nothing, and leaves does not burn `stdin:`: the seat comes back, and the
+/// next peer reads the input written after it attached.
+#[tokio::test]
+async fn a_peer_that_reads_nothing_and_leaves_does_not_burn_stdin() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut producer, source) = tokio::io::duplex(64 * 1024);
+            let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
+            let exposer_id = exposer_node.node_id();
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let exposer = prove(
+                stdin_service("cam", Box::new(source)),
+                Gate::Open,
+                PublicRequest::none(),
+                PublicUnsafeRequest::new(["cam".to_owned()]),
+            )
+            .expect("a raw stream opened unsafe builds under an open gate");
+            tokio::task::spawn_local(async move {
+                exposer
+                    .run(&exposer_node, CancellationToken::new())
+                    .await
+                    .expect("exposer runs");
+            });
+
+            // The first peer is admitted and leaves without reading a byte. The producer keeps writing,
+            // so the host finds the stream gone at its next write.
+            let first_session = consumer.connect(exposer_id).await.expect("connect");
+            let first = ServiceStream::open(&first_session, "cam")
+                .await
+                .expect("the first peer takes the seat");
+            drop(first);
+            drop(first_session);
+            producer
+                .write_all(b"written while nobody reads")
+                .await
+                .expect("feed the source");
+
+            let session = consumer.connect(exposer_id).await.expect("connect again");
+            let next = dial_until_released(&session, "cam")
+                .await
+                .expect("the seat comes back after a peer that read nothing");
+            let body = b"bytes for the next peer";
+            producer.write_all(body).await.expect("feed the source");
+            drop(producer);
+            let got = next.read_all().await.expect("read the next peer's stream");
+            assert!(
+                got.ends_with(body),
+                "the next peer reads the input written after it attached: {got:?}"
             );
         })
         .await;
@@ -673,6 +759,7 @@ async fn run_returns_gracefully_when_its_cancel_token_fires() {
         public: PublicServices::default(),
         public_unsafe: PublicServices::default(),
         enabled: Box::new(AllEnabled),
+        cuts: None,
     };
     let cancel = CancellationToken::new();
 
@@ -724,6 +811,7 @@ async fn a_lossy_source_fans_out_to_many_consumers() {
                 public: PublicServices::default(),
                 public_unsafe: PublicServices::default(),
                 enabled: Box::new(AllEnabled),
+                cuts: None,
             };
             tokio::task::spawn_local(async move {
                 exposer
@@ -816,6 +904,7 @@ async fn an_unadmitted_dialer_gets_one_uniform_refusal_no_reason_no_menu() {
                 public: PublicServices::default(),
                 public_unsafe: PublicServices::default(),
                 enabled: Box::new(AllEnabled),
+                cuts: None,
             };
 
             let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
@@ -913,6 +1002,7 @@ async fn an_unknown_service_probe_never_gets_the_menu_even_when_admitted() {
                 public: PublicServices::default(),
                 public_unsafe: PublicServices::default(),
                 enabled: Box::new(AllEnabled),
+                cuts: None,
             };
 
             let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);

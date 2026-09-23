@@ -23,6 +23,9 @@ license = "MIT OR Apache-2.0"
 bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "b295a7d2d23c2bafd70f7c3b5a93d9bb6810e174" }
 bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "b295a7d2d23c2bafd70f7c3b5a93d9bb6810e174" }
 bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "b295a7d2d23c2bafd70f7c3b5a93d9bb6810e174" }
+# The key file store, in bifrost's repo beside the identity it stores. No released rev carries it yet, so
+# this rev resolves only through the local path patch until the cascade publishes one.
+keystore = { git = "https://github.com/theia-hq/bifrost", rev = "b295a7d2d23c2bafd70f7c3b5a93d9bb6810e174" }
 nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "e148cb899dc8752a2403564ccbd8228e2b246dd0" }
 # The handler contract, in-tree beside its only dispatcher. A path dep (not a git self-dep): the workspace
 # member resolves within this checkout, and the package stays separately pinnable by a consumer.
@@ -33,17 +36,17 @@ eyre = "0.6"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 rand = "0.8"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zeroize = { version = "1", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
 # The raw-stream forward (`file:`/`fifo:`) opens an existing OS object with O_NOFOLLOW and stats it to
 # refuse anything that is not a regular file or a FIFO. Those two guards need the libc open flags and the
 # `st_mode` type macros, which std does not surface; unix-only, matching where `fifo:`/`unix:` live.
 libc = "0.2"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 # `start_paused` for the first-traffic deadline tests. Declared rather than inherited: it resolves

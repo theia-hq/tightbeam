@@ -27,6 +27,15 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check sources
+  # The one non-unix build. Only the guarded path open differs off unix, and nothing else compiles
+  # that twin, so without this job it drifts unseen. A check, not a test run: the fifo tests are unix-only.
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: check
+        run: cargo check --locked
   fmt:
     runs-on: ubuntu-latest
     steps:

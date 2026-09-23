@@ -21,12 +21,13 @@
 use core::future::Future;
 use core::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use bifrost::Node;
 use bifrost_iroh::Endpoint;
 use clap::{CommandFactory, Parser, Subcommand};
-use nauthy::FileDenylist;
-use tightbeam::config::{load_signet, revoked_path};
+use nauthy::{DisabledRoots, FileDenylist, Latch};
+use tightbeam::config::{disabled_roots_path, load_signet, revoked_path};
 use tightbeam::identity::{self, Secret};
 use tightbeam::peer::{Discovery, Peer};
 
@@ -129,9 +130,14 @@ async fn run() -> eyre::Result<()> {
         Command::Expose(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
             let signet = load_signet().await?;
-            // Load tightbeam's own denylist here in the adapter and pass it as a value; the core takes the
-            // loaded list, never a path (the same interface any richer consumer drives on its own store).
-            let denylist = FileDenylist::load(revoked_path()?).await?;
+            // Load tightbeam's own denylist and disabled roots here in the adapter and pass them as one
+            // composed value; the core takes the loaded store, never a path (the same interface any richer
+            // consumer drives on its own store). Shared, because the gate and the live cut must read the
+            // one instance.
+            let revocations = Arc::new(Latch::new(
+                DisabledRoots::load(disabled_roots_path()?).await?,
+                FileDenylist::load(revoked_path()?).await?,
+            ));
             let node = bind_node(
                 secret,
                 cli.peer,
@@ -140,7 +146,7 @@ async fn run() -> eyre::Result<()> {
                 BindRole::Serving,
             )
             .await?;
-            let outcome = run_until_signalled(cmd.run(&node, signet, denylist)).await;
+            let outcome = run_until_signalled(cmd.run(&node, signet, revocations)).await;
             node.close().await;
             outcome
         }
@@ -196,15 +202,28 @@ async fn bind_node(
     // Offline (implied by a fixed --bind-addr) binds iroh's minimal preset: no n0, no relays, reachable
     // only via the --peer hints below. Otherwise bind under n0 discovery, with hints as a direct-path
     // shortcut. A fixed bind address defaults to an ephemeral port, which suits a dial-only client.
+    // Each bind borrows the seed through `with_bytes` and returns a future that holds only what it
+    // derived, so the seed never leaves its wiping owner, which drops once the endpoint is bound.
     let endpoint = if offline || bind_addr.is_some() {
         let addr = bind_addr.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-        Endpoint::bind_offline(secret.into_bytes(), addr).await?
+        secret
+            .with_bytes(|seed| Endpoint::bind_offline(seed, addr))
+            .await?
     } else {
         match role {
-            BindRole::Serving => Endpoint::bind_reachable_with_secret(secret.into_bytes()).await?,
-            BindRole::Dialing => Endpoint::bind_dialing_with_secret(secret.into_bytes()).await?,
+            BindRole::Serving => {
+                secret
+                    .with_bytes(Endpoint::bind_reachable_with_secret)
+                    .await?
+            }
+            BindRole::Dialing => {
+                secret
+                    .with_bytes(Endpoint::bind_dialing_with_secret)
+                    .await?
+            }
         }
     };
+    drop(secret);
     // Compose local discovery (--peer hints + LAN mDNS) so a nearby peer is reached directly; under n0
     // it keeps the internet as the fallback for a remote peer with no local hint.
     let discovery = Peer::discovery(&endpoint, peers);
