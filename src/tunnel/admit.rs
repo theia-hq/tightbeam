@@ -11,13 +11,14 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 use std::collections::HashMap;
 use std::io::IoSlice;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bifrost::{NodeId, PeerProof, Refusal, RefusalDetail};
-use nauthy::{Admitted, Cap, FileDenylist, Gate, ProvenPeer, Service};
+use nauthy::{Admitted, Cap, Gate, ProvenPeer, Revocations, Service};
 use tokio::io;
 use tokio::sync::OwnedSemaphorePermit;
 
+use super::cut::AdmittedChains;
 use super::exposer::{PublicPool, PublicSession, Serving, SessionPeer};
 use super::router::{Access, PublicServices, Route, Services, Target};
 use crate::identity::AsVerifyKey as _;
@@ -27,9 +28,15 @@ use crate::splice_halves;
 
 /// Resolve the exposer's node BASE gate, in ONE place so every embedder applies the SAME policy: a family
 /// gate on the node's provisioned `signet`; an UNPROVISIONED
-/// node fails LOUD rather than ever defaulting to open. The caller loads the denylist and passes it as a
-/// value. This exists so the two security-relevant conventions (fail-loud-on-unprovisioned,
-/// real-loaded-denylist) are enforced once, not hand-copied into each caller.
+/// node fails LOUD rather than ever defaulting to open. The caller loads its revocation store and passes
+/// it as a value. This exists so the two security-relevant conventions (fail-loud-on-unprovisioned,
+/// real-loaded-store) are enforced once, not hand-copied into each caller.
+///
+/// The store is the WHOLE per-token revocation policy the gate sees, so the caller composes it: a bare
+/// [`FileDenylist`](nauthy::FileDenylist) refuses revoked grants only, and a [`Latch`](nauthy::Latch)
+/// over one also refuses every cap rooted at a disabled key. A node that passes the bare denylist gets no
+/// root disable. Pass an `Arc` of the store to share the one instance with
+/// [`Exposer::with_live_cuts`](super::Exposer::with_live_cuts).
 ///
 /// The base gate is the node-wide FAMILY authority; opening individual services is a SEPARATE, per-service
 /// overlay ([`Router::public`](super::Router::public)), never a node-wide value this function returns.
@@ -37,14 +44,17 @@ use crate::splice_halves;
 /// [`Gate::Open`]), not something a
 /// gate-resolution policy hands back from a flag: that node-wide-open flag was exactly the whole-node blast
 /// radius per-service exposure removes.
-pub fn resolve_gate(signet: Option<NodeId>, denylist: FileDenylist) -> eyre::Result<Gate> {
+pub fn resolve_gate(
+    signet: Option<NodeId>,
+    revocations: impl Revocations + Send + Sync + 'static,
+) -> eyre::Result<Gate> {
     let root = signet.ok_or_else(|| {
         eyre::eyre!(
             "this node has no signet to gate on: provision it (adopt a signet), or open individual services \
              to anyone"
         )
     })?;
-    Ok(Gate::rooted(root.verify_key(), denylist))
+    Ok(Gate::rooted(root.verify_key(), revocations))
 }
 
 /// How long to wait for a connector to send its opening request before dropping the stream. Bounds the
@@ -83,12 +93,15 @@ pub(super) const FIRST_TRAFFIC_TIMEOUT: Duration = Duration::from_secs(10);
 /// capability) is a property of the stream: one session may carry several service requests, each gated on
 /// its own merits. `public_session` is this session's half of the public cap: a stream that
 /// takes the public path classifies the session, and the permit it carries rides this future to the end.
+/// `chains` is this session's live-cut record, `None` when no cut is wired: an admitted stream keeps the
+/// chains it was admitted on there, so the session can end itself if one is recalled later.
 pub(super) async fn serve_request<W, R>(
     peer: SessionPeer,
     mut writer: W,
     mut reader: R,
     serving: Arc<Serving>,
     public_session: Arc<PublicSession>,
+    chains: Option<Arc<Mutex<AdmittedChains>>>,
 ) -> eyre::Result<()>
 where
     W: io::AsyncWrite + Unpin + Send + 'static,
@@ -102,6 +115,7 @@ where
         raw_stream_opens,
         public_pool,
         enabled,
+        cuts: _,
     } = &*serving;
     let Services(services) = services;
     // Bound the pre-gate read: a peer that opens a stream but never sends its request would otherwise
@@ -186,6 +200,24 @@ where
                 .map_err(Into::into);
         }
     };
+    // Keep the chains the gate just ruled on, for the live cut, before anything below can return: every
+    // later arm is a refusal or a dispatch, and one that returned first would leave an admitted stream
+    // the cut could never see. Only the ids and roots are kept; the parsed caps drop here.
+    // A session past its ceiling is refused the stream rather than grown: the record is bounded or the
+    // sweep that walks it is not.
+    if let Some(chains) = &chains {
+        let recorded = chains
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record_all(&admitted.ruled);
+        if let Err(full) = recorded {
+            tracing::warn!(%peer, service = %service, %full, "refused");
+            return Response::Refused(Refusal::NotAdmitted)
+                .write(&mut writer)
+                .await
+                .map_err(Into::into);
+        }
+    }
 
     // Live enable/disable, consulted POST-admission on the RESOLVED name: a service the operator has
     // disabled refuses here, and a re-enable restores it on the next stream with no restart (the oracle
@@ -460,15 +492,30 @@ impl From<nauthy::Refusal> for HostRefusal {
     }
 }
 
-/// An admitted stream: the nauthy witness the dispatch consumes, plus the public-path permit (if any) this
-/// stream holds until it ends. The permit rides the binding through the whole of [`serve_request`], so a
-/// public stream keeps its slot for exactly its lifetime; a gated stream carries `None` and touches no
-/// public capacity.
-#[derive(Debug)]
+/// An admitted stream: the nauthy witness the dispatch consumes, the caps the gate ruled on to admit it,
+/// plus the public-path permit (if any) this stream holds until it ends. The permit rides the binding
+/// through the whole of [`serve_request`], so a public stream keeps its slot for exactly its lifetime; a
+/// gated stream carries `None` and touches no public capacity.
 struct AdmittedStream {
     witness: Admitted,
+    /// Every cap the gate asked its revocation store about: the presented cap, and on the authority-bound
+    /// path the foreign badge too. The live cut re-asks about exactly these, so it can end a session only
+    /// for a recall the gate itself would have refused on. Empty on the open path, where nothing is ruled
+    /// on and nothing can be recalled.
+    ruled: Vec<Cap>,
     /// Held for the stream's lifetime; dropped when the binding leaves scope. Never read.
     _stream_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl core::fmt::Debug for AdmittedStream {
+    /// A [`Cap`] is a bearer credential and renders nothing, so the ruled caps are counted, never shown.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AdmittedStream")
+            .field("witness", &self.witness)
+            .field("ruled", &self.ruled.len())
+            .field("_stream_permit", &self._stream_permit)
+            .finish()
+    }
 }
 
 /// The policy one stream's admission is ruled under: the node base [`Gate`], the two disjoint open
@@ -547,6 +594,7 @@ fn admit(
             })?;
         return Ok(AdmittedStream {
             witness,
+            ruled: Vec::new(),
             _stream_permit: Some(stream_permit),
         });
     }
@@ -602,8 +650,15 @@ fn admit(
             .admit_witnessed(peer, presented, service)
             .map_err(HostRefusal::from),
     }?;
+    // An open base rules on nothing, so it keeps nothing for the cut to re-ask about.
+    let ruled = if base.wants_capability() {
+        cap.into_iter().chain(membership).collect()
+    } else {
+        Vec::new()
+    };
     Ok(AdmittedStream {
         witness,
+        ruled,
         _stream_permit: None,
     })
 }
