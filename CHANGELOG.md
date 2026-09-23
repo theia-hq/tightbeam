@@ -2,6 +2,37 @@
 
 All notable changes to tightbeam, newest first.
 
+## v0.13.0
+
+The key file goes through bifrost's keystore, and the public stream limits say what they cover.
+
+### Changed
+- **The identity key file is read and written by bifrost's `keystore` crate.** Its format, its
+  owner-only permission check and its atomic writes are now the ones every bifrost key file uses. A
+  missing file still mints and saves a fresh key; a file that is present but does not load is an error
+  naming the path and is never overwritten. The key directory is created owner-only (0700).
+- **A key file sealed under a passphrase is refused**, with a message saying tightbeam cannot unlock
+  it and to point it at a plain key. tightbeam has no way to ask for a passphrase, and such a file is
+  never treated as absent.
+- **`identity::write` never replaces a different key.** It leaves a file holding the same key alone and
+  refuses one holding another.
+
+### Breaking
+- **`Secret` no longer hands its bytes out by value.** `Secret::into_bytes` is replaced by
+  `Secret::with_bytes`, which lends the seed to a closure, so the seed never leaves its wiping owner.
+- **`IdentityError`** drops `Read`, `Malformed`, `Permissive` and `Write` for `Sealed`, `CreateDir`,
+  `Entropy` and `Key` (the keystore's own error).
+- Requires bifrost v0.5.0 and nauthy v0.5.0.
+
+### Added
+- **`tunnel::Serve`** is re-exported, so an embedder can wrap a typed service without depending on
+  tightbeam-handler directly.
+
+### Docs
+- **The four public stream slots say what they do not bound:** they are shared across every public
+  service, held for a stream's whole life, and a viewer that half-closed before leaving is noticed only
+  at the next write. The `+lossy` ring is pinned at its exact byte ceiling by test.
+
 ## v0.12.0
 
 A service can be typed, and nothing is forced through a codec.
