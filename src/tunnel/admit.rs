@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use bifrost::{NodeId, PeerProof, Refusal, RefusalDetail};
 use nauthy::{Admitted, Cap, Gate, ProvenPeer, Revocations, Service};
+use tightbeam_handler::bridge::Prepared;
 use tokio::io;
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -201,26 +202,6 @@ where
                 .map_err(Into::into);
         }
     };
-    // Keep the chains the gate just ruled on, for the live cut, before anything below can return: every
-    // later arm is a refusal or a dispatch, and one that returned first would leave an admitted stream
-    // the cut could never see. Only the ids and roots are kept; the parsed caps drop here.
-    // A session past its ceiling is refused the stream rather than grown: the record is bounded or the
-    // sweep that walks it is not. So is a stream on a cap whose expiry cannot be read, which the cut
-    // could never end on time.
-    if let Some(chains) = &chains {
-        let recorded = chains
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .record_all(&admitted.ruled);
-        if let Err(unrecorded) = recorded {
-            tracing::warn!(%peer, service = %service, %unrecorded, "refused");
-            return Response::Refused(Refusal::NotAdmitted)
-                .write(&mut writer)
-                .await
-                .map_err(Into::into);
-        }
-    }
-
     // Live enable/disable, consulted POST-admission on the RESOLVED name: a service the operator has
     // disabled refuses here, and a re-enable restores it on the next stream with no restart (the oracle
     // re-reads its backing file on change). The check sits AFTER `admit` so every dialer pays the gate
@@ -238,15 +219,38 @@ where
             .map_err(Into::into);
     }
 
+    // Unknown service. The node's OWN log names what it exposes, so a service-name mismatch (the connector
+    // defaulting to `default` while the exposer named `web`) is diagnosable by the operator. It must NOT
+    // cross the wire: enumerating the service menu to a dialer hands an unauthorized peer the node's
+    // capability list before it has proved anything, so the wire gets the same indistinguishable refusal
+    // as any not-admitted dial. A dialer learns a service exists only by being admitted to it; the
+    // teaching hint returns as the gated `control.services` verb, never as a free menu here. (This is
+    // reached only past the gate: an Open node, or a whole-node member badge that admits any name -- so
+    // uniformity here also stops a member from mapping the menu by probing wrong names, keeping the same
+    // rule at every dialer class.) The lookup is hoisted so the floor and the dispatch below read the same
+    // resolved route.
+    let Some(route) = services.get(service.as_str()) else {
+        let mut available: Vec<&str> = services.keys().map(String::as_str).collect();
+        available.sort_unstable();
+        tracing::warn!(
+            %peer,
+            service = %service,
+            exposes = %available.join(", "),
+            "unknown service requested"
+        );
+        return Response::Refused(Refusal::NotAdmitted)
+            .write(&mut writer)
+            .await
+            .map_err(Into::into);
+    };
+
     // The member floor: a route declared `Access::Member` at registration is checked ONCE here,
     // after `admit` and before every `Response::Ok` below, so the check covers every dispatch arm and can
     // still be a WIRE refusal; a handler-side check would run post-`Ok` and the client would read a stopped
     // "success". The witness is BORROWED for `is_member` (`&self`) and stays owned for the single move into
     // the handler, and the refusal is the SAME payload-free class a gate miss gives: the wire never learns
-    // that a route is member-only (no member-vs-slip oracle). The lookup is hoisted so the floor and the
-    // dispatch below read the same resolved route.
-    let route = services.get(service.as_str());
-    if route.is_some_and(|route| route.access == Access::Member) && !admitted.witness.is_member() {
+    // that a route is member-only (no member-vs-slip oracle).
+    if route.access == Access::Member && !admitted.witness.is_member() {
         tracing::warn!(%peer, service = %service, "refused: member-only route");
         return Response::Refused(Refusal::NotAdmitted)
             .write(&mut writer)
@@ -254,13 +258,15 @@ where
             .map_err(Into::into);
     }
 
-    match route.map(|route| &route.target) {
+    // Open or prepare the target, with nothing yet said to the peer. Every refusal left happens here, so
+    // the chains are kept only once the stream is past all of them.
+    let ready = match &route.target {
         // tightbeam's own primitive, the raw-stream half: open the source (a guarded file/FIFO, or claim the
         // `stdin:` seat) and splice its bytes toward the peer. `Response::Ok` is written only AFTER the open
         // succeeds, so a peer learns "refused" (not a silent hang or a mid-stream reset) when the target is a
         // device, a directory, a symlink, a FIFO whose writer never appears, or a `stdin:` seat another peer
         // holds or whose input has ended.
-        Some(Target::RawStream(stream)) => {
+        Target::RawStream(stream) => {
             // Take a raw-stream open permit BEFORE opening, as defense-in-depth (the open is nonblocking and
             // cannot park a thread, so this bounds the fds a peer holds mid-open, not a leak): `try_acquire`
             // refuses immediately over the cap rather than admitting one more concurrent open. The permit is
@@ -276,25 +282,15 @@ where
                 }
             };
             match opened {
-                // Direction is fixed at parse time: read the source, send its bytes to the peer, and discard
-                // any bytes the peer sends upstream (a read-only source has nowhere to put them). Using
-                // `splice_halves` (never the duplex `splice`) is what makes "write peer bytes back into the
-                // source" unrepresentable.
-                Ok(Opened::Stream(source)) => {
-                    Response::Ok.write(&mut writer).await?;
-                    splice_halves(source, io::sink(), writer, reader).await?;
-                }
-                // A `stdin:` seat writes its own `Ok`, metered and preemptible like the rest of its splice:
-                // written here, a peer granting no credit would park on it unjudged and hold the seat for
-                // good. A failed write drops the seat, whose guard hands the reader back.
-                Ok(Opened::Seat(seated)) => seated.serve(writer, reader).await?,
+                Ok(opened) => Ready::Raw(opened),
                 Err(error) => {
                     tracing::warn!(%peer, service = %service, %error, "raw-stream open refused");
-                    Response::Refused(Refusal::Unavailable {
+                    return Response::Refused(Refusal::Unavailable {
                         detail: RefusalDetail::bounded(error.to_string()),
                     })
                     .write(&mut writer)
-                    .await?;
+                    .await
+                    .map_err(Into::into);
                 }
             }
         }
@@ -304,53 +300,8 @@ where
         // gate miss gives (no never-public oracle). The witness is moved into the proof by value (single-use),
         // so a handler can never run for an unauthorized peer; the guarantee holds only because the admit
         // (above) and this serve share one stream frame, never hoisted to session scope.
-        Some(Target::Handler(handler)) => match handler.prepare(admitted.witness) {
-            Ok(prepared) => {
-                Response::Ok.write(&mut writer).await?;
-                // Arm the post-admission first-traffic deadline AT THE HANDOFF, and disarm it on the
-                // first byte in EITHER direction. This is where the pre-gate `REQUEST_READ_TIMEOUT`
-                // stops applying, and nothing downstream replaces it: a handler is handed two halves
-                // and no clock, so an admitted peer that never speaks parks this task and its buffers
-                // until the session dies. It is enforced HERE, uniformly, and no handler declares it,
-                // because the bound does not vary by handler: one that varies belongs to the service
-                // that varies it, but a bound that is the same for all of them belongs to the one
-                // place that dispatches them all.
-                //
-                // It can only ever fire on a stream where NOTHING has been said in either direction,
-                // so it can never truncate an answer in flight and can never turn a success into a
-                // lie. That is the whole reason it is safe to enforce AFTER `Response::Ok`, where no
-                // refusal is left to send; a bound on anything but silence would not be.
-                //
-                // Both halves are wrapped, never the reader alone. `Forward` splices the peer against
-                // an arbitrary local endpoint, and a server-speaks-first endpoint (an SSH
-                // identification string, an SMTP greeting) legitimately leaves the peer silent until
-                // the local server has spoken. A read-side deadline would drop exactly those streams
-                // for doing the correct thing.
-                let traffic = Arc::new(FirstTraffic::default());
-                let served = prepared.serve(
-                    Box::new(Watched::new(writer, Arc::clone(&traffic))),
-                    Box::new(Watched::new(reader, Arc::clone(&traffic))),
-                );
-                tokio::select! {
-                    // Biased so a serve that finishes in the same instant the deadline elapses is read
-                    // as finished: the handler's own result wins the tie, never the clock.
-                    biased;
-                    result = served => result?,
-                    () = traffic.silent_past(FIRST_TRAFFIC_TIMEOUT) => {
-                        // The success frame is already on the wire, so the enforcement IS the drop:
-                        // the halves go with `served` and the peer sees its stream close after an `Ok`
-                        // it never used. The cause exists only here, which is why it is logged at the
-                        // level a stock serving filter shows rather than at `warn`, where a host
-                        // watching a wedge would never see it.
-                        tracing::error!(
-                            %peer,
-                            service = %service,
-                            after = ?FIRST_TRAFFIC_TIMEOUT,
-                            "admitted stream carried no bytes in either direction; dropping it"
-                        );
-                    }
-                }
-            }
+        Target::Handler(handler) => match handler.prepare(admitted.witness) {
+            Ok(prepared) => Ready::Handler(prepared),
             Err(refusal) => {
                 tracing::warn!(
                     %peer,
@@ -358,35 +309,104 @@ where
                     %refusal,
                     "refused: unrooted witness for a never-public handler"
                 );
-                Response::Refused(Refusal::NotAdmitted)
+                return Response::Refused(Refusal::NotAdmitted)
                     .write(&mut writer)
-                    .await?;
+                    .await
+                    .map_err(Into::into);
             }
         },
-        None => {
-            // Unknown service. The node's OWN log names what it exposes, so a service-name mismatch (the
-            // connector defaulting to `default` while the exposer named `web`) is diagnosable by the
-            // operator. It must NOT cross the wire: enumerating the service menu to a dialer hands an
-            // unauthorized peer the node's capability list before it has proved anything, so the wire gets
-            // the same indistinguishable refusal as any not-admitted dial. A dialer learns a service exists only
-            // by being admitted to it; the teaching hint returns as the gated `control.services` verb, never
-            // as a free menu here. (This arm is reached only past the gate: an Open node, or a whole-node
-            // member badge that admits any name -- so uniformity here also stops a member from mapping the
-            // menu by probing wrong names, keeping the same rule at every dialer class.)
-            let mut available: Vec<&str> = services.keys().map(String::as_str).collect();
-            available.sort_unstable();
-            tracing::warn!(
-                %peer,
-                service = %service,
-                exposes = %available.join(", "),
-                "unknown service requested"
-            );
-            Response::Refused(Refusal::NotAdmitted)
+    };
+
+    // Keep the chains the gate ruled on, for the live cut, just before `Ok`: every refusal is behind us
+    // and every arm below serves, so no served stream escapes the cut and a refused one leaves no trace in
+    // the record. A refused stream kept here would still bound the session by its grant, or count against
+    // the ceiling, for a stream never served. Only the ids and roots are kept; the parsed caps drop here.
+    // A session past its ceiling is refused the stream rather than grown: the record is bounded or the
+    // sweep that walks it is not. So is a stream on a cap whose expiry cannot be read, which the cut
+    // could never end on time. Refusing here drops what was opened: a file closes, and a seat's guard
+    // hands the reader back.
+    if let Some(chains) = &chains {
+        let recorded = chains
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record_all(&admitted.ruled);
+        if let Err(unrecorded) = recorded {
+            tracing::warn!(%peer, service = %service, %unrecorded, "refused");
+            return Response::Refused(Refusal::NotAdmitted)
                 .write(&mut writer)
-                .await?;
+                .await
+                .map_err(Into::into);
+        }
+    }
+
+    match ready {
+        // Direction is fixed at parse time: read the source, send its bytes to the peer, and discard any
+        // bytes the peer sends upstream (a read-only source has nowhere to put them). Using `splice_halves`
+        // (never the duplex `splice`) is what makes "write peer bytes back into the source"
+        // unrepresentable.
+        Ready::Raw(Opened::Stream(source)) => {
+            Response::Ok.write(&mut writer).await?;
+            splice_halves(source, io::sink(), writer, reader).await?;
+        }
+        // A `stdin:` seat writes its own `Ok`, metered and preemptible like the rest of its splice: written
+        // here, a peer granting no credit would park on it unjudged and hold the seat for good. A failed
+        // write drops the seat, whose guard hands the reader back.
+        Ready::Raw(Opened::Seat(seated)) => seated.serve(writer, reader).await?,
+        Ready::Handler(prepared) => {
+            Response::Ok.write(&mut writer).await?;
+            // Arm the post-admission first-traffic deadline AT THE HANDOFF, and disarm it on the first
+            // byte in EITHER direction. This is where the pre-gate `REQUEST_READ_TIMEOUT` stops applying,
+            // and nothing downstream replaces it: a handler is handed two halves and no clock, so an
+            // admitted peer that never speaks parks this task and its buffers until the session dies. It
+            // is enforced HERE, uniformly, and no handler declares it, because the bound does not vary by
+            // handler: one that varies belongs to the service that varies it, but a bound that is the
+            // same for all of them belongs to the one place that dispatches them all.
+            //
+            // It can only ever fire on a stream where NOTHING has been said in either direction, so it
+            // can never truncate an answer in flight and can never turn a success into a lie. That is the
+            // whole reason it is safe to enforce AFTER `Response::Ok`, where no refusal is left to send; a
+            // bound on anything but silence would not be.
+            //
+            // Both halves are wrapped, never the reader alone. `Forward` splices the peer against an
+            // arbitrary local endpoint, and a server-speaks-first endpoint (an SSH identification string,
+            // an SMTP greeting) legitimately leaves the peer silent until the local server has spoken. A
+            // read-side deadline would drop exactly those streams for doing the correct thing.
+            let traffic = Arc::new(FirstTraffic::default());
+            let served = prepared.serve(
+                Box::new(Watched::new(writer, Arc::clone(&traffic))),
+                Box::new(Watched::new(reader, Arc::clone(&traffic))),
+            );
+            tokio::select! {
+                // Biased so a serve that finishes in the same instant the deadline elapses is read as
+                // finished: the handler's own result wins the tie, never the clock.
+                biased;
+                result = served => result?,
+                () = traffic.silent_past(FIRST_TRAFFIC_TIMEOUT) => {
+                    // The success frame is already on the wire, so the enforcement IS the drop: the
+                    // halves go with `served` and the peer sees its stream close after an `Ok` it never
+                    // used. The cause exists only here, which is why it is logged at the level a stock
+                    // serving filter shows rather than at `warn`, where a host watching a wedge would
+                    // never see it.
+                    tracing::error!(
+                        %peer,
+                        service = %service,
+                        after = ?FIRST_TRAFFIC_TIMEOUT,
+                        "admitted stream carried no bytes in either direction; dropping it"
+                    );
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// A stream's target, opened or prepared, with nothing yet said to the peer: the one point where every
+/// refusal is behind it and nothing has been served, which is where the live cut keeps its chains.
+enum Ready<'a> {
+    /// A raw stream's source, opened.
+    Raw(Opened),
+    /// A handler's frozen serve, its proof already minted.
+    Handler(Prepared<'a>),
 }
 
 /// Why the host did not admit a stream, in full, for the host's OWN log. It

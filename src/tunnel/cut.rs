@@ -1,5 +1,5 @@
-//! The live cut: a session admitted on a capability that is later recalled, or whose every grant has run
-//! out, ends itself, rather than running on until its peer leaves.
+//! The live cut: a session admitted on a capability that is later recalled, or on a grant that has since
+//! run out, ends itself, rather than running on until its peer leaves.
 //!
 //! Admission rules per stream, at the moment the stream opens, so a recall written after that moment has
 //! no stream left to refuse. The cut closes that gap without a registry of who is connected: each session
@@ -8,8 +8,8 @@
 //! it. The oracle holds only rules, never a session, so nothing here can list, count, or name the live
 //! peers.
 //!
-//! The unit is the SESSION: a recall ends every stream on it, including streams admitted under other caps,
-//! because a dropped stream alone leaves a handler's detached work running.
+//! The unit is the SESSION: a recall or an expiry ends every stream on it, including streams admitted
+//! under other caps, because a dropped stream alone leaves a handler's detached work running.
 
 use core::time::Duration;
 use std::collections::HashSet;
@@ -90,8 +90,8 @@ impl AdmittedChains {
         self.lease = self.lease.extend(until);
     }
 
-    /// Whether every grant this session was admitted on has run out by `now`. Never for a session no
-    /// stream was admitted on a grant, and never for one holding a grant that never expires.
+    /// Whether any grant this session was admitted on has run out by `now`. Never for a session no
+    /// stream was admitted on a grant, and never for one whose every grant never expires.
     pub(super) fn lapsed(&self, now: SystemTime) -> bool {
         self.lease.lapsed(now)
     }
@@ -113,7 +113,7 @@ impl AdmittedChains {
         }
         self.ids.extend(fresh);
         self.roots.extend(ruled.iter().map(Cap::root));
-        // An open stream rules on nothing, so it holds the session open on no grant.
+        // An open stream rules on nothing, so it has no grant to bound the session by.
         if !ruled.is_empty() {
             self.lease = self.lease.extend(until);
         }
@@ -127,21 +127,25 @@ impl AdmittedChains {
     }
 }
 
-/// How long a session's grants hold it open: until the LAST of its streams' grants runs out.
+/// How long a session's grants hold it open: until the FIRST of its streams' grants runs out.
 ///
 /// One stream is admitted only while every cap it was ruled on holds (the foreign path ANDs a slip and a
-/// badge), so a stream's grant runs out at the EARLIEST of their expiries. The session is still held by
-/// any stream's grant, so it lapses at the LATEST of those. Each cap's expiry is [`Cap::valid_until`],
-/// the earliest bound anywhere in its chain, so a holder who narrowed a grant and passed it on is cut at
-/// the narrower instant.
+/// badge), so a stream's grant runs out at the EARLIEST of their expiries. The session ends at the
+/// EARLIEST of those too, the rule a recall already follows: any one grant ending ends the session, the
+/// same as any one chain recalled. Were it the latest, a stream on a short grant would ride any later
+/// grant from the same root, even one for another service, past its own expiry. The cost falls only on
+/// a client that puts several grants on one session, which loses them all at the first expiry and
+/// reconnects; a client presents one cap per session, so it pays nothing. Each cap's expiry is
+/// [`Cap::valid_until`], the earliest bound anywhere in its chain, so a holder who narrowed a grant and
+/// passed it on is cut at the narrower instant.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Lease {
     /// No stream was admitted on a grant: nothing here can run out.
     #[default]
     Unruled,
-    /// Every grant a stream was admitted on has run out once this instant passes.
+    /// Some grant a stream was admitted on has run out once this instant passes.
     Until(SystemTime),
-    /// Some stream was admitted on grants none of which ever expires, so time alone never ends this
+    /// Every stream was admitted on grants none of which ever expires, so time alone never ends this
     /// session. A recall still does.
     Unbounded,
 }
@@ -167,12 +171,14 @@ impl Lease {
             })
     }
 
-    /// This lease widened by one more admitted stream whose grant runs out at `stream`.
+    /// This lease with one more admitted stream, whose grant runs out at `stream`. It can only ever
+    /// shorten: a grant that never expires leaves a bounded lease as it was.
     fn extend(self, stream: Option<SystemTime>) -> Self {
         match (self, stream) {
-            (Self::Unbounded, _) | (_, None) => Self::Unbounded,
-            (Self::Unruled, Some(until)) => Self::Until(until),
-            (Self::Until(held), Some(until)) => Self::Until(held.max(until)),
+            (Self::Unruled | Self::Unbounded, None) => Self::Unbounded,
+            (Self::Unruled | Self::Unbounded, Some(until)) => Self::Until(until),
+            (Self::Until(held), Some(until)) => Self::Until(held.min(until)),
+            (held @ Self::Until(_), None) => held,
         }
     }
 
@@ -188,7 +194,7 @@ impl Lease {
 pub(super) enum Cut {
     /// A cap it was admitted on is revoked, or the root one was issued under is disabled.
     Recalled,
-    /// Every grant it was admitted on has expired.
+    /// A grant it was admitted on has expired.
     Expired,
 }
 
@@ -196,7 +202,7 @@ impl core::fmt::Display for Cut {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Self::Recalled => "a capability it was admitted on is revoked or its root disabled",
-            Self::Expired => "every capability it was admitted on has expired",
+            Self::Expired => "a capability it was admitted on has expired",
         })
     }
 }
