@@ -188,7 +188,7 @@ pub(super) enum Target {
     Handler(Arc<dyn ErasedHandler>),
     /// tightbeam's own primitive, the raw-stream half: source an already-open byte stream and splice it
     /// toward the peer, either an OS object the operator named (`file:<path>` / `fifo:<path>`) or this
-    /// process's own standard input (`stdin:`, a single-consumer source taken once). The reverse of piping
+    /// process's own standard input (`stdin:`, read by one peer at a time and handed on). The reverse of piping
     /// a service to the connector's stdout. It stays a native arm because of the second open axis: a raw
     /// stream is unsafe-open only through its own overlay, a policy the one-dimensional `Exposure` marker
     /// cannot express.
