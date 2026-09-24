@@ -1,12 +1,14 @@
-//! What the composed discovery reads off its transport: bind truth, never the rewritten hints.
+//! What the composed discovery reads off its transport: bind truth for a serving node, never the
+//! rewritten hints, and nothing at all for a dialling one.
 
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use bifrost::{Addr, Error, InProcess, NodeId, Transport};
+use bifrost_mdns::{Advertising, MdnsDiscovery, MdnsError};
 use bifrost_mem::{MemSession, MemTransport};
 
-use crate::peer::Peer;
+use crate::peer::{Peer, Role};
 
 /// A wildcard bind on a fixed port: the shape the rewrite destroys, since `local_addr` reports it as
 /// loopback and a publisher cannot then tell it from a node that deliberately bound `127.0.0.1`.
@@ -64,6 +66,16 @@ impl Transport for Recording {
     }
 }
 
+/// A [`Recording`] transport and the log of what was read off it.
+fn recording() -> (Recording, Arc<Mutex<Vec<Read>>>) {
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let transport = Recording {
+        inner: MemTransport::bind(),
+        reads: Arc::clone(&reads),
+    };
+    (transport, reads)
+}
+
 impl Recording {
     /// Note one accessor read. A poisoned lock would only be a panic inside an accessor, which would
     /// have failed the test already.
@@ -79,17 +91,78 @@ impl Recording {
 /// either way.
 #[tokio::test]
 async fn composing_discovery_advertises_the_bound_sockets() {
-    let reads = Arc::new(Mutex::new(Vec::new()));
-    let transport = Recording {
-        inner: MemTransport::bind(),
-        reads: Arc::clone(&reads),
-    };
+    let (transport, reads) = recording();
 
-    let _discovery = Peer::discovery(&transport, []);
+    let _discovery = Peer::discovery(&transport, [], Role::Serving);
 
     assert_eq!(
         *reads.lock().unwrap(),
         vec![Read::BoundSockets(vec![WILDCARD])],
         "the advertisement must take raw bind truth, not the loopback-rewritten hints"
+    );
+}
+
+/// A serving bind hands its bound sockets to the advertisement: a dialer finds it by its key.
+#[test]
+fn a_serving_bind_advertises_its_bind() {
+    let (transport, _reads) = recording();
+
+    assert_eq!(
+        Role::Serving.advertised(&transport),
+        vec![WILDCARD],
+        "a serving node must still publish its bind"
+    );
+}
+
+/// A dialling bind hands the advertisement no address, and reads none off the transport: there is
+/// nothing to publish, so no record on the LAN names this node's key.
+#[test]
+fn a_dialling_bind_advertises_no_address() {
+    let (transport, reads) = recording();
+
+    assert_eq!(
+        Role::Dialing.advertised(&transport),
+        Vec::<SocketAddr>::new(),
+        "a dialling node must publish no address"
+    );
+    assert_eq!(
+        *reads.lock().unwrap(),
+        Vec::new(),
+        "a dialling node has no reason to read an address to publish"
+    );
+}
+
+/// Composing a dialling node's discovery reads no address off the transport, so nothing reaches the
+/// advertisement.
+#[tokio::test]
+async fn composing_a_dialling_discovery_reads_no_address() {
+    let (transport, reads) = recording();
+
+    let _discovery = Peer::discovery(&transport, [], Role::Dialing);
+
+    assert_eq!(
+        *reads.lock().unwrap(),
+        Vec::new(),
+        "a dialling node's advertisement must be composed from no address"
+    );
+}
+
+/// The advertisement a dialling node starts is browse-only for want of addresses, the one outcome
+/// the report treats as intended rather than degraded.
+#[tokio::test]
+async fn a_dialling_advertisement_is_browse_only_for_want_of_addresses() {
+    let (transport, _reads) = recording();
+
+    let started =
+        MdnsDiscovery::advertise(transport.node_id(), Role::Dialing.advertised(&transport))
+            .expect("the mDNS service starts");
+
+    assert!(
+        matches!(
+            started.advertising,
+            Advertising::BrowseOnly(MdnsError::NoAddrs)
+        ),
+        "a dialling node publishes no record: {:?}",
+        started.advertising
     );
 }

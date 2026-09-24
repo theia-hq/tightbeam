@@ -29,7 +29,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use nauthy::{DisabledRoots, FileDenylist, Latch};
 use tightbeam::config::{disabled_roots_path, load_signet, revoked_path};
 use tightbeam::identity::{self, Secret};
-use tightbeam::peer::{Discovery, Peer};
+use tightbeam::peer::{Discovery, Peer, Role};
 
 mod attenuate;
 mod connect;
@@ -140,28 +140,16 @@ async fn run() -> eyre::Result<()> {
                 DisabledRoots::load(disabled_roots_path()?).await?,
                 FileDenylist::load(revoked_path()?).await?,
             ));
-            let node = bind_node(
-                secret,
-                cli.peer,
-                cli.offline,
-                cli.bind_addr,
-                BindRole::Serving,
-            )
-            .await?;
+            let node =
+                bind_node(secret, cli.peer, cli.offline, cli.bind_addr, Role::Serving).await?;
             let outcome = run_until_signalled(cmd.run(&node, signet, revocations)).await;
             node.close().await;
             outcome
         }
         Command::Connect(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
-            let node = bind_node(
-                secret,
-                cli.peer,
-                cli.offline,
-                cli.bind_addr,
-                BindRole::Dialing,
-            )
-            .await?;
+            let node =
+                bind_node(secret, cli.peer, cli.offline, cli.bind_addr, Role::Dialing).await?;
             let outcome = run_until_signalled(cmd.run(&node)).await;
             node.close().await;
             outcome
@@ -182,15 +170,6 @@ async fn run_until_signalled(verb: impl Future<Output = eyre::Result<()>>) -> ey
     }
 }
 
-/// Which side of the conversation this bind serves: `expose` publishes the node's address record for
-/// dialers; `connect` only resolves and must not overwrite a live node's record with its own short-lived
-/// one.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BindRole {
-    Serving,
-    Dialing,
-}
-
 /// Bind the overlay node under the persisted secret. The one place a concrete transport is named;
 /// everything else speaks `bifrost`. Binding under the same secret the cap identity roots at is what
 /// makes a minted cap verify against the identity peers dial.
@@ -199,7 +178,7 @@ async fn bind_node(
     peers: Vec<Peer>,
     offline: bool,
     bind_addr: Option<SocketAddr>,
-    role: BindRole,
+    role: Role,
 ) -> eyre::Result<Node<Endpoint, Discovery>> {
     // Offline (implied by a fixed --bind-addr) binds iroh's minimal preset: no n0, no relays, reachable
     // only via the --peer hints below. Otherwise bind under n0 discovery, with hints as a direct-path
@@ -212,13 +191,15 @@ async fn bind_node(
             .with_bytes(|seed| Endpoint::bind_offline(seed, addr))
             .await?
     } else {
+        // A dialling node only resolves: it must not overwrite a live node's record with its own
+        // short-lived one.
         match role {
-            BindRole::Serving => {
+            Role::Serving => {
                 secret
                     .with_bytes(Endpoint::bind_reachable_with_secret)
                     .await?
             }
-            BindRole::Dialing => {
+            Role::Dialing => {
                 secret
                     .with_bytes(Endpoint::bind_dialing_with_secret)
                     .await?
@@ -228,6 +209,6 @@ async fn bind_node(
     drop(secret);
     // Compose local discovery (--peer hints + LAN mDNS) so a nearby peer is reached directly; under n0
     // it keeps the internet as the fallback for a remote peer with no local hint.
-    let discovery = Peer::discovery(&endpoint, peers);
+    let discovery = Peer::discovery(&endpoint, peers, role);
     Ok(Node::new(endpoint, discovery))
 }
