@@ -12,7 +12,7 @@ use core::str::FromStr;
 use std::net::ToSocketAddrs;
 
 use bifrost::{Layered, NodeId, StaticDiscovery, Transport};
-use bifrost_mdns::{Advertising, MdnsDiscovery, Started};
+use bifrost_mdns::{Advertising, MdnsDiscovery, MdnsError, Started};
 use eyre::WrapErr as _;
 
 /// The discovery tightbeam composes: explicit [`Peer`] hints layered over LAN mDNS (iroh keeps n0 as the
@@ -29,27 +29,54 @@ pub struct Peer {
     addrs: Vec<SocketAddr>,
 }
 
+/// Which side of a conversation a bound node is on, and so what of it goes on the LAN.
+///
+/// A serving node is dialled by its key, so it publishes a record naming that key and its bind. A
+/// dialling node reaches out to a key it already holds: nobody needs to find it, and a record would
+/// tell every host on the LAN which key is running here, so it publishes none and only browses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Accepts dials: advertises its key and bind over mDNS.
+    Serving,
+    /// Only dials: browses mDNS, advertises nothing.
+    Dialing,
+}
+
+impl Role {
+    /// The sockets this role hands to the mDNS advertisement.
+    ///
+    /// Bind truth for a serving node, never `local_addr`'s hints: the hints rewrite an unspecified
+    /// bind to loopback, so handing them over would advertise `127.0.0.1` for a node bound to every
+    /// interface and make every LAN dialer reach its own machine. Discovery owns what of the bind is
+    /// publishable. A dialling node hands over nothing, so the key never goes on the wire.
+    pub fn advertised<T: Transport>(self, transport: &T) -> Vec<SocketAddr> {
+        match self {
+            Self::Serving => transport.bound_sockets(),
+            Self::Dialing => Vec::new(),
+        }
+    }
+}
+
 impl Peer {
     /// Compose the discovery for a freshly bound transport: the [`Peer`] hints layered over an mDNS
-    /// resolver that advertises this node's bind and browses the LAN. Degrades to hints-only if mDNS
-    /// cannot start (multicast blocked), rather than failing the command.
+    /// resolver that browses the LAN and, for a [`Role::Serving`] node, advertises this node's bind.
+    /// Degrades to hints-only if mDNS cannot start (multicast blocked), rather than failing the
+    /// command.
     pub fn discovery<T: Transport>(
         transport: &T,
         peers: impl IntoIterator<Item = Self>,
+        role: Role,
     ) -> Discovery {
         let mut hints = StaticDiscovery::new();
         for Self { node, addrs } in peers {
             hints.insert(node, addrs);
         }
-        // Bind truth, never `local_addr`'s hints: the hints rewrite an unspecified bind to loopback, so
-        // handing them over would advertise `127.0.0.1` for a node bound to every interface and make
-        // every LAN dialer reach its own machine. Discovery owns what of the bind is publishable.
-        let mdns = match MdnsDiscovery::advertise(transport.node_id(), transport.bound_sockets()) {
+        let mdns = match MdnsDiscovery::advertise(transport.node_id(), role.advertised(transport)) {
             Ok(Started {
                 discovery,
                 advertising,
             }) => {
-                report(&advertising);
+                report(role, &advertising);
                 discovery
             }
             Err(err) => {
@@ -66,19 +93,23 @@ impl Peer {
 /// The composed [`Discovery`] cannot be asked: a node publishing nothing, a node publishing only
 /// loopback, and a node on the LAN all resolve peers identically, and the two degraded ones are
 /// invisible to every other host while looking live from the inside. Each arm names its own reach, so
-/// a run that cannot be found says why instead of leaving the operator to guess.
-fn report(advertising: &Advertising) {
-    match advertising {
-        Advertising::OnLan(advertised) => tracing::debug!(
+/// a run that cannot be found says why instead of leaving the operator to guess. A dialling node
+/// publishing nothing is the intended state, not a degraded one, and says so.
+fn report(role: Role, advertising: &Advertising) {
+    match (role, advertising) {
+        (Role::Dialing, Advertising::BrowseOnly(MdnsError::NoAddrs)) => tracing::debug!(
+            "browsing the LAN over mDNS; a dialling node advertises nothing, so no record names its key"
+        ),
+        (_, Advertising::OnLan(advertised)) => tracing::debug!(
             port = advertised.port(),
             addrs = advertised.addrs().len(),
             "advertising this node on the LAN over mDNS"
         ),
-        Advertising::LoopbackOnly(advertised) => tracing::debug!(
+        (_, Advertising::LoopbackOnly(advertised)) => tracing::debug!(
             port = advertised.port(),
             "advertising this node over mDNS on loopback only; a peer on another host needs a direct address hint"
         ),
-        Advertising::BrowseOnly(cause) => tracing::debug!(
+        (_, Advertising::BrowseOnly(cause)) => tracing::debug!(
             error = %cause,
             "browsing the LAN over mDNS without advertising this node; a peer on another host needs a direct address hint"
         ),
