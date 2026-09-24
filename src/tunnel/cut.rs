@@ -4,8 +4,8 @@
 //! Admission rules per stream, at the moment the stream opens, so a recall written after that moment has
 //! no stream left to refuse. The cut closes that gap without a registry of who is connected: each session
 //! keeps the chains it was admitted on, in its own frame, and re-asks the oracle whenever the exposer's one
-//! sweep ticks. A session that finds itself recalled or expired returns, which drops it and every stream on
-//! it. The oracle holds only rules, never a session, so nothing here can list, count, or name the live
+//! sweep ticks. A session that finds itself recalled or expired, anchored at a root no longer trusted, or
+//! held by a peer whose key is revoked returns, which drops it and every stream on it. The oracle holds only rules, never a session, so nothing here can list, count, or name the live
 //! peers.
 //!
 //! The unit is the SESSION: a recall or an expiry ends every stream on it, including streams admitted
@@ -45,18 +45,42 @@ pub(super) const MAX_SESSION_CHAIN_IDS: usize = 1024;
 /// The rule a live session is re-checked against: whether the chains it was admitted on are still good.
 ///
 /// Synchronous and cheap, like the gate's own [`Revocations`] store, because every live session asks it on
-/// every sweep. It answers about chains only: it never sees a session, a peer, or a count, so no impl can
-/// grow into an inventory of who is connected.
+/// every sweep. It answers about one session's record at a time: it never sees a session or a count, so no
+/// impl can grow into an inventory of who is connected.
 ///
 /// Implemented for nauthy's stores, so a caller shares ONE instance between the gate and the cut and the
 /// two can never disagree about a file they each read at a different moment.
+///
+/// A wrapper that holds an oracle must forward [`trusts`](Self::trusts) and
+/// [`revoked_peer`](Self::revoked_peer) as well as [`cuts`](Self::cuts): a provided method a wrapper does
+/// not write answers the default, not the inner oracle, and would trust every anchor and every peer.
 pub trait LiveCuts: Send + Sync {
     /// Whether a session admitted on `chains` must end now.
     fn cuts(&self, chains: &AdmittedChains) -> bool;
+
+    /// Whether a session anchored at `anchor` may keep running: the root the gate verified a stream's
+    /// first cap under, which a gate whose trusted root can change may since have stopped trusting. A
+    /// session ends when ANY of its anchors is no longer trusted, so a session that mixed streams under an
+    /// old root and a still-trusted one does not ride the second past the change.
+    ///
+    /// Provided, trusting every anchor: an oracle behind a gate whose root never changes keeps the default.
+    fn trusts(&self, _anchor: &VerifyKey) -> bool {
+        true
+    }
+
+    /// Whether the key of the peer a session proved is revoked, which ends the session whatever caps it
+    /// was admitted on. The gate refuses a revoked peer at admission; this reaches a session admitted
+    /// before the revocation.
+    ///
+    /// Provided, revoking no key: an oracle over a store that keeps no keys keeps the default.
+    fn revoked_peer(&self, _peer: &VerifyKey) -> bool {
+        false
+    }
 }
 
 /// Every root key and revocation id of every capability the gate ruled on to admit a session's streams,
-/// and how long those grants hold it: the facts the cut re-checks, kept instead of the caps themselves.
+/// the anchors those streams were verified under, the peer key they were bound to, and how long those
+/// grants hold the session: the facts the cut re-checks, kept instead of the caps themselves.
 ///
 /// A parsed cap is the whole token; the ids and the root are all a revocation or a disabled root ever
 /// matches. Held as a union per session: the cut is session-granular, so which stream carried which cap
@@ -65,6 +89,8 @@ pub trait LiveCuts: Send + Sync {
 pub struct AdmittedChains {
     roots: HashSet<VerifyKey>,
     ids: HashSet<RevocationId>,
+    anchors: HashSet<VerifyKey>,
+    peer: Option<VerifyKey>,
     lease: Lease,
 }
 
@@ -79,11 +105,26 @@ impl AdmittedChains {
         self.ids.iter()
     }
 
+    /// The root of each admitted stream's first cap: the one the gate verified at its own authority, so
+    /// the root the session's standing hangs on. A badge presented second, on the two-token path, is never
+    /// an anchor: it is rooted at the authority its slip names, which no change to the gate's trusted root
+    /// moves, and it stays in [`roots`](Self::roots), where a disabled root still cuts it.
+    pub fn anchors(&self) -> impl Iterator<Item = VerifyKey> + '_ {
+        self.anchors.iter().copied()
+    }
+
+    /// The key the session's peer proved, once any of its streams was admitted on a cap. `None` for a
+    /// session whose every stream took the open path, where the key was announced and ruled on by nothing.
+    pub fn peer(&self) -> Option<VerifyKey> {
+        self.peer
+    }
+
     /// Keep what the cut will need of `cap`, and nothing else. Test fixtures only: the serving path goes
     /// through [`record_all`](Self::record_all), which enforces the ceiling.
     #[cfg(test)]
     pub(super) fn record(&mut self, cap: &Cap) {
         self.roots.insert(cap.root());
+        self.anchors.insert(cap.root());
         self.ids.extend(cap.revocation_ids());
         let until =
             Lease::of_stream(core::slice::from_ref(cap)).expect("a fixture cap's expiry reads");
@@ -96,10 +137,14 @@ impl AdmittedChains {
         self.lease.lapsed(now)
     }
 
-    /// Keep what the cut will need of every cap one stream was admitted on, or keep nothing and refuse
-    /// the stream: when a cap's expiry cannot be read, or when keeping it would take this session past
-    /// [`MAX_SESSION_CHAIN_IDS`]. All or nothing, so a refused stream leaves no trace in the record.
-    pub(super) fn record_all(&mut self, ruled: &[Cap]) -> Result<(), Unrecorded> {
+    /// Keep what the cut will need of every cap one stream was admitted on, and of the `peer` it was bound
+    /// to, or keep nothing and refuse the stream: when a cap's expiry cannot be read, or when keeping it
+    /// would take this session past [`MAX_SESSION_CHAIN_IDS`]. All or nothing, so a refused stream leaves
+    /// no trace in the record.
+    ///
+    /// `ruled` lists the cap the gate verified at its own authority first, so its root is the stream's
+    /// anchor, and a badge after it is not.
+    pub(super) fn record_all(&mut self, peer: VerifyKey, ruled: &[Cap]) -> Result<(), Unrecorded> {
         // Fail closed: a grant whose end cannot be read is treated as already over, so the stream it
         // would admit is refused here rather than served on a lease nobody can bound.
         let until = Lease::of_stream(ruled).map_err(Unrecorded::UnreadableExpiry)?;
@@ -113,8 +158,11 @@ impl AdmittedChains {
         }
         self.ids.extend(fresh);
         self.roots.extend(ruled.iter().map(Cap::root));
-        // An open stream rules on nothing, so it has no grant to bound the session by.
-        if !ruled.is_empty() {
+        // An open stream rules on nothing, so it has no grant to bound the session by, no anchor, and no
+        // proven peer.
+        if let Some(anchor) = ruled.first() {
+            self.anchors.insert(anchor.root());
+            self.peer = Some(peer);
             self.lease = self.lease.extend(until);
         }
         Ok(())
@@ -194,6 +242,10 @@ impl Lease {
 pub(super) enum Cut {
     /// A cap it was admitted on is revoked, or the root one was issued under is disabled.
     Recalled,
+    /// A root one of its streams was verified under is no longer trusted.
+    Untrusted,
+    /// The key its peer proved is revoked.
+    PeerRevoked,
     /// A grant it was admitted on has expired.
     Expired,
 }
@@ -202,6 +254,8 @@ impl core::fmt::Display for Cut {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Self::Recalled => "a capability it was admitted on is revoked or its root disabled",
+            Self::Untrusted => "a root it was admitted under is no longer trusted",
+            Self::PeerRevoked => "its peer's key is revoked",
             Self::Expired => "a capability it was admitted on has expired",
         })
     }
@@ -232,10 +286,18 @@ impl<R: Revocations + LiveCuts> LiveCuts for Latch<R> {
     }
 }
 
-/// A shared oracle cuts as the one it shares, which is how the gate and the cut read one instance.
+/// A shared oracle answers as the one it shares, which is how the gate and the cut read one instance.
 impl<C: LiveCuts + ?Sized> LiveCuts for Arc<C> {
     fn cuts(&self, chains: &AdmittedChains) -> bool {
         C::cuts(self, chains)
+    }
+
+    fn trusts(&self, anchor: &VerifyKey) -> bool {
+        C::trusts(self, anchor)
+    }
+
+    fn revoked_peer(&self, peer: &VerifyKey) -> bool {
+        C::revoked_peer(self, peer)
     }
 }
 
@@ -280,11 +342,21 @@ impl Cuts {
     }
 
     /// Whether the session behind `cut` must end at `now`, and why. Expiry is checked here, beside the
-    /// oracle rather than inside it, so every oracle a caller wires gets it and none can forget it.
+    /// oracle rather than inside it, so every oracle a caller wires gets it and none can forget it. So is
+    /// the walk over the session's anchors and its peer: the oracle only rules on one key at a time.
     pub(super) fn cuts(&self, cut: &SessionCut, now: SystemTime) -> Option<Cut> {
         let chains = cut.chains.lock().unwrap_or_else(PoisonError::into_inner);
         if self.oracle.cuts(&chains) {
             return Some(Cut::Recalled);
+        }
+        if chains.anchors().any(|anchor| !self.oracle.trusts(&anchor)) {
+            return Some(Cut::Untrusted);
+        }
+        if chains
+            .peer()
+            .is_some_and(|peer| self.oracle.revoked_peer(&peer))
+        {
+            return Some(Cut::PeerRevoked);
         }
         chains.lapsed(now).then_some(Cut::Expired)
     }

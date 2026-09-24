@@ -42,6 +42,13 @@ fn signet() -> Identity {
     Identity::from_secret(&[9u8; 32]).expect("valid secret")
 }
 
+/// The key a unit test's streams were admitted from.
+fn dialer() -> nauthy::VerifyKey {
+    Identity::from_secret(&[13u8; 32])
+        .expect("valid secret")
+        .verifying_key()
+}
+
 /// An hour out: nothing here expires mid-test.
 fn hour() -> std::time::SystemTime {
     nauthy::Request::expires_in(Duration::from_secs(3600))
@@ -760,7 +767,8 @@ fn a_lease_lapses_at_the_first_grant_of_any_stream() {
     one.record(&signet().mint(&svc("demo"), at(10)).expect("mint"));
     assert!(!one.lapsed(at(10)), "a grant is good through its expiry");
     assert!(one.lapsed(at(11)), "and lapsed after it");
-    one.record_all(&[]).expect("an open stream keeps nothing");
+    one.record_all(dialer(), &[])
+        .expect("an open stream keeps nothing");
     assert!(
         one.lapsed(at(11)),
         "an open stream, ruled on nothing, holds no session open"
@@ -799,7 +807,7 @@ fn a_lease_lapses_at_the_first_grant_of_any_stream() {
         .expect("mint badge");
     let mut paired = AdmittedChains::default();
     paired
-        .record_all(&[slip, badge])
+        .record_all(dialer(), &[slip, badge])
         .expect("under the ceiling");
     assert!(!paired.lapsed(at(15)), "held while both caps hold");
     assert!(
@@ -963,11 +971,11 @@ fn a_refused_record_keeps_nothing() {
     let mut chains = AdmittedChains::default();
     for cap in fill {
         chains
-            .record_all(core::slice::from_ref(cap))
+            .record_all(dialer(), core::slice::from_ref(cap))
             .expect("under the ceiling");
     }
     assert!(
-        chains.record_all(over).is_err(),
+        chains.record_all(dialer(), over).is_err(),
         "one past the ceiling is refused"
     );
     assert_eq!(
@@ -976,7 +984,7 @@ fn a_refused_record_keeps_nothing() {
         "and keeps nothing of it"
     );
     assert!(
-        chains.record_all(&fill[..1]).is_ok(),
+        chains.record_all(dialer(), &fill[..1]).is_ok(),
         "a grant already kept adds nothing and is accepted"
     );
 }
@@ -1174,3 +1182,6 @@ async fn a_handshake_in_flight_across_a_sweep_is_still_accepted() {
         })
         .await;
 }
+
+#[path = "cut_anchor_tests.rs"]
+mod anchors;
