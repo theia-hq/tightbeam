@@ -12,7 +12,9 @@
 //! that is present but does not load (wrong size, unreadable, a directory, a mode group or other can read,
 //! an owner that is not this user) is an [`IdentityError`] naming the path, and it is never overwritten: a
 //! truncated or corrupted key is a hard error, not a new identity. A file sealed under a passphrase is
-//! refused too, because tightbeam has no way to ask for one; it is never read as absent.
+//! refused too, because tightbeam has no way to ask for one; it is never read as absent. The file is
+//! named as a device key: a sealed root key at the path is refused as the wrong kind, never loaded or
+//! replaced.
 //!
 //! The secret is a [`Secret`] newtype, never a bare `[u8; 32]`: it zeroizes on drop so the key does not
 //! linger in freed memory, and it is lent out only at the two boundaries that need it raw, the transport
@@ -162,11 +164,12 @@ pub async fn load(explicit: Option<&Path>) -> Result<Secret, IdentityError> {
     Ok(Secret(secret))
 }
 
-/// The key file at the explicit path, or the persisted default when none was given.
+/// The device key file at the explicit path, or the persisted default when none was given. The identity
+/// is this machine's own key, so a sealed root key at the path is refused by its kind, never read as one.
 fn key_file(explicit: Option<&Path>) -> Result<KeyFile, IdentityError> {
     match explicit {
-        Some(path) => Ok(KeyFile::from(path)),
-        None => default_path().map(KeyFile::from),
+        Some(path) => Ok(KeyFile::device(path)),
+        None => default_path().map(KeyFile::device),
     }
 }
 

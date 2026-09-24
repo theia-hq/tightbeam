@@ -223,7 +223,7 @@ async fn a_sealed_key_is_refused_and_survives() {
     let passphrase =
         keystore::Passphrase::new(zeroize::Zeroizing::new(b"hunter2".to_vec())).expect("non-empty");
     let secret = keystore::Secret::take(&mut [3u8; 32]);
-    keystore::KeyFile::from(path.as_path())
+    keystore::KeyFile::device(path.as_path())
         .write(&secret, keystore::Protection::Passphrase(&passphrase))
         .expect("seal a key");
     let sealed = std::fs::read(&path).expect("read the sealed file");
@@ -237,6 +237,49 @@ async fn a_sealed_key_is_refused_and_survives() {
     assert!(
         matches!(&refused, Err(IdentityError::Sealed { .. })),
         "a sealed file is refused as sealed"
+    );
+}
+
+/// A sealed root key at the identity path is refused as the wrong kind, by load and by write, and
+/// survives both: the identity is a device key, and a root key is never taken for one.
+#[tokio::test]
+async fn a_root_key_is_refused_by_its_kind_and_survives() {
+    let dir = TempDir::new("root-kind");
+    let path = dir.key();
+    let passphrase =
+        keystore::Passphrase::new(zeroize::Zeroizing::new(b"hunter2".to_vec())).expect("non-empty");
+    let secret = keystore::Secret::take(&mut [5u8; 32]);
+    keystore::KeyFile::root(path.as_path())
+        .write(&secret, keystore::Protection::Passphrase(&passphrase))
+        .expect("seal a root key");
+    let sealed = std::fs::read(&path).expect("read the sealed root key");
+
+    let wrong_kind = |refused: &Result<_, IdentityError>| {
+        matches!(
+            refused,
+            Err(IdentityError::Key(keystore::Error::Format {
+                source: keystore::FormatError::WrongKind {
+                    expected: keystore::Kind::Device,
+                    found: keystore::Kind::Root,
+                },
+                ..
+            }))
+        )
+    };
+    let loaded = load(Some(&path)).await.map(drop);
+    assert!(
+        wrong_kind(&loaded),
+        "a root key is refused by its kind on load, got {loaded:?}"
+    );
+    let written = write(&[5u8; 32], Some(&path)).await;
+    assert!(
+        wrong_kind(&written),
+        "a root key is refused by its kind on write, got {written:?}"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read back"),
+        sealed,
+        "the root key survives"
     );
 }
 
