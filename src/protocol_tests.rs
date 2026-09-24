@@ -39,7 +39,7 @@ impl<P: SecurityProfile> Session for StubSession<P> {
 fn presenting() -> Request {
     Request {
         service: "svc".to_owned(),
-        capability: Some("sheer:bf01abc.def".to_owned()),
+        capability: Some("ed01abc.def".to_owned()),
         membership: None,
     }
 }
@@ -60,7 +60,7 @@ async fn request_roundtrips_without_a_capability() {
 async fn request_roundtrips_with_a_capability() {
     let request = Request {
         service: "svc".to_owned(),
-        capability: Some("sheer:bf01abc.def".to_owned()),
+        capability: Some("ed01abc.def".to_owned()),
         membership: None,
     };
     let mut buf = Vec::new();
@@ -75,8 +75,8 @@ async fn request_roundtrips_with_both_slots() {
     // the dialer wrote.
     let request = Request {
         service: "ssh".to_owned(),
-        capability: Some("sheer:bf01abc.def".to_owned()),
-        membership: Some("sheer:bf02ghi.jkl".to_owned()),
+        capability: Some("ed01abc.def".to_owned()),
+        membership: Some("ed01ghi.jkl".to_owned()),
     };
     let mut buf = Vec::new();
     request.write(&mut buf).await.unwrap();
@@ -242,7 +242,7 @@ async fn a_membership_write_over_an_announced_session_refuses() {
     let request = Request {
         service: "svc".to_owned(),
         capability: None,
-        membership: Some("sheer:bf02ghi.jkl".to_owned()),
+        membership: Some("ed01ghi.jkl".to_owned()),
     };
     let mut writer = Vec::new();
     assert!(
@@ -411,8 +411,8 @@ mod vectors {
                 "tb04-request-capability-and-membership",
                 Request {
                     service: "ssh".to_owned(),
-                    capability: Some("sheer:bf01abc.def".to_owned()),
-                    membership: Some("sheer:bf02ghi.jkl".to_owned()),
+                    capability: Some("ed01abc.def".to_owned()),
+                    membership: Some("ed01ghi.jkl".to_owned()),
                 },
             )
             .await,

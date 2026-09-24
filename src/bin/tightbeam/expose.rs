@@ -17,8 +17,7 @@ use tightbeam::tunnel::{
 ///
 /// tightbeam's binary is a thin demo of the tunnel: it forwards the raw primitives (`tcp:<host>:<port>` /
 /// `unix:<path>`, and the raw-stream `file:<path>` / `fifo:<path>` that source a path's bytes to the peer)
-/// only. A named handler service is bound by value in a richer consumer (swoosh, or your own embedder), so
-/// it is not served here.
+/// only. A named handler service is bound by value in an embedder, so it is not served here.
 ///
 /// Authorization is a property of the node, not a per-expose choice: by default a service is gated to this
 /// node's signet (set once when the node adopts an identity), admitting the owner's own devices (membership
@@ -82,8 +81,8 @@ impl ExposeCmd {
         <T::Session as Session>::Read: Send + 'static,
     {
         // Build the gate before announcing readiness. This thin demo has no auto-added `control.*` services,
-        // so its `--public` stays a whole-node opt-out (a deliberate `Gate::Open` BASE); a richer consumer
-        // (swoosh) opens individual services per-service instead. An unprovisioned node with NO `--public`
+        // so its `--public` stays a whole-node opt-out (a deliberate `Gate::Open` BASE); an embedder opens
+        // individual services per-service instead. An unprovisioned node with NO `--public`
         // fails HERE, loudly, through the shared `resolve_gate` policy, never on a permissive default.
         let gate = if self.public {
             nauthy::Gate::Open
@@ -111,7 +110,7 @@ impl ExposeCmd {
         // or rooted at a key since disabled, ends itself. Under `--public` nothing is ruled on, so
         // nothing is ever cut.
         let exposer = router.expose()?.with_live_cuts(revocations);
-        // Prove the transport can carry this gate BEFORE any ready output, mirroring swoosh's serve: a
+        // Prove the transport can carry this gate BEFORE any ready output: a
         // rooted gate over a transport that does not prove the peer refuses here, never after a banner
         // the node cannot honor. The library's `run` re-checks, so the invariant holds however the
         // exposer is driven.
@@ -189,8 +188,34 @@ fn gate_description(cmd: &ExposeCmd, signet: Option<NodeId>) -> String {
         "public (anyone, unauthenticated)".to_owned()
     } else {
         match signet {
-            Some(root) => format!("signet {}", root.short()),
+            Some(root) => format!("root {}", root.short()),
             None => "unprovisioned".to_owned(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bifrost::NodeId;
+
+    use super::{ExposeCmd, gate_description};
+
+    fn gated() -> ExposeCmd {
+        ExposeCmd {
+            services: vec!["demo=echo:".to_owned()],
+            public: false,
+            public_unsafe: Vec::new(),
+            quiet: false,
+        }
+    }
+
+    /// The banner's gate line names the key the node trusts as a root, in the plain key text: the label is
+    /// the word "root", and the value is the start of the key a person can match against `status` or a pin.
+    #[test]
+    fn the_gate_line_names_the_root_key() {
+        let root = NodeId::from_ed25519_secret(&[1u8; 32]);
+        let line = gate_description(&gated(), Some(root));
+        assert_eq!(line, format!("root {}", root.short()));
+        assert!(line.starts_with("root ed01"), "{line}");
     }
 }

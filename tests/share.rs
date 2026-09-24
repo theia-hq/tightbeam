@@ -56,6 +56,20 @@ fn own_id() -> NodeId {
     NodeId::from_ed25519_secret(&OWN_SECRET)
 }
 
+/// The printed text is a link rooted at this node's key: it parses, it starts with the key, and nothing
+/// stands before the key.
+fn assert_is_own_link(link: &str) {
+    assert!(
+        link.parse::<nauthy::Link>().is_ok(),
+        "the printed text parses as a link: {link}"
+    );
+    assert!(
+        link.starts_with(&format!("{}.", own_id())),
+        "the link starts with this node's key: {link}"
+    );
+    assert!(!link.contains(':'), "the link carries no prefix: {link}");
+}
+
 #[tokio::test]
 async fn tightbeam_share_refuses_under_a_foreign_pin() {
     let dir = TempDir::new("foreign");
@@ -79,6 +93,10 @@ async fn tightbeam_share_refuses_under_a_foreign_pin() {
         stderr.contains(&format!("this node's key ({})", own_id())),
         "the refusal names the key the link would carry: {stderr}"
     );
+    assert!(
+        stderr.contains("Make the link with `tightbeam share` on the node whose key is that root"),
+        "the refusal says where the link can be made: {stderr}"
+    );
 }
 
 #[tokio::test]
@@ -91,7 +109,7 @@ async fn tightbeam_share_mints_under_its_own_pin() {
         String::from_utf8_lossy(&output.stderr)
     );
     let link = String::from_utf8(output.stdout).expect("utf-8 link");
-    assert!(link.starts_with("sheer:"), "a link is printed: {link}");
+    assert_is_own_link(link.trim());
 }
 
 #[tokio::test]
@@ -104,5 +122,38 @@ async fn tightbeam_share_mints_with_no_pin() {
         String::from_utf8_lossy(&output.stderr)
     );
     let link = String::from_utf8(output.stdout).expect("utf-8 link");
-    assert!(link.starts_with("sheer:"), "a link is printed: {link}");
+    assert_is_own_link(link.trim());
+}
+
+/// The link `share` prints is the library's own text, `<key>.<token>`, exactly: the same bytes a peer
+/// presents on the wire, with no scheme in front for anyone to strip.
+#[tokio::test]
+async fn share_prints_a_link_with_no_prefix() {
+    let dir = TempDir::new("bare");
+    let output = share_under(&dir, None).await;
+    assert!(
+        output.status.success(),
+        "share must mint: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let printed = String::from_utf8(output.stdout).expect("utf-8 link");
+    let printed = printed.trim();
+    let link = printed
+        .parse::<nauthy::Link>()
+        .expect("the printed text is a link");
+    assert_eq!(
+        link.as_str(),
+        printed,
+        "the printed text is the link's own text"
+    );
+    let (key, token) = printed.split_once('.').expect("a link holds a `.`");
+    assert_eq!(
+        key,
+        own_id().to_string(),
+        "the text before the `.` is the key"
+    );
+    assert!(
+        !token.is_empty() && !token.contains('.'),
+        "one `.`, then the token"
+    );
 }

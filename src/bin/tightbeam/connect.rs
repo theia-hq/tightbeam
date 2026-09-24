@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use bifrost::{Node, NodeId, Transport};
 use clap::Args;
 use eyre::WrapErr as _;
-use nauthy::{Link, SCHEME, Service};
+use nauthy::{Link, Service};
 use tightbeam::tunnel::Connector;
 
 /// Where a reached service's bytes go locally: the one `--to` selector, parsed to a closed enum so the
@@ -63,7 +63,7 @@ impl FromStr for To {
 /// Reach a peer's exposed service and bind it to a local port, stream it to stdout, or a unix listener.
 #[derive(Debug, Args)]
 pub struct ConnectCmd {
-    /// who to reach: a raw node id, or a `sheer:` capability link
+    /// who to reach: a raw node id, or a capability link (`<key>.<token>`)
     #[arg(value_name = "peer")]
     pub target: Target,
     /// where to put the stream: a local port, `-` for stdout, or `unix:<path>`
@@ -91,7 +91,7 @@ pub struct ConnectCmd {
 pub enum Target {
     /// A raw node id to dial; the host gates on the proven identity (open/strict/paired).
     Node(NodeId),
-    /// A capability link (`sheer:…`) to present to a `cap`-gated host.
+    /// A capability link (`<key>.<token>`) to present to a `cap`-gated host.
     Capability(String),
 }
 
@@ -99,7 +99,8 @@ impl FromStr for Target {
     type Err = eyre::Error;
 
     fn from_str(text: &str) -> eyre::Result<Self> {
-        if text.starts_with(SCHEME) {
+        // A key holds no `.` and a link holds exactly one, so the shape alone says which was given.
+        if text.contains('.') {
             // Parse it now so a malformed link fails fast at the CLI boundary, not mid-connect: the
             // connector reparses the validated text so the token travels whole to the host.
             text.parse::<Link>()?;
@@ -164,7 +165,7 @@ impl ConnectCmd {
 mod tests {
     use clap::Parser as _;
 
-    use super::To;
+    use super::{Target, To};
 
     /// `--service` is REQUIRED: there is no `default` to fall back on, so a dial names the service or
     /// does not leave. This fails the moment a `default_value` comes back, which is the point: the
@@ -186,6 +187,30 @@ mod tests {
         assert!(
             crate::Cli::try_parse_from(["tightbeam", "connect", &peer, "--to", "-"]).is_err(),
             "a dial with no --service must be refused at the parser, not at the far gate"
+        );
+    }
+
+    /// A peer is a key or a link, told apart by the `.` a link carries and a key never does: the link
+    /// text nauthy prints dials and presents with no prefix, and a key dials on its own.
+    #[test]
+    fn connect_takes_a_key_or_a_link_by_shape() {
+        let identity = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
+        let service = "web".parse::<nauthy::Service>().expect("a service name");
+        let link = nauthy::Link::mint(&identity, &service, core::time::Duration::from_secs(60))
+            .expect("mint a link")
+            .to_string();
+        assert!(
+            matches!(link.parse::<Target>().expect("a link parses"), Target::Capability(text) if text == link),
+            "the minted link text is a capability target: {link}"
+        );
+        let key = bifrost::NodeId::from_ed25519_secret(&[3u8; 32]);
+        assert!(
+            matches!(key.to_string().parse::<Target>().expect("a key parses"), Target::Node(node) if node == key),
+            "a key is a node target"
+        );
+        assert!(
+            format!("app:{link}").parse::<Target>().is_err(),
+            "anything before the key fails to parse"
         );
     }
 

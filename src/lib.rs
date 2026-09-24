@@ -11,7 +11,7 @@
 //! [`Handler`](tunnel::Handler) a caller binds to a name on a
 //! [`Router`](tunnel::Router); tightbeam knows only the contract, never what a handler does, and
 //! ships only its own built-ins (`echo:`, local forwards, raw streams). [`Link`](nauthy::Link) mints,
-//! narrows, and revokes the `sheer:` capabilities the gate honors, all offline.
+//! narrows, and revokes the capabilities the gate honors, all offline.
 //!
 //! The tunnel core lives in [`tunnel`]; the wire frames in [`protocol`]. A command-line tool can be built
 //! on this library; this crate also ships a `tightbeam` binary (`src/bin/tightbeam/`), a thin bridge over

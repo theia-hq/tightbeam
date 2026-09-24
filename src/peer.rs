@@ -31,12 +31,13 @@ pub struct Peer {
 
 /// Which side of a conversation a bound node is on, and so what of it goes on the LAN.
 ///
-/// A serving node is dialled by its key, so it publishes a record naming that key and its bind. A
-/// dialling node reaches out to a key it already holds: nobody needs to find it, and a record would
-/// tell every host on the LAN which key is running here, so it publishes none and only browses.
+/// A serving node is dialled by its key, so it publishes a record of its bind under a name only holders
+/// of that key recognise. A dialling node reaches out to a key it already holds: nobody needs to find
+/// it, and a record would tell every host on the LAN that a node is running here, so it publishes none
+/// and only browses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    /// Accepts dials: advertises its key and bind over mDNS.
+    /// Accepts dials: announces itself over mDNS under a rotating name only holders of its key recognise.
     Serving,
     /// Only dials: browses mDNS, advertises nothing.
     Dialing,

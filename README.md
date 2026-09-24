@@ -58,7 +58,7 @@ This page describes the default branch; the released docs are at the newest tag.
 ## Reach a service, get a stream
 
 A `Connector` reaches one exposed service on a peer and hands back a bidirectional stream. Build it from a
-node id (optionally presenting a capability token) or from a `sheer:` link that carries both the node to
+node id (optionally presenting a capability token) or from a link that carries both the node to
 dial and the token. A dial that presents a credential has a compile-time-checked form,
 `PresentingConnector`: it requires the transport to prove the peer, so a credential over a transport that
 only announces the peer does not compile. The unbounded `Connector` carries the same rule at run time, for
@@ -75,7 +75,7 @@ let forward = Connector::to_node(peer_id, "web".parse()?, None)
 forward.run().await?;
 
 // Or reach it via a capability link, which supplies the node and the token together.
-let link: Link = "sheer:<node-id>.<token>".parse()?;
+let link: Link = "<key>.<token>".parse()?;
 let forward = PresentingConnector::from_link(&link, "web".parse()?)
     .preflight(&node, 8080)
     .await?;
@@ -163,7 +163,7 @@ let exposer = Router::new(gate).service("sh".parse()?, Shell)?.expose()?;
 ## Hand out an expiring key
 
 A gate rooted at a node's signet admits the node's own devices and their delegates. A delegate holds a
-`sheer:` capability: a signed, expiring, attenuable link the gate verifies offline, with no server in the
+capability: a signed, expiring, attenuable link the gate verifies offline, with no server in the
 loop and no allowlist to sync. The link is a [`nauthy::Link`], and minting, narrowing, and revoking are
 methods on it.
 
@@ -229,7 +229,7 @@ The library is the product, but the `tightbeam` binary is a real command-line to
 shell, and the [getting-started walkthrough](examples.md) runs entirely on it. It exposes services (raw
 `tcp:` / `unix:` forwards, and the `echo:` / `stdin:` / `file:` / `fifo:` sources), gated by default or
 opened with `--public` (and `--public-unsafe` for a raw source); it reaches them with `connect`; and it
-mints, shares, and revokes `sheer:` links. It registers no `Handler` of its own, so a named handler (a
+mints, shares, and revokes links. It registers no `Handler` of its own, so a named handler (a
 shell, say) is something a library embedder adds in code. On its own the binary already covers forwarding,
 raw streams, and an ssh `ProxyCommand`.
 
@@ -238,11 +238,6 @@ raw streams, and an ssh `ProxyCommand`.
 A capability is a bearer token: whoever holds an unexpired, un-revoked one gets that one service until it
 expires or you revoke it. A device-bound or signet-bound link narrows that (a copy alone grants no one), and
 short expiry and revocation bound the rest.
-
-## A tool built on this
-
-swoosh is a command-line tool built on tightbeam; see
-[swoosh](https://github.com/theia-hq/swoosh) for a worked consumer that drives this library end to end.
 
 ## The name
 

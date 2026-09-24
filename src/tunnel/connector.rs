@@ -35,7 +35,7 @@ pub struct DialRefused {
 ///
 /// The domain half of a `connect`, with target parsing left to the caller. A caller builds one with
 /// [`Connector::to_node`] (a raw node id, optionally presenting a [`Link`]) or [`Connector::from_link`]
-/// (a `sheer:` link that supplies both the node and the token), then drives it with
+/// (a link that supplies both the node and the token), then drives it with
 /// [`Connector::preflight`] (then [`PortForward::run`]) or [`Connector::pipe_stdio`].
 ///
 /// This type is the path for a transport selected at run time, where no compile-time bound is possible;
@@ -60,7 +60,7 @@ impl Connector {
         }
     }
 
-    /// Connect via a `sheer:` capability link, requesting `service`. The link supplies the node to dial
+    /// Connect via a capability link, requesting `service`. The link supplies the node to dial
     /// (the cap's root) and carries the token; the host refuses unless the token actually grants `service`.
     pub fn from_link(link: &Link, service: Service) -> Self {
         Self {
@@ -235,7 +235,7 @@ impl PresentingConnector {
         }
     }
 
-    /// Dial the node a `sheer:` link names, presenting the link (slot 1). The compile-time twin of
+    /// Dial the node a link names, presenting the link (slot 1). The compile-time twin of
     /// [`Connector::from_link`].
     pub fn from_link(link: &Link, service: Service) -> Self {
         Self {

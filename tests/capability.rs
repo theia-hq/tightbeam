@@ -7,7 +7,7 @@
 //!
 //! The exposer's cap identity is independent of the mem transport's synthetic node id, so the connector
 //! dials the mem node directly (`Target::Node`) and presents the token with `--present`. Over iroh the
-//! two coincide (the node binds under the cap secret), so a bare `sheer:` link both dials and presents;
+//! two coincide (the node binds under the cap secret), so a bare capability link both dials and presents;
 //! see the demo. Here the split lets the gate be exercised without an ed25519-keyed mem transport.
 
 use core::time::Duration;

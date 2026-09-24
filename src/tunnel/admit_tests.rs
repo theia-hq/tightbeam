@@ -1272,7 +1272,7 @@ fn a_member_dial_ignores_a_second_slot_when_slot_one_is_not_signet_bound() {
             security: PROVEN,
         },
         Some(badge.as_str()),
-        Some("not a sheer link"),
+        Some("not a link"),
         &svc("web"),
     )
     .expect("a member badge admits on slot 1 alone; garbage in slot 2 is ignored");

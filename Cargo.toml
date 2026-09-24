@@ -11,23 +11,23 @@ name = "tightbeam"
 description = "Named services behind one gate, reached by public key: a router, a connector, and the wire between them."
 version = "0.15.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# theia. Sibling git-deps are pinned to an EXACT rev so a tightbeam release records exactly which
+# Siblings. Sibling git-deps are pinned to an EXACT rev so a tightbeam release records exactly which
 # nauthy/bifrost commit compiled in, instead of floating on default-branch HEAD. The local dev
 # `.cargo/config.toml` still [patch]es these by URL to sibling PATH checkouts, so a `rev` here does not
 # slow local builds (the patch wins locally regardless of the rev); CI resolves the rev from GitHub. All
 # bifrost-* crates live in one repo, so they share one rev. Bump deliberately each release.
-bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "31107a0e7122bd25372c8c74ae8565f9e84f6827" }
-bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "31107a0e7122bd25372c8c74ae8565f9e84f6827" }
-bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "31107a0e7122bd25372c8c74ae8565f9e84f6827" }
-# The key file store, in bifrost's repo beside the identity it stores. v0.6.1: a key file is named with
-# its kind, and the identity is a device key.
-keystore = { git = "https://github.com/theia-hq/bifrost", rev = "31107a0e7122bd25372c8c74ae8565f9e84f6827" }
-# v0.7.0: `Gate::Anchored`, and `Revocations::is_revoked_peer`, which the live cut's peer check mirrors.
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "9bb8a267148bb90cc6b87435d850991ccdf8257e" }
+bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "ed7cd8d591b4bef3ff1d005ad4f8b9b6a82b8359" }
+bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "ed7cd8d591b4bef3ff1d005ad4f8b9b6a82b8359" }
+bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "ed7cd8d591b4bef3ff1d005ad4f8b9b6a82b8359" }
+# The key file store, in bifrost's repo beside the identity it stores. v0.7.0: a key file starts with
+# `KEYSTORE`, and key text starts with `ed01`.
+keystore = { git = "https://github.com/theia-hq/bifrost", rev = "ed7cd8d591b4bef3ff1d005ad4f8b9b6a82b8359" }
+# v0.9.0: a link is `<key>.<token>` with no scheme, and key text starts with `ed01`.
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "2b2a8a94cd3ee211efb94aa0173f6009b5d1ba4f" }
 # The handler contract, in-tree beside its only dispatcher. A path dep (not a git self-dep): the workspace
 # member resolves within this checkout, and the package stays separately pinnable by a consumer.
 tightbeam-handler = { path = "tightbeam-handler" }
@@ -54,7 +54,7 @@ libc = "0.2"
 # today only through feature unification via iroh, so a dependency bump could drop it and break the
 # test build. Every sibling repo using the paused clock declares it explicitly.
 tokio = { version = "1", features = ["test-util"] }
-bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "31107a0e7122bd25372c8c74ae8565f9e84f6827" }
+bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "ed7cd8d591b4bef3ff1d005ad4f8b9b6a82b8359" }
 # A hostile holder appends raw datalog to a cap it was given; nauthy's API writes only its own shapes, so
 # the live cut's fail-closed read is tested with a token built the way that holder builds one. Both are
 # already in the tree through nauthy.
