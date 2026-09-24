@@ -1,18 +1,21 @@
 //! The live cut behind a gate whose trusted root can change: a session ends when a root it was anchored
 //! at is no longer trusted, or when the key its peer proved is revoked, and a badge presented second is
-//! never taken for an anchor. Also that an `Arc` over an oracle answers as the oracle does, and that an
-//! oracle which keeps the defaults trusts every anchor.
+//! never taken for an anchor. Also that an `Arc` or a [`Latch`] over an oracle answers as the oracle
+//! does, and that an oracle which keeps the defaults trusts every anchor.
 
 use core::time::Duration;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use bifrost::{NoDiscovery, Node};
+use bifrost::{NoDiscovery, Node, Session as _};
 use bifrost_mem::MemTransport;
-use nauthy::{Cap, Gate, Identity, IssuedIds, PinSource, RevocationId, Revocations, VerifyKey};
+use nauthy::{
+    Cap, DisabledRoots, Gate, Identity, IssuedIds, Latch, PinSource, RevocationId, Revocations,
+    VerifyKey,
+};
 
 use super::super::{AdmittedChains, CUT_SWEEP, LiveCuts};
-use super::{gated_echo, host_ends, hour, serve, signet, still_echoes, store};
+use super::{gated_echo, host_ends, hour, scratch, serve, signet, still_echoes, store};
 use crate::identity::AsVerifyKey as _;
 use crate::tunnel::Exposer;
 use crate::tunnel::fixtures::{ServiceStream, prove, services, svc};
@@ -376,10 +379,17 @@ async fn the_default_oracle_trusts_every_anchor() {
         .await;
 }
 
-/// An oracle with fixed answers, for proving what a wrapper around it forwards.
+/// An oracle with fixed answers, for proving what a wrapper around it forwards. As a gate store it
+/// revokes nothing, so a wrapper that cuts over it cuts on its [`LiveCuts`] answers alone.
 struct Fixed {
     trusts: bool,
     revoked_peer: bool,
+}
+
+impl Revocations for Fixed {
+    fn is_revoked(&self, _cap: &Cap) -> bool {
+        false
+    }
 }
 
 impl LiveCuts for Fixed {
@@ -396,25 +406,63 @@ impl LiveCuts for Fixed {
     }
 }
 
-/// Serve a member session behind an anchored gate with the cut wired to `Arc<oracle>`, and report
-/// whether the host ends it.
-async fn arc_over(oracle: Fixed) -> bool {
+/// A keyed store as a caller would write one: it revokes keys for the gate, and on the cut side answers
+/// only [`cuts`](LiveCuts::cuts), keeping the [`revoked_peer`](LiveCuts::revoked_peer) default.
+struct Keyed(Arc<Recalls>);
+
+impl Revocations for Keyed {
+    fn is_revoked(&self, cap: &Cap) -> bool {
+        self.0.is_revoked(cap)
+    }
+
+    fn is_revoked_peer(&self, peer: &VerifyKey) -> bool {
+        self.0.is_revoked_peer(peer)
+    }
+}
+
+impl LiveCuts for Keyed {
+    fn cuts(&self, chains: &AdmittedChains) -> bool {
+        chains.ids().any(|id| self.0.names(id))
+    }
+}
+
+/// A latch over `inner`, with no root disabled.
+async fn latch<R: Revocations>(tag: &str, inner: R) -> Latch<R> {
+    Latch::new(
+        DisabledRoots::load(scratch(&format!("{tag}-roots")))
+            .await
+            .expect("load roots"),
+        inner,
+    )
+}
+
+/// Serve a member session behind an anchored gate with the cut wired to `oracle`, and report whether the
+/// host ends it.
+async fn ends_under(oracle: impl LiveCuts + 'static) -> bool {
     let node = Anchored::new();
-    let host = serve(node.exposer(Arc::new(oracle)));
+    let host = serve(node.exposer(oracle));
     let consumer = Node::new(MemTransport::bind(), NoDiscovery);
     let badge = old_root()
         .mint_member(consumer.node_id().verify_key(), hour())
         .expect("mint badge");
     let session = consumer.connect(host).await.expect("connect");
-    // No echo first: the oracle rules against the session from the first sweep, which may come before it.
-    let mut stream = ServiceStream::open_with(
-        &session,
-        "demo",
-        Some(badge.link().expect("link").to_string()),
-    )
+    // No echo first: the oracle rules against the session from the first sweep, which may land before the
+    // admission's reply is read. A stream ended there is as ended as one ended after it; only a refusal
+    // means the gate, not the cut, ruled.
+    let (mut writer, mut reader) = session.open_bi().await.expect("open a stream");
+    crate::protocol::Request {
+        service: "demo".to_owned(),
+        capability: Some(badge.link().expect("link").to_string()),
+        membership: None,
+    }
+    .write(&mut writer)
     .await
-    .expect("admitted");
-    host_ends(&mut stream.reader).await
+    .expect("write request");
+    match crate::protocol::Response::read(&mut reader).await {
+        Err(_) => true,
+        Ok(crate::protocol::Response::Refused(refusal)) => panic!("admitted, got {refusal:?}"),
+        Ok(crate::protocol::Response::Ok) => host_ends(&mut reader).await,
+    }
 }
 
 #[tokio::test]
@@ -423,10 +471,10 @@ async fn arc_live_cuts_forwards_trusts() {
     local
         .run_until(async {
             assert!(
-                arc_over(Fixed {
+                ends_under(Arc::new(Fixed {
                     trusts: false,
                     revoked_peer: false,
-                })
+                }))
                 .await,
                 "an Arc over an oracle that trusts no anchor cuts as the oracle does"
             );
@@ -440,12 +488,84 @@ async fn arc_live_cuts_forwards_revoked_peer() {
     local
         .run_until(async {
             assert!(
-                arc_over(Fixed {
+                ends_under(Arc::new(Fixed {
                     trusts: true,
                     revoked_peer: true,
-                })
+                }))
                 .await,
                 "an Arc over an oracle that revokes the peer cuts as the oracle does"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn latch_live_cuts_forwards_trusts() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let oracle = latch(
+                "latch-trusts",
+                Fixed {
+                    trusts: false,
+                    revoked_peer: false,
+                },
+            )
+            .await;
+            assert!(
+                ends_under(Arc::new(oracle)).await,
+                "a latch over an oracle that trusts no anchor cuts as the oracle does"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn latch_live_cuts_forwards_revoked_peer() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let oracle = latch(
+                "latch-peer",
+                Fixed {
+                    trusts: true,
+                    revoked_peer: true,
+                },
+            )
+            .await;
+            assert!(
+                ends_under(Arc::new(oracle)).await,
+                "a latch over an oracle that revokes the peer cuts as the oracle does"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn a_key_revoked_in_a_latched_store_cuts_its_open_session() {
+    // The store revokes the key for the gate and keeps the cut-side default, so only the latch asking
+    // itself the gate's question ends the session: the gate and the cut read one instance and agree.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let node = Anchored::new();
+            let oracle = Arc::new(latch("latch-keyed", Keyed(Arc::clone(&node.recalls))).await);
+            let host = serve(node.exposer(Arc::clone(&oracle)));
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let peer = consumer.node_id().verify_key();
+            let badge = old_root().mint_member(peer, hour()).expect("mint badge");
+
+            let session = consumer.connect(host).await.expect("connect");
+            let mut stream = open(&session, "demo", &badge).await;
+
+            node.recalls.revoke_key(peer);
+            assert!(
+                Revocations::is_revoked_peer(&*oracle, &peer),
+                "the gate side refuses the key"
+            );
+            assert!(
+                host_ends(&mut stream.reader).await,
+                "a session whose key the latched store revokes ends, as the gate would refuse it"
             );
         })
         .await;

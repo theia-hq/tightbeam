@@ -5,8 +5,12 @@
 //! no stream left to refuse. The cut closes that gap without a registry of who is connected: each session
 //! keeps the chains it was admitted on, in its own frame, and re-asks the oracle whenever the exposer's one
 //! sweep ticks. A session that finds itself recalled or expired, anchored at a root no longer trusted, or
-//! held by a peer whose key is revoked returns, which drops it and every stream on it. The oracle holds only rules, never a session, so nothing here can list, count, or name the live
-//! peers.
+//! held by a peer whose key is revoked returns, which drops it and every stream on it.
+//!
+//! The oracle holds no session and no list of sessions, but it is not blind to who is connected: every
+//! sweep asks it about the proven peer key of each live session admitted on a cap, so an oracle that
+//! remembered what it was asked could list and count them. tightbeam's own oracles keep nothing between
+//! calls; the property rests on the oracle being the node's own revocation store, not on the cut.
 //!
 //! The unit is the SESSION: a recall or an expiry ends every stream on it, including streams admitted
 //! under other caps, because a dropped stream alone leaves a handler's detached work running.
@@ -45,8 +49,11 @@ pub(super) const MAX_SESSION_CHAIN_IDS: usize = 1024;
 /// The rule a live session is re-checked against: whether the chains it was admitted on are still good.
 ///
 /// Synchronous and cheap, like the gate's own [`Revocations`] store, because every live session asks it on
-/// every sweep. It answers about one session's record at a time: it never sees a session or a count, so no
-/// impl can grow into an inventory of who is connected.
+/// every sweep. It answers about one session's record at a time and is never handed a session, but
+/// [`revoked_peer`](Self::revoked_peer) is asked once per sweep for each live session admitted on a cap,
+/// with the key that session's peer proved: an impl that kept those keys could list and count who is
+/// connected. tightbeam's own impls keep nothing; wire only an oracle that is the node's own revocation
+/// store.
 ///
 /// Implemented for nauthy's stores, so a caller shares ONE instance between the gate and the cut and the
 /// two can never disagree about a file they each read at a different moment.
@@ -278,11 +285,24 @@ impl LiveCuts for FileDenylist {
     }
 }
 
-/// The disabled root first, then the inner store: the same order and the same two questions the gate's
-/// own [`Latch`] answers at admission.
+/// The disabled root first, then the inner store: the same order and the same questions the gate's own
+/// [`Latch`] answers at admission. Every method is written, since a provided one left out would answer
+/// the default rather than the inner store.
 impl<R: Revocations + LiveCuts> LiveCuts for Latch<R> {
     fn cuts(&self, chains: &AdmittedChains) -> bool {
         chains.roots().any(|root| self.disabled().is_disabled(root)) || self.inner().cuts(chains)
+    }
+
+    /// The disabled roots are authority keys, not anchors a pin moves between, so only the inner store is
+    /// asked.
+    fn trusts(&self, anchor: &VerifyKey) -> bool {
+        self.inner().trusts(anchor)
+    }
+
+    /// The question the gate asks this same latch at admission, then the inner store's own cut-side
+    /// answer: a store that revokes keys for the gate but keeps the [`LiveCuts`] default still cuts.
+    fn revoked_peer(&self, peer: &VerifyKey) -> bool {
+        Revocations::is_revoked_peer(self, peer) || self.inner().revoked_peer(peer)
     }
 }
 
