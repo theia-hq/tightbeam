@@ -120,10 +120,12 @@ async fn run() -> eyre::Result<()> {
         Command::Attenuate(cmd) => cmd.run(),
         // `revoke` adds to the local revocation denylist; local, no node, no identity.
         Command::Revoke(cmd) => cmd.run().await,
-        // `share` needs the signing identity but no bound node: minting is offline.
+        // `share` needs the signing identity but no bound node: minting is offline. It also reads the
+        // signet, because a link signed under a foreign one would be admitted nowhere.
         Command::Share(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
-            cmd.run(&secret.cap_identity()?)
+            let signet = load_signet().await?;
+            cmd.run(&secret.cap_identity()?, signet)
         }
         // `expose`/`connect` bind a node. `expose` also reads the persisted signet: the key its default
         // gate trusts (a family gate admits the owner's devices and their delegates).
