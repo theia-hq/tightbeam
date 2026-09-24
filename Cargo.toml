@@ -26,9 +26,8 @@ bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "7e2702af2c6
 # The key file store, in bifrost's repo beside the identity it stores. No released rev carries it yet, so
 # this rev resolves only through the local path patch until the cascade publishes one.
 keystore = { git = "https://github.com/theia-hq/bifrost", rev = "7e2702af2c6b7a8986c60f492042bcc7f6107438" }
-# `Cap::valid_until`, which the live cut reads, is on no released rev yet: this one is its unmerged commit,
-# and moves to the release that carries it.
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "cd76786de5dba4db295c43aac5a1e931ddb67429" }
+# v0.7.0: `Gate::Anchored`, and `Revocations::is_revoked_peer`, which the live cut's peer check mirrors.
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "9bb8a267148bb90cc6b87435d850991ccdf8257e" }
 # The handler contract, in-tree beside its only dispatcher. A path dep (not a git self-dep): the workspace
 # member resolves within this checkout, and the package stays separately pinnable by a consumer.
 tightbeam-handler = { path = "tightbeam-handler" }

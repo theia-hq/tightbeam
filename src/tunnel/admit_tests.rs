@@ -1348,6 +1348,76 @@ fn an_announced_session_cannot_root_admit_a_valid_badge() {
     );
 }
 
+/// An anchored base wants a capability exactly as a rooted one does, so an announced session is refused
+/// before the ruling, even with a slip the gate's own key issued and recorded.
+#[test]
+fn an_anchored_base_refuses_an_unproven_peer() {
+    struct Unpinned;
+    impl nauthy::PinSource for Unpinned {
+        fn current(&self) -> Option<nauthy::VerifyKey> {
+            None
+        }
+    }
+    struct EveryId;
+    impl nauthy::IssuedIds for EveryId {
+        fn is_issued(&self, _id: &nauthy::RevocationId) -> bool {
+            true
+        }
+    }
+
+    let own = nauthy::Identity::from_secret(&[23u8; 32]).expect("valid secret");
+    let gate = Gate::anchored(
+        Unpinned,
+        own.verifying_key(),
+        nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-anchored-unproven")),
+        EveryId,
+    );
+    let peer = bifrost::NodeId::from_ed25519_secret(&[5u8; 32]);
+    let slip = own
+        .mint(
+            &svc("web"),
+            nauthy::Request::expires_in(core::time::Duration::from_secs(3600)),
+        )
+        .expect("mint slip")
+        .link()
+        .expect("link");
+    let admit_as = |security| {
+        admit(
+            &gate,
+            &super::PublicServices::default(),
+            &super::PublicServices::default(),
+            SessionPeer {
+                node: peer,
+                security,
+            },
+            Some(slip.as_str()),
+            None,
+            &svc("web"),
+        )
+    };
+
+    let admitted = admit_as(PROVEN).expect("the slip is admitted over a proven session");
+    assert_eq!(
+        admitted.ruled.first().map(nauthy::Cap::root),
+        Some(own.verifying_key()),
+        "and the slip is kept for the live cut"
+    );
+    let refused = admit_as(Security {
+        peer: PeerProof::Announced,
+        channel: ChannelProtection::Plain,
+    })
+    .expect_err("an announced session cannot be admitted by an anchored gate");
+    assert!(
+        matches!(
+            refused,
+            super::HostRefusal::PeerNotProven {
+                declared: PeerProof::Announced
+            }
+        ),
+        "the local cause names the declared profile: {refused:?}"
+    );
+}
+
 /// The admission seam refuses an announced session even when the presented badge is genuine and
 /// bound to the announced key: `serve_session` reads the session's declared profile, the predicate
 /// refuses before any `ProvenPeer` is minted, and the wire gets the uniform `NotAdmitted` a gate

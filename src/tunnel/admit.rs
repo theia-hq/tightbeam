@@ -329,7 +329,7 @@ where
         let recorded = chains
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .record_all(&admitted.ruled);
+            .record_all(peer.node.verify_key(), &admitted.ruled);
         if let Err(unrecorded) = recorded {
             tracing::warn!(%peer, service = %service, %unrecorded, "refused");
             return Response::Refused(Refusal::NotAdmitted)
@@ -524,10 +524,10 @@ impl From<nauthy::Refusal> for HostRefusal {
 /// gated stream carries `None` and touches no public capacity.
 struct AdmittedStream {
     witness: Admitted,
-    /// Every cap the gate asked its revocation store about: the presented cap, and on the authority-bound
-    /// path the foreign badge too. The live cut re-asks about exactly these, so it can end a session only
-    /// for a recall the gate itself would have refused on. Empty on the open path, where nothing is ruled
-    /// on and nothing can be recalled.
+    /// Every cap the gate asked its revocation store about: the presented cap first, and on the
+    /// authority-bound path the foreign badge after it. The live cut re-asks about exactly these, so it can
+    /// end a session only for a recall the gate itself would have refused on, and takes the first as the
+    /// stream's anchor. Empty on the open path, where nothing is ruled on and nothing can be recalled.
     ruled: Vec<Cap>,
     /// Held for the stream's lifetime; dropped when the binding leaves scope. Never read.
     _stream_permit: Option<OwnedSemaphorePermit>,
