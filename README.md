@@ -124,10 +124,11 @@ announces readiness before `run`.
 ## Inject a named service
 
 tightbeam knows only the [`Handler`](tightbeam-handler/src/lib.rs) contract, never what a handler does. A handler names its
-`Exposure` ceiling as a type (`Never` for a keyless shell, `OptIn` for a legitimately public responder),
-declares its `Metering` if it bounds callers, and serves one admitted stream from the `Served<Self>` proof
-the gate prepared for it. The declaration is the author's: the marker prevents an omitted choice and a
-third variant, not a mislabeled one.
+`Exposure` ceiling as a type (`Never` for a keyless shell, `OptIn` for a legitimately public responder,
+`ProvenOnly` for a service that answers a proven key and grants it nothing), declares its `Metering` if it
+bounds callers, and serves one admitted stream from the `Served<Self>` proof the gate prepared for it. The
+declaration is the author's: the marker prevents an omitted choice and a fourth variant, not a mislabeled
+one.
 
 ```rust
 use tightbeam::open_policy::Never;
@@ -139,7 +140,7 @@ impl Handler for Shell {
     // Whether this handler may EVER face a stranger is a compile-time property, stated once as a type. A
     // keyless shell is remote code execution, so it names `Never`: an open gate over it is refused when
     // the proof is prepared. A legitimately public responder names `OptIn`. The choice cannot be omitted
-    // and the marker set is sealed, so there is no default and no third marker; the declaration is the
+    // and the marker set is sealed, so there is no default and no fourth marker; the declaration is the
     // author's, and an `OptIn` service still takes a deliberate operator opt-in to reach a stranger.
     type Exposure = Never;
 
@@ -159,6 +160,12 @@ impl Handler for Shell {
 
 let exposer = Router::new(gate).service("sh".parse()?, Shell)?.expose()?;
 ```
+
+A service that answers a device by its key alone, with no token, names `ProvenOnly` and binds with
+`.proven_service(name, handler, knows)`. A stream reaches it only when the transport proved the peer's key,
+the gate's store does not revoke that key, and `knows` recognizes it; only then does it take one of the
+node's eight proven slots, and it is dropped five seconds after it was admitted. Its handler accepts no
+other witness, no other handler accepts its witness, and the route cannot be opened to everyone.
 
 ## Hand out an expiring key
 

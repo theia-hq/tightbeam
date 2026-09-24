@@ -1040,6 +1040,9 @@ async fn a_cut_closes_the_session_rather_than_only_dropping_it() {
                 services: services(&["demo=echo:"]),
                 raw_stream_opens: tokio::sync::Semaphore::new(4),
                 public_pool: super::super::exposer::PublicPool::new(),
+                proven_pool: Arc::new(tokio::sync::Semaphore::new(
+                    super::super::exposer::PROVEN_STREAM_PERMITS,
+                )),
                 enabled: Box::new(crate::enabled::AllEnabled),
                 cuts: Some(super::Cuts::new(Box::new(Arc::clone(&store)))),
             });

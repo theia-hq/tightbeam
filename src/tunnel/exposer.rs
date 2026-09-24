@@ -6,6 +6,7 @@
 //! the one teardown authority a [`CancellationToken`] clone can request.
 
 use core::pin::pin;
+use core::time::Duration;
 use std::sync::{Arc, PoisonError};
 use std::time::SystemTime;
 
@@ -87,6 +88,23 @@ const PUBLIC_SESSION_PERMITS: usize = 32;
 /// lifetime (that would cut every long-lived public handler to catch the idle ones).
 pub(super) const PUBLIC_STREAM_PERMITS: usize = 4;
 
+/// The number of streams every proven-only route on a node shares
+/// ([`Router::proven_service`](super::Router::proven_service)). Fixed: those routes answer a known key in
+/// one short exchange, so eight in flight is room for every device of a household at once, and a peer that
+/// holds some of them holds them for at most [`PROVEN_STREAM_DEADLINE`] each.
+///
+/// A slot is taken only after the peer's key passed the store and the route's check, so a stranger never
+/// holds one: the pool bounds keys this node already knows. Past it the answer is the uniform refusal, so a
+/// full pool reads exactly like a miss. It is separate from the public pools, so neither starves the other,
+/// and a gated route never touches it.
+pub(super) const PROVEN_STREAM_PERMITS: usize = 8;
+
+/// How long a proven-only stream may run, from admission to close. Past it the stream is dropped and its
+/// slot freed, whatever the peer is doing: a known key that opens a stream and never reads, or never lets
+/// the close finish, holds a slot for at most this long. Five seconds covers one short exchange with room
+/// for a slow link; a route that needs longer is not what this pool is for.
+pub(super) const PROVEN_STREAM_DEADLINE: Duration = Duration::from_secs(5);
+
 /// An exposer: the proven services to publish and the gate that decides who may reach them. Accepts overlay
 /// sessions and forwards each inbound stream to its service.
 ///
@@ -125,8 +143,9 @@ impl Exposer {
     /// base; a raw-stream source under an open base is refused UNLESS the operator knowingly opted it into
     /// the unsafe set (proven here into the disjoint unsafe overlay); a route declared [`Access::Member`](super::router::Access::Member)
     /// may not pair with an open base or with that unsafe overlay, both of which admit only open witnesses
-    /// and would make the floor a route no dialer can reach (and, opened, a posture lie); and the safe
-    /// public overlay proves every requested name exposed and open-safe.
+    /// and would make the floor a route no dialer can reach (and, opened, a posture lie); a proven-only
+    /// route may not pair with an open base, which witnesses no proven key; and the safe public overlay
+    /// proves every requested name exposed, open-safe, and not proven-only.
     ///
     /// The two raw-stream interlocks stay DISJOINT: the keyless-handler refusal reads a
     /// compile-time marker (`type Exposure`), while the raw-stream-unsafe refusal is a RUNTIME opt-in guard
@@ -138,6 +157,17 @@ impl Exposer {
         public: PublicRequest,
         public_unsafe: PublicUnsafeRequest,
     ) -> eyre::Result<Self> {
+        // Interlock 0 (proven-only): an open base witnesses no proven key (its peers only announced
+        // theirs), so a proven-only route under one would refuse every dialer. Checked before interlock 1,
+        // which would refuse the same route as a keyless shell and teach the wrong fix.
+        if matches!(gate, Gate::Open)
+            && let Some(name) = services.proven_names().next()
+        {
+            eyre::bail!(
+                "`{name}` is proven-only, so an open gate will never serve it: an open gate proves nothing \
+                 about a peer's key. keep the service on a gate that roots at a key"
+            );
+        }
         // Interlock 1: a keyless handler (`type Exposure = Never`) may not sit behind an open BASE. Reads
         // the erased compile-time `OPEN_SAFE` marker.
         if matches!(gate, Gate::Open) {
@@ -377,6 +407,7 @@ impl Exposer {
             services,
             raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
             public_pool: PublicPool::new(),
+            proven_pool: Arc::new(Semaphore::new(PROVEN_STREAM_PERMITS)),
             enabled,
             cuts: cuts.map(Cuts::new),
         });
@@ -444,6 +475,9 @@ pub(super) struct Serving {
     /// The public-path capacity: taken only at the public-admit seam, so a gated route never
     /// consults it and non-public traffic is untouched.
     pub(super) public_pool: PublicPool,
+    /// The proven-only routes' one shared pool of [`PROVEN_STREAM_PERMITS`], taken only past the key
+    /// checks on a proven-only route.
+    pub(super) proven_pool: Arc<Semaphore>,
     /// The live enable/disable oracle, consulted per stream at admission, beside the gate: a
     /// disabled service is refused with the same indistinguishable refusal a gate miss gives.
     pub(super) enabled: Box<dyn EnabledServices + Send + Sync>,

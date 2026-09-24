@@ -9,8 +9,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use nauthy::{Gate, Service};
+use nauthy::{Gate, Origin, Service, VerifyKey};
 use tightbeam_handler::bridge::ErasedHandler;
+use tightbeam_handler::open_policy::ProvenOnly;
 use tightbeam_handler::{Handler, Metering};
 
 use super::catalog::{Posture, ServiceCatalog, ServiceEntry};
@@ -20,7 +21,7 @@ use crate::raw_stream::RawStream;
 /// The one server-side route table: each served name binds to its handler or raw source in one call, and the
 /// terminal [`expose`](Router::expose) proves every route against the gate and hands back the runnable
 /// [`Exposer`]. Everything an author assembles is here: typed handlers ([`service`](Router::service),
-/// [`member_service`](Router::member_service)), the built-in local forward ([`forward`](Router::forward)),
+/// [`member_service`](Router::member_service), [`proven_service`](Router::proven_service)), the built-in local forward ([`forward`](Router::forward)),
 /// the built-in loopback reflector ([`echo`](Router::echo)), and the native raw-stream arm
 /// ([`raw_stream`](Router::raw_stream)).
 ///
@@ -52,16 +53,46 @@ impl Router {
         }
     }
 
-    /// Bind `name` to a handler you wrote. Fallible: a name may map to only one target.
+    /// Bind `name` to a handler you wrote. Fallible: a name may map to only one target, and a
+    /// [`ProvenOnly`] handler binds only through [`proven_service`](Self::proven_service).
     pub fn service(self, name: Service, handler: impl Handler) -> eyre::Result<Self> {
-        self.bind(name, Target::Handler(Arc::new(handler)), Access::Family)
+        self.bind_gated(name, Arc::new(handler), Access::Family)
     }
 
     /// As [`service`](Self::service), with the member floor: only a witness the gate admitted as a
     /// whole-node member may reach it, checked before any `Response::Ok`. A delegated slip for the same
     /// name is refused with the same uniform refusal a gate miss gives.
     pub fn member_service(self, name: Service, handler: impl Handler) -> eyre::Result<Self> {
-        self.bind(name, Target::Handler(Arc::new(handler)), Access::Member)
+        self.bind_gated(name, Arc::new(handler), Access::Member)
+    }
+
+    /// Bind `name` to a handler that answers a transport-proven key and grants it nothing: a peer whose
+    /// key the transport proved, and which `knows` recognizes, reaches it with no token at all.
+    ///
+    /// The route never reaches the family gate, and no token presented on it is read. A stream for it is
+    /// admitted only when the transport proves the peer, the base gate's revocation store does not revoke
+    /// the key (nor its sign twin), and `knows` answers `true` for the key, in that order, and only then
+    /// does it take one of the node's eight proven slots, which every proven-only route shares. A stream is
+    /// dropped, and its slot freed, five seconds after it was admitted. Every miss, a full pool included,
+    /// is the uniform refusal.
+    ///
+    /// `knows` answers whether this node already holds anything for a key. It runs on every stream before
+    /// a slot is taken, so it answers from memory, never from disk, and it compares the key's exact bytes,
+    /// never a form that folds its sign. The handler's [`ProvenOnly`] marker is the other half: its proof
+    /// mints only from a proven witness, and a proven witness mints no other handler's proof.
+    ///
+    /// A proven-only route cannot be opened to everyone, and it cannot sit behind a node-wide
+    /// [`Gate::Open`], which witnesses no proven key; both are refused at [`expose`](Self::expose).
+    pub fn proven_service<H, K>(self, name: Service, handler: H, knows: K) -> eyre::Result<Self>
+    where
+        H: Handler<Exposure = ProvenOnly>,
+        K: Fn(&VerifyKey) -> bool + Send + Sync + 'static,
+    {
+        self.bind(
+            name,
+            Target::Handler(Arc::new(handler)),
+            Access::ProvenOnly(Arc::new(knows)),
+        )
     }
 
     /// Bind `name` to tightbeam's built-in loopback reflector: it opens no host resource and reflects only
@@ -158,6 +189,23 @@ impl Router {
             gate,
         } = self;
         Exposer::prove(services, gate, public, public_unsafe)
+    }
+
+    /// Bind a handler on a family or member route, refusing a [`ProvenOnly`] handler: its proof mints only
+    /// from a proven witness, which neither route ever holds, so the route would refuse every dialer.
+    fn bind_gated(
+        self,
+        name: Service,
+        handler: Arc<dyn ErasedHandler>,
+        access: Access,
+    ) -> eyre::Result<Self> {
+        if handler.accepts(Origin::Proven) {
+            eyre::bail!(
+                "`{name}` is a proven-only handler, so a gated route would refuse every dialer: it answers \
+                 only a proven key with no token. bind it as a proven-only service"
+            );
+        }
+        self.bind(name, Target::Handler(handler), access)
     }
 
     /// The one bind: insert a row under its typed name, refusing a duplicate with the one policy every
@@ -260,8 +308,9 @@ pub enum TargetKind {
 /// [`Family`](Access::Family) is the default and means "the gate alone decides": under a node-wide open
 /// gate it admits anyone, so it is no floor beyond the gate, never "this node's family".
 /// [`Member`](Access::Member) can only REFUSE: it reads one bit of the witness the gate minted and never
-/// mints, clones, or widens one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// mints, clones, or widens one. [`ProvenOnly`](Access::ProvenOnly) is ruled before the family gate and
+/// never reaches it.
+#[derive(Clone)]
 pub(super) enum Access {
     /// The default: the gate's verdict is the whole verdict, byte-identical to a node with no declaration.
     Family,
@@ -269,6 +318,36 @@ pub(super) enum Access {
     /// delegated slip, a stranger on an open node) is refused with the same payload-free class the gate
     /// gives a miss, BEFORE any `Response::Ok` is written.
     Member,
+    /// PROVEN-only: a peer whose key the transport proved, which the store does not revoke and the route's
+    /// check knows, is witnessed as [`Origin::Proven`] with no token read, under the node's proven pool.
+    /// Only a [`ProvenOnly`] handler is bound here, and no other route mints a proven witness.
+    ProvenOnly(Knows),
+}
+
+/// Whether this node already holds anything for a proven key: the check a proven-only route runs before a
+/// pool slot is taken.
+pub(super) type Knows = Arc<dyn Fn(&VerifyKey) -> bool + Send + Sync>;
+
+/// Two proven-only declarations are equal only when they share one check.
+impl PartialEq for Access {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Family, Self::Family) | (Self::Member, Self::Member) => true,
+            (Self::ProvenOnly(a), Self::ProvenOnly(b)) => Arc::ptr_eq(a, b),
+            (Self::Family | Self::Member | Self::ProvenOnly(_), _) => false,
+        }
+    }
+}
+
+impl core::fmt::Debug for Access {
+    /// The check is code, so it renders as its arm.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Family => "Family",
+            Self::Member => "Member",
+            Self::ProvenOnly(_) => "ProvenOnly",
+        })
+    }
 }
 
 /// One served route: the [`Target`] the name resolves to and the [`Access`] class declared for it. Access
@@ -440,6 +519,25 @@ impl Services {
             })
     }
 
+    /// The check a proven-only route runs on a key, or `None` when `service` is not a proven-only route:
+    /// the one branch admission takes before the family gate.
+    pub(super) fn proven(&self, service: &str) -> Option<&Knows> {
+        let Self(routes) = self;
+        match &routes.get(service)?.access {
+            Access::ProvenOnly(knows) => Some(knows),
+            Access::Family | Access::Member => None,
+        }
+    }
+
+    /// The served names declared [`Access::ProvenOnly`], for the construction interlocks: an open base
+    /// witnesses no proven key, so such a route under one is dead.
+    pub(super) fn proven_names(&self) -> impl Iterator<Item = &str> {
+        let Self(routes) = self;
+        routes.iter().filter_map(|(name, route)| {
+            matches!(route.access, Access::ProvenOnly(_)).then_some(name.as_str())
+        })
+    }
+
     /// The served names declared [`Access::Member`], for the construction interlocks: a member-only route
     /// no dialer can reach is a dead route, and when it renders `Open` (the public overlays) that is a
     /// posture lie too.
@@ -539,6 +637,14 @@ impl Services {
                     served.join(", ")
                 );
             };
+            // A proven-only route answers a proven key, never a stranger: opening it would hand its
+            // answers to anyone who reaches the node.
+            if matches!(route.access, Access::ProvenOnly(_)) {
+                eyre::bail!(
+                    "`{name}` is proven-only, so it cannot be opened to everyone: it answers only a peer \
+                     whose key the transport proved and this node knows. drop it from the public set"
+                );
+            }
             // A member-only route cannot be public: the public overlay admits through `Gate::Open`, whose
             // only witness is an open one, so a public dial could never pass the floor while the catalog
             // renders the name `Open`: a dead route and a posture lie. Refused here, where the overlay is

@@ -9,9 +9,10 @@
 //!
 //! Whether a handler may EVER face an unauthenticated stranger is a compile-time property, stated once as
 //! [`Handler::Exposure`]: [`Never`](open_policy::Never) for a service with no legitimate
-//! public use (a keyless shell), [`OptIn`](open_policy::OptIn) for one the operator may deliberately open.
-//! The markers are sealed and uninhabited, so the choice cannot be omitted, defaulted, or named by a third
-//! variant. [`Compatible`](open_policy::Compatible) is the one-way relation a proof conversion is bounded
+//! public use (a keyless shell), [`OptIn`](open_policy::OptIn) for one the operator may deliberately open,
+//! [`ProvenOnly`](open_policy::ProvenOnly) for one that answers a transport-proven key and grants it
+//! nothing. The markers are sealed and uninhabited, so the choice cannot be omitted, defaulted, or named by
+//! a fourth variant. [`Compatible`](open_policy::Compatible) is the one-way relation a proof conversion is bounded
 //! by: a proof may widen into a compatible inner handler (`Never` into `OptIn`), never launder into an
 //! incompatible one.
 //!

@@ -6,4 +6,4 @@
 //! `tightbeam::open_policy::*` path working. The definitions, the seal, and the compile-fail probe live in
 //! `tightbeam_handler::open_policy`.
 
-pub use tightbeam_handler::open_policy::{Compatible, Never, OptIn, PublicUse};
+pub use tightbeam_handler::open_policy::{Compatible, Never, OptIn, ProvenOnly, PublicUse};

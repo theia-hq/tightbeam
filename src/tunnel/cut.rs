@@ -8,9 +8,10 @@
 //! held by a peer whose key is revoked returns, which drops it and every stream on it.
 //!
 //! The oracle holds no session and no list of sessions, but it is not blind to who is connected: every
-//! sweep asks it about the proven peer key of each live session admitted on a cap, so an oracle that
-//! remembered what it was asked could list and count them. tightbeam's own oracles keep nothing between
-//! calls; the property rests on the oracle being the node's own revocation store, not on the cut.
+//! sweep asks it about the proven peer key of each live session admitted on a cap or on a proven-only
+//! route, so an oracle that remembered what it was asked could list and count them. tightbeam's own
+//! oracles keep nothing between calls; the property rests on the oracle being the node's own revocation
+//! store, not on the cut.
 //!
 //! The unit is the SESSION: a recall or an expiry ends every stream on it, including streams admitted
 //! under other caps, because a dropped stream alone leaves a handler's detached work running.
@@ -50,10 +51,10 @@ pub(super) const MAX_SESSION_CHAIN_IDS: usize = 1024;
 ///
 /// Synchronous and cheap, like the gate's own [`Revocations`] store, because every live session asks it on
 /// every sweep. It answers about one session's record at a time and is never handed a session, but
-/// [`revoked_peer`](Self::revoked_peer) is asked once per sweep for each live session admitted on a cap,
-/// with the key that session's peer proved: an impl that kept those keys could list and count who is
-/// connected. tightbeam's own impls keep nothing; wire only an oracle that is the node's own revocation
-/// store.
+/// [`revoked_peer`](Self::revoked_peer) is asked once per sweep for each live session admitted on a cap or
+/// on a proven-only route, with the key that session's peer proved: an impl that kept those keys could
+/// list and count who is connected. tightbeam's own impls keep nothing; wire only an oracle that is the
+/// node's own revocation store.
 ///
 /// Implemented for nauthy's stores, so a caller shares ONE instance between the gate and the cut and the
 /// two can never disagree about a file they each read at a different moment.
@@ -120,8 +121,9 @@ impl AdmittedChains {
         self.anchors.iter().copied()
     }
 
-    /// The key the session's peer proved, once any of its streams was admitted on a cap. `None` for a
-    /// session whose every stream took the open path, where the key was announced and ruled on by nothing.
+    /// The key the session's peer proved, once any of its streams was admitted on a cap or on a proven-only
+    /// route. `None` for a session whose every stream took the open path, where the key was announced and
+    /// ruled on by nothing.
     pub fn peer(&self) -> Option<VerifyKey> {
         self.peer
     }
@@ -173,6 +175,13 @@ impl AdmittedChains {
             self.lease = self.lease.extend(until);
         }
         Ok(())
+    }
+
+    /// Keep the key a stream on a proven-only route was witnessed for, and nothing else: it ruled on no
+    /// token, so there is no id, root, anchor or grant to keep, and the lease stays as it was. The cut then
+    /// finds the session by this key alone, through [`LiveCuts::revoked_peer`].
+    pub(super) fn record_proven(&mut self, peer: VerifyKey) {
+        self.peer = Some(peer);
     }
 
     /// How many revocation ids this session keeps.

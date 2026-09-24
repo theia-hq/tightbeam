@@ -4,8 +4,8 @@
 //! its associated marker. [`ErasedHandler`] is that object-safe view: the marker erases to a frozen
 //! `const bool`, and the RPITIT serve future boxes into a `Send`-bearing trait object. The bridge also splits
 //! preparation from serving so the ceiling refusal lands BEFORE a success response: `prepare` is
-//! monomorphized on the concrete `H`, mints the handler-bound [`Served<H>`](crate::Served) (refusing an open
-//! witness for a [`Never`](crate::open_policy::Never) handler), and freezes the serve step into an opaque
+//! monomorphized on the concrete `H`, mints the handler-bound [`Served<H>`](crate::Served) (refusing a witness
+//! whose origin the handler's marker does not accept), and freezes the serve step into an opaque
 //! [`Prepared`] closure. A dispatcher runs `prepare`, writes its success response only on `Ok`, then runs the
 //! prepared closure.
 //!
@@ -17,10 +17,10 @@ use core::future::Future;
 use core::pin::Pin;
 
 use bifrost_core::Refusal;
-use nauthy::Admitted;
+use nauthy::{Admitted, Origin};
 
 use crate::contract::{BoxRead, BoxWrite, Handler, Metering, ServeError, Served};
-use crate::open_policy::PublicUse;
+use crate::open_policy::{self, PublicUse};
 
 /// The object-safe, stored-in-the-route view of a [`Handler`]: the associated `Exposure` marker is erased
 /// here to a `const bool` ([`open_safe`](ErasedHandler::open_safe)) and the RPITIT `serve` future is boxed
@@ -39,6 +39,10 @@ pub trait ErasedHandler: sealed::Sealed + Send + Sync {
     /// The erased open-safety ceiling: `<H::Exposure as PublicUse>::OPEN_SAFE`, read before any success
     /// response.
     fn open_safe(&self) -> bool;
+    /// The erased origin rule: whether this handler's marker accepts a witness of `origin`, the same rule
+    /// [`prepare`](ErasedHandler::prepare) applies. Read at construction, so a route that could never mint
+    /// its handler's proof is refused before it serves.
+    fn accepts(&self, origin: Origin) -> bool;
     /// The erased responder-side metering: [`Handler::metering`], read when a dispatcher builds its
     /// manifest.
     fn metering(&self) -> Metering;
@@ -79,6 +83,10 @@ impl<'a> Prepared<'a> {
 impl<H: Handler> ErasedHandler for H {
     fn open_safe(&self) -> bool {
         <H::Exposure as PublicUse>::OPEN_SAFE
+    }
+
+    fn accepts(&self, origin: Origin) -> bool {
+        open_policy::accepts::<H::Exposure>(origin)
     }
 
     fn metering(&self) -> Metering {
