@@ -2,6 +2,31 @@
 
 All notable changes to tightbeam, newest first.
 
+## v0.15.0
+
+A live session also ends when its root stops being trusted or its peer's key is revoked, the identity
+file is a device key, and a node that only dials stops naming itself on the LAN.
+
+### Breaking
+- **`Peer::discovery` takes a `peer::Role`.** `Role` moves from the binary into the library. `Serving`
+  advertises its bound sockets over mDNS as before; `Dialing` advertises none.
+- **bifrost v0.6.1 and nauthy v0.7.0.** The identity file is opened as a device key
+  (`KeyFile::device`); a sealed root key at the identity path is refused as the wrong kind and left
+  untouched, by both load and write.
+
+### Added
+- **`LiveCuts::trusts` and `LiveCuts::revoked_peer`**, provided methods that default to trusting every
+  root and revoking no peer. The sweep ends a session when any root it was admitted under is no longer
+  trusted (so a changed pin ends the old root's sessions within a sweep) or when its proven peer's key is
+  revoked. `AdmittedChains` records each session's roots and its proven peer. The `Arc` and `Latch`
+  wrappers forward both methods, so the gate and the cut answer the same question the same way.
+
+### Changed
+- **A node that only dials advertises nothing over mDNS.** It still browses. Before, every bind put a
+  record naming the node's key on the local network, including `connect`.
+- **`share` refuses when the node trusts another root.** A link minted under a foreign signet would be
+  admitted by no node, this one included; `share` now says so and prints no link.
+
 ## v0.14.1
 
 A live session now ends when its first grant expires, and a refused stream no longer touches it.
