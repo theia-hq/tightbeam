@@ -5,7 +5,10 @@
 //! stream repeats the handshake. [`PresentingConnector`] is the same dial with the credential rule moved
 //! into the type system.
 
+use core::time::Duration;
+
 use bifrost::{ConnInfo, Discovery, Node, NodeId, PeerProven, Refusal, Session, Transport};
+use eyre::WrapErr as _;
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
 use nauthy::{Link, Service};
@@ -132,6 +135,7 @@ impl Connector {
             session,
             listener,
             request,
+            max_pipes: MAX_PIPES,
         })
     }
 
@@ -298,32 +302,50 @@ pub struct PortForward<S> {
     session: S,
     listener: TcpListener,
     request: Request,
+    /// How many local connections the forward holds at once, carried or waiting for a stream. Past it,
+    /// new connections wait in the kernel's listen backlog, which has a fixed size.
+    max_pipes: usize,
 }
+
+/// The most local connections one forward holds at once. Above a QUIC peer's usual concurrent-stream
+/// limit (100 on iroh), so every stream the peer grants can be used, and far enough below a default
+/// descriptor limit (256 on macOS) that connections waiting for a stream cannot exhaust the process.
+const MAX_PIPES: usize = 128;
+
+/// How long the forward waits before accepting again after an accept fails. An error such as running out
+/// of descriptors repeats on every attempt until something frees, so retrying at once would spin.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
 impl<S: Session> PortForward<S> {
     /// Forward each accepted TCP connection over its own stream. Runs until cancelled; prints nothing.
     pub async fn run(self) -> eyre::Result<()> {
         let mut pipes = FuturesUnordered::new();
+        // Set after a failed accept: accepting resumes once `retry` fires.
+        let retry = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(retry);
+        let mut paused = false;
         loop {
             tokio::select! {
-                accepted = self.listener.accept() => {
-                    // One local accept or stream-open failing must not drop the pipes already in flight:
-                    // log the transient error and keep the local listener up.
+                () = &mut retry, if paused => paused = false,
+                // Accept only below the cap: a connection waiting for a stream holds a descriptor, so
+                // past the cap new connections stay in the kernel's backlog instead of piling up here.
+                accepted = self.listener.accept(), if !paused && pipes.len() < self.max_pipes => {
+                    // One local accept failing must not drop the pipes already in flight: log the
+                    // error and keep the local listener up. Pause before the next accept, while still
+                    // polling the pipes: an error like running out of descriptors fails again at once.
                     let (tcp, _) = match accepted {
                         Ok(accepted) => accepted,
                         Err(error) => {
                             tracing::warn!(%error, "local accept failed; still listening");
+                            retry.as_mut().reset(tokio::time::Instant::now() + ACCEPT_RETRY);
+                            paused = true;
                             continue;
                         }
                     };
-                    let (writer, reader) = match self.session.open_bi().await {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            tracing::warn!(%error, "opening a stream to the peer failed; still listening");
-                            continue;
-                        }
-                    };
-                    pipes.push(request_service::<S, _, _>(self.request.clone(), tcp, writer, reader));
+                    // The stream is opened inside the pipe, not here: past the peer's concurrent-stream
+                    // limit an open waits until another stream ends, and awaiting it in this arm would
+                    // stop every pipe in flight from being polled, so none could end.
+                    pipes.push(forward::<S>(&self.session, self.request.clone(), tcp));
                 }
                 Some(result) = pipes.next(), if !pipes.is_empty() => {
                     if let Err(error) = result {
@@ -405,6 +427,15 @@ impl<S: Session> Session for ServiceSession<S> {
     }
 }
 
+/// Carry one local connection: open its stream to the peer, then request the service over it.
+async fn forward<S: Session>(session: &S, request: Request, tcp: TcpStream) -> eyre::Result<()> {
+    let (writer, reader) = session
+        .open_bi()
+        .await
+        .wrap_err("opening a stream to the peer")?;
+    request_service::<S, _, _>(request, tcp, writer, reader).await
+}
+
 /// Open a stream to a service: send the request, and if the host accepts, pipe the connection.
 ///
 /// Generic over the session so the checked writer can read the session's declared security profile; the
@@ -446,3 +477,7 @@ where
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "connector_tests.rs"]
+mod connector_tests;
