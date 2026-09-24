@@ -5,6 +5,8 @@
 //! stream repeats the handshake. [`PresentingConnector`] is the same dial with the credential rule moved
 //! into the type system.
 
+use core::time::Duration;
+
 use bifrost::{ConnInfo, Discovery, Node, NodeId, PeerProven, Refusal, Session, Transport};
 use eyre::WrapErr as _;
 use futures::StreamExt as _;
@@ -133,6 +135,7 @@ impl Connector {
             session,
             listener,
             request,
+            max_pipes: MAX_PIPES,
         })
     }
 
@@ -299,21 +302,43 @@ pub struct PortForward<S> {
     session: S,
     listener: TcpListener,
     request: Request,
+    /// How many local connections the forward holds at once, carried or waiting for a stream. Past it,
+    /// new connections wait in the kernel's listen backlog, which has a fixed size.
+    max_pipes: usize,
 }
+
+/// The most local connections one forward holds at once. Above a QUIC peer's usual concurrent-stream
+/// limit (100 on iroh), so every stream the peer grants can be used, and far enough below a default
+/// descriptor limit (256 on macOS) that connections waiting for a stream cannot exhaust the process.
+const MAX_PIPES: usize = 128;
+
+/// How long the forward waits before accepting again after an accept fails. An error such as running out
+/// of descriptors repeats on every attempt until something frees, so retrying at once would spin.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
 impl<S: Session> PortForward<S> {
     /// Forward each accepted TCP connection over its own stream. Runs until cancelled; prints nothing.
     pub async fn run(self) -> eyre::Result<()> {
         let mut pipes = FuturesUnordered::new();
+        // Set after a failed accept: accepting resumes once `retry` fires.
+        let retry = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(retry);
+        let mut paused = false;
         loop {
             tokio::select! {
-                accepted = self.listener.accept() => {
+                () = &mut retry, if paused => paused = false,
+                // Accept only below the cap: a connection waiting for a stream holds a descriptor, so
+                // past the cap new connections stay in the kernel's backlog instead of piling up here.
+                accepted = self.listener.accept(), if !paused && pipes.len() < self.max_pipes => {
                     // One local accept failing must not drop the pipes already in flight: log the
-                    // transient error and keep the local listener up.
+                    // error and keep the local listener up. Pause before the next accept, while still
+                    // polling the pipes: an error like running out of descriptors fails again at once.
                     let (tcp, _) = match accepted {
                         Ok(accepted) => accepted,
                         Err(error) => {
                             tracing::warn!(%error, "local accept failed; still listening");
+                            retry.as_mut().reset(tokio::time::Instant::now() + ACCEPT_RETRY);
+                            paused = true;
                             continue;
                         }
                     };
