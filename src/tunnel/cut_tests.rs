@@ -357,7 +357,7 @@ fn with_block(cap: &nauthy::Cap, block: biscuit_auth::builder::BlockBuilder) -> 
     let (root, token) = link.split_once('.').expect("a link is root.token");
     let token = biscuit_auth::UnverifiedBiscuit::from(
         BASE32_NOPAD
-            .decode(token.to_uppercase().as_bytes())
+            .decode(token.to_ascii_uppercase().as_bytes())
             .expect("base32"),
     )
     .expect("a token")
