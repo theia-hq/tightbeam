@@ -2,6 +2,37 @@
 
 All notable changes to tightbeam, newest first.
 
+## v0.16.0
+
+Links are bare `<key>.<token>`, keys print as `ed01…`, a node can answer a proven key that holds no
+token, and a port forward keeps flowing past the peer's stream limit.
+
+### Breaking
+- **A link is `<key>.<token>`, with no scheme**, on the wire (request slots 1 and 2), in `share`'s output
+  and everywhere the binary reads one. `connect` takes a key or a link and tells them apart by the `.`.
+  Text with a prefix is refused.
+- **Built on nauthy 0.9.0 and bifrost 0.7.0.** Key text starts with `ed01` and is ASCII; mDNS uses
+  `_bifrost._udp` and a serving node announces a blinded name instead of its key; key files start with
+  `KEYSTORE`; derived device keys change.
+- **Requires Rust 1.91**, checked in CI.
+
+### Added
+- **`Router::proven_service(name, handler, knows)`** binds a handler that answers a transport-proven key
+  and grants it nothing. A stream is admitted only when the transport proves the key, the revocation
+  store revokes neither the key nor its sign twin, and `knows` recognizes it, in that order; only then
+  does it take one of the node's eight proven slots, shared by every proven-only route. It is dropped
+  five seconds after admission. Its handler carries the `ProvenOnly` marker. A proven-only route cannot
+  be opened to everyone or sit behind `Gate::Open`.
+
+### Fixed
+- **A port forward no longer freezes at the peer's stream limit.** Each connection opens its stream
+  inside its own pipe, so waiting for one never stops the others. The forward holds at most 128 local
+  connections; past that they wait in the listen backlog, and a failed accept pauses 100 ms.
+
+### Changed
+- **`--bind-addr` help** says a fixed port is visible to the local network and links the machine across
+  networks.
+
 ## v0.15.0
 
 A live session also ends when its root stops being trusted or its peer's key is revoked, the identity
