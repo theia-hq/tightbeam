@@ -6,6 +6,7 @@
 //! into the type system.
 
 use bifrost::{ConnInfo, Discovery, Node, NodeId, PeerProven, Refusal, Session, Transport};
+use eyre::WrapErr as _;
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
 use nauthy::{Link, Service};
@@ -307,8 +308,8 @@ impl<S: Session> PortForward<S> {
         loop {
             tokio::select! {
                 accepted = self.listener.accept() => {
-                    // One local accept or stream-open failing must not drop the pipes already in flight:
-                    // log the transient error and keep the local listener up.
+                    // One local accept failing must not drop the pipes already in flight: log the
+                    // transient error and keep the local listener up.
                     let (tcp, _) = match accepted {
                         Ok(accepted) => accepted,
                         Err(error) => {
@@ -316,14 +317,10 @@ impl<S: Session> PortForward<S> {
                             continue;
                         }
                     };
-                    let (writer, reader) = match self.session.open_bi().await {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            tracing::warn!(%error, "opening a stream to the peer failed; still listening");
-                            continue;
-                        }
-                    };
-                    pipes.push(request_service::<S, _, _>(self.request.clone(), tcp, writer, reader));
+                    // The stream is opened inside the pipe, not here: past the peer's concurrent-stream
+                    // limit an open waits until another stream ends, and awaiting it in this arm would
+                    // stop every pipe in flight from being polled, so none could end.
+                    pipes.push(forward::<S>(&self.session, self.request.clone(), tcp));
                 }
                 Some(result) = pipes.next(), if !pipes.is_empty() => {
                     if let Err(error) = result {
@@ -405,6 +402,15 @@ impl<S: Session> Session for ServiceSession<S> {
     }
 }
 
+/// Carry one local connection: open its stream to the peer, then request the service over it.
+async fn forward<S: Session>(session: &S, request: Request, tcp: TcpStream) -> eyre::Result<()> {
+    let (writer, reader) = session
+        .open_bi()
+        .await
+        .wrap_err("opening a stream to the peer")?;
+    request_service::<S, _, _>(request, tcp, writer, reader).await
+}
+
 /// Open a stream to a service: send the request, and if the host accepts, pipe the connection.
 ///
 /// Generic over the session so the checked writer can read the session's declared security profile; the
@@ -446,3 +452,7 @@ where
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "connector_tests.rs"]
+mod connector_tests;
