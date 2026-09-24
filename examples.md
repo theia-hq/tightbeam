@@ -31,12 +31,12 @@ On the machine you want to reach:
 tightbeam expose demo=echo: --public
 ```
 
-The banner prints this node's key, a `bf01...` string:
+The banner prints this node's key, an `ed01...` string:
 
 ```
 tightbeam ready. peers can reach these services at:
 
-    bf01ksohhwnkthxk2vy2pxrtjrrqkk22iou4q5zzu7n37crh4sdnszjq   (share this key, or mint a link with `tightbeam share`)
+    ed01ksohhwnkthxk2vy2pxrtjrrqkk22iou4q5zzu7n37crh4sdnszjq   (share this key, or mint a link with `tightbeam share`)
 
 exposing demo. gate: public (anyone, unauthenticated). ctrl-c to stop.
 ```
@@ -146,7 +146,7 @@ and a second concurrent reader is refused rather than corrupting the feed with a
 ## 5. Give someone a key
 
 Everything so far used `--public`: anyone who reaches the host gets in. The normal way is the opposite. A
-service is **gated**, and you hand one person a **key** to it. The key is a `sheer:` link: signed, scoped to
+service is **gated**, and you hand one person a **key** to it. The key is a link: signed, scoped to
 one service, and expiring. It reaches that one service and nothing else on the host.
 
 A node gates every service on a **signet**: the authority whose devices it trusts. For one machine that
@@ -162,13 +162,13 @@ Now expose the service gated (no `--public`) and mint a link to it:
 
 ```sh
 tightbeam expose demo=echo:
-tightbeam share demo --expires 2h    # prints: sheer:<node-id>.<token>
+tightbeam share demo --expires 2h    # prints: <key>.<token>
 ```
 
 Send the link to your friend. It carries both your key and the grant, so nothing else is needed:
 
 ```sh
-echo 'hi from a friend' | tightbeam connect sheer:<node-id>.<token> --service demo --to -
+echo 'hi from a friend' | tightbeam connect <key>.<token> --service demo --to -
 ```
 
 Their bytes echo back. The link works only for `demo`, expires on its own after two hours, and reaches
@@ -176,8 +176,7 @@ nothing else. Without it, a stranger who dials the host is refused (`not admitte
 capability for this service was accepted`). Revoke a link early with `tightbeam revoke`; short expiry backs
 that up. Add `--delegable` to `share` if the holder may narrow the link and hand it on.
 
-This is the one-machine, one-authority form. Running a single authority across several of your own devices,
-so any of them can serve and be reached by name, is what [swoosh](https://github.com/theia-hq/swoosh) is for.
+This is the one-machine, one-authority form.
 
 ## Anything with a local address
 
@@ -225,5 +224,5 @@ tar -cf - ~/project | tightbeam expose bundle=stdin:  # on the host
 tightbeam connect <peer> --service bundle --to - | tar -xf -   # on your machine
 ```
 
-Each `<peer>` is a raw node id (with a key you were handed via `share`) or a `sheer:` link that carries the
+Each `<peer>` is a raw node id (with a key you were handed via `share`) or a link that carries the
 key and the grant together.

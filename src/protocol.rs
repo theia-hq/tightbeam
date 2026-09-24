@@ -106,7 +106,7 @@ impl core::fmt::Display for WireVersion {
 pub struct Request {
     /// The service to reach, as named in `expose`.
     pub service: String,
-    /// Slot 1: a presented capability link (`sheer:…`), when the host gates on capabilities. Absent when
+    /// Slot 1: a presented capability link (`<key>.<token>`), when the host gates on capabilities. Absent when
     /// the host gates on identity (open/strict/paired), where the proven `NodeId` is the whole story.
     pub capability: Option<String>,
     /// Slot 2: a membership badge under the FOREIGN fleet a signet-bound slip in `capability` names. The

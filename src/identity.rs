@@ -31,8 +31,8 @@ use zeroize::{ZeroizeOnDrop, Zeroizing};
 /// key on either side of the cap/transport boundary.
 ///
 /// nauthy is standalone (it carries no bifrost dependency), so it names a key by [`VerifyKey`] while
-/// bifrost names the same key by [`NodeId`]. Both are the same 32 raw bytes under the same `bf01` string
-/// form, so the conversion is an infallible byte copy. It lives here, at the one crate that sees both
+/// bifrost names the same key by [`NodeId`]. Both are the same 32 raw bytes under the same key text, so the
+/// conversion is an infallible byte copy. It lives here, at the one crate that sees both
 /// types, so no call site open-codes the byte shuffle. The orphan rule forbids a `From` impl (both types
 /// are foreign to tightbeam), hence the extension traits.
 pub trait AsVerifyKey {

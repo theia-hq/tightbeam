@@ -3,7 +3,7 @@ publish = false  # git-only for now, not published to crates.io
 name = "tightbeam-handler"
 version = "0.4.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 description = "The handler contract a tightbeam service implements: exposure, metering, and the served proof."
 repository = "https://github.com/theia-hq/tightbeam"
@@ -12,9 +12,9 @@ repository = "https://github.com/theia-hq/tightbeam"
 # The gate's single-use admission witness and the origin it carries. `default-features = false` keeps the
 # contract runtime-free (no file denylist, no OS RNG); a consumer that needs those unifies its own nauthy
 # features in, cargo features being additive.
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "9bb8a267148bb90cc6b87435d850991ccdf8257e", default-features = false }
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "2b2a8a94cd3ee211efb94aa0173f6009b5d1ba4f", default-features = false }
 # `Refusal` for the typed serve error. `bifrost-core` only: the contract never names a transport backend.
-bifrost-core = { git = "https://github.com/theia-hq/bifrost", rev = "31107a0e7122bd25372c8c74ae8565f9e84f6827" }
+bifrost-core = { git = "https://github.com/theia-hq/bifrost", rev = "ed7cd8d591b4bef3ff1d005ad4f8b9b6a82b8359" }
 thiserror = "2"
 # The boxed stream halves a handler receives. `io-util` only, no runtime: the contract never spawns.
 tokio = { version = "1", default-features = false, features = ["io-util"] }
@@ -22,7 +22,7 @@ tokio = { version = "1", default-features = false, features = ["io-util"] }
 [dev-dependencies]
 # The proof tests build a real rooted gate over the file-backed denylist, the same mint a dispatcher uses, so
 # they need nauthy's async-fs feature; the contract's normal dependency stays runtime-free.
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "9bb8a267148bb90cc6b87435d850991ccdf8257e", features = ["tokio-fs"] }
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "2b2a8a94cd3ee211efb94aa0173f6009b5d1ba4f", features = ["tokio-fs"] }
 
 [lints]
 workspace = true

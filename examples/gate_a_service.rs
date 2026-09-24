@@ -2,7 +2,7 @@
 //!
 //! The companion to [`reach_by_key`](../reach_by_key/index.html): that one admits
 //! anyone who reaches the key ([`Gate::Open`](nauthy::Gate::Open)); this one admits only a caller holding a
-//! `sheer:` capability the exposer's identity signed. The exposer stands its service behind a *signet gate*
+//! capability the exposer's identity signed. The exposer stands its service behind a *signet gate*
 //! (its own key); the owner [`Link::mint`](nauthy::Link::mint)s a capability granting one service;
 //! a connector presents it. No allowlist, no server in the delegation loop: the exposer verifies the signed
 //! chain offline.
@@ -91,7 +91,7 @@ async fn run() -> eyre::Result<()> {
     });
 
     // 4. The owner mints a capability granting exactly `ssh`, valid for an hour. This is offline: it needs
-    //    the signing identity but no network. The link IS the grant, a `sheer:<node-id>.<token>` string you
+    //    the signing identity but no network. The link IS the grant, a `<key>.<token>` string you
     //    can hand to whoever should reach the service.
     let ssh = "ssh".parse::<Service>()?;
     let link = Link::mint(&identity, &ssh, Duration::from_secs(3600))?.seal()?;

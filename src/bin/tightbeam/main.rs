@@ -8,7 +8,7 @@
 //!
 //! `expose` publishes local services under this machine's key; `connect` reaches an exposed service from
 //! another machine and puts it on a local port, stdout (`-`), or a unix listener. `share` / `attenuate` /
-//! `revoke` mint, narrow, and revoke the `sheer:` capability links the gate honors. Each verb is a thin
+//! `revoke` mint, narrow, and revoke the capability links the gate honors. Each verb is a thin
 //! adapter that loads the identity and denylist, resolves the gate through the shared
 //! [`resolve_gate`](tightbeam::tunnel::resolve_gate) policy, prints its own banner, and drives the core.
 //!
@@ -63,7 +63,8 @@ struct Cli {
     /// bind offline: no n0 discovery, no relays; reach peers only via --peer hints (LAN, Docker, air-gap)
     #[arg(long, global = true)]
     offline: bool,
-    /// fixed local bind address, e.g. `0.0.0.0:9000`; implies --offline so a peer can hardcode host:port
+    /// fixed local bind address, e.g. `0.0.0.0:9000`; implies --offline so a peer can hardcode host:port;
+    /// a fixed port is visible to the local network and links this machine across networks
     #[arg(long, value_name = "addr", global = true)]
     bind_addr: Option<SocketAddr>,
     #[command(subcommand)]
@@ -76,11 +77,11 @@ enum Command {
     Expose(ExposeCmd),
     /// Reach a peer's exposed service and bind it to a local port.
     Connect(ConnectCmd),
-    /// Mint a `sheer:` capability link granting one service, expiring, attenuable, delegable.
+    /// Mint a capability link granting one service, expiring, attenuable, delegable.
     Share(ShareCmd),
-    /// Narrow an existing `sheer:` link offline before handing it on.
+    /// Narrow an existing link offline before handing it on.
     Attenuate(AttenuateCmd),
-    /// Revoke a `sheer:` link so this node refuses it at once, without waiting for expiry.
+    /// Revoke a link so this node refuses it at once, without waiting for expiry.
     Revoke(RevokeCmd),
     /// Print this command tree (spec vs binary).
     Tree(TreeCmd),

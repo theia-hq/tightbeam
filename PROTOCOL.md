@@ -434,14 +434,13 @@ vector tb04-request-minimal
 
 ### A request carrying a capability and a membership badge
 
-Service `ssh`, slot 1 `sheer:bf01abc.def`, slot 2 `sheer:bf02ghi.jkl`.
+Service `ssh`, slot 1 `ed01abc.def`, slot 2 `ed01ghi.jkl`.
 
 ```text
 vector tb04-request-capability-and-membership
-54 42 30 34 00 03 73 73 68 01 00 11 73 68 65 65
-72 3a 62 66 30 31 61 62 63 2e 64 65 66 01 00 11
-73 68 65 65 72 3a 62 66 30 32 67 68 69 2e 6a 6b
-6c
+54 42 30 34 00 03 73 73 68 01 00 0b 65 64 30 31
+61 62 63 2e 64 65 66 01 00 0b 65 64 30 31 67 68
+69 2e 6a 6b 6c
 ```
 
 | octets | field | value |
@@ -449,11 +448,11 @@ vector tb04-request-capability-and-membership
 | `54 42 30 34` | magic | `TB04` |
 | `00 03` `73 73 68` | service | `ssh` |
 | `01` | capability present | present |
-| `00 11` | capability length | 17 |
-| `73 68 ... 65 66` | capability | `sheer:bf01abc.def` |
+| `00 0b` | capability length | 11 |
+| `65 64 ... 65 66` | capability | `ed01abc.def` |
 | `01` | membership present | present |
-| `00 11` | membership length | 17 |
-| `73 68 ... 6b 6c` | membership | `sheer:bf02ghi.jkl` |
+| `00 0b` | membership length | 11 |
+| `65 64 ... 6b 6c` | membership | `ed01ghi.jkl` |
 
 ### The reached response
 

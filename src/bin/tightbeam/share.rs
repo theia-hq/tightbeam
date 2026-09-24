@@ -1,4 +1,4 @@
-//! `tightbeam share`: mint a `sheer:` capability link for one of this node's services.
+//! `tightbeam share`: mint a capability link for one of this node's services.
 
 use bifrost::NodeId;
 use clap::Args;
@@ -35,8 +35,8 @@ impl ShareCmd {
         if let Some(signet) = signet.filter(|signet| *signet != own) {
             eyre::bail!(
                 "this node trusts root {signet}. A link made here would be signed by this node's key \
-                 ({own}), and no node would admit it, this one included. Issue it with `swoosh grant \
-                 issue` on a machine that serves the service"
+                 ({own}), and no node would admit it, this one included. Make the link with `tightbeam \
+                 share` on the node whose key is that root"
             );
         }
         let link = Link::mint(identity, &self.service, self.expires.duration())?;

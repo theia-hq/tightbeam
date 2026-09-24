@@ -1,4 +1,4 @@
-//! `tightbeam attenuate`: narrow an existing `sheer:` link, offline, before handing it on.
+//! `tightbeam attenuate`: narrow an existing link, offline, before handing it on.
 
 use clap::Args;
 use nauthy::{Link, Service};
@@ -11,7 +11,7 @@ use tightbeam::duration::Lifetime;
 /// than the input; a holder uses it to hand a colleague a strictly smaller slice of their own access.
 #[derive(Debug, Args)]
 pub struct AttenuateCmd {
-    /// The `sheer:` link to narrow.
+    /// The link to narrow.
     #[arg(value_name = "link")]
     pub link: String,
     /// Restrict the link to this service (must be one the link already permits).

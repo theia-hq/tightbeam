@@ -3,7 +3,7 @@
 > *"Here's a link to reach my box's ssh. It only works for ssh, it expires, you can narrow it further and
 > hand it to a colleague, and there is no server anywhere that issued it, can see it, or can revoke it."*
 
-A `sheer:` share-link is a real bearer capability: signed by the exposer's own identity, offline
+A share-link is a real bearer capability: signed by the exposer's own identity, offline
 verifiable, attenuable, delegable. This is the one thing no incumbent offers (ngrok/CF give a guessable
 URL backed by their ingress; Tailscale needs a tailnet plus a central ACL; croc is a one-shot code; SSH
 `authorized_keys` cannot attenuate, expire, or delegate; iroh punts authz to the app). It runs over the
@@ -13,7 +13,7 @@ real iroh transport today.
 
 ```
 tightbeam expose ssh=127.0.0.1:22                # gated to the signet by default, which accepts caps
-tightbeam share ssh --expires 2h --delegable     # mint a sheer:<node>.<token> link
+tightbeam share ssh --expires 2h --delegable     # mint a <key>.<token> link
 tightbeam attenuate <link> --service ssh --expires 30m   # narrow a link, offline, no key
 tightbeam connect <link> --to 2222               # dial + present the token, from the link alone
 ```
@@ -31,13 +31,13 @@ party), then used by the connector. The refusals share the same live tunnel.
 
 ```
 ### 1. exposer publishes ssh=<echo> behind its signet gate (no allowlist anywhere)
-    exposer node id: bf01mjwxs225tml3yqnrm64zrwysqxmzpkutp5w7y3j7hu3zq5qp3b6a
+    exposer node id: ed01mjwxs225tml3yqnrm64zrwysqxmzpkutp5w7y3j7hu3zq5qp3b6a
 
-### 2. exposer mints a delegable ssh cap, valid 2h -> a sheer link
-    sheer:bf01mjwxs225tml3yqnrm64zrwysqxmzpkutp5w7y3j7hu3zq5qp3b6a.clfaccs6biaxgcq...
+### 2. exposer mints a delegable ssh cap, valid 2h -> a link
+    ed01mjwxs225tml3yqnrm64zrwysqxmzpkutp5w7y3j7hu3zq5qp3b6a.clfaccs6biaxgcq...
 
 ### 3. a holder narrows to 30m (offline), then a THIRD PARTY narrows to ssh + 10m
-    delegated: sheer:bf01mjwxs225tml3yqnrm64zrwysqxmzpkutp5w7y3j7hu3zq5qp3b6a.clfaccs6...
+    delegated: ed01mjwxs225tml3yqnrm64zrwysqxmzpkutp5w7y3j7hu3zq5qp3b6a.clfaccs6...
     (attenuation used NO key and NO network; the exposer never saw the delegation)
 
 ### 4. connect USING the delegated link alone (it dials + presents the token)
