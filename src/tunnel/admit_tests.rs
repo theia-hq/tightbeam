@@ -17,8 +17,8 @@ use super::{Admission, FIRST_TRAFFIC_TIMEOUT, resolve_single_service, serve_requ
 use crate::enabled::AllEnabled;
 use crate::open_policy::OptIn;
 use crate::tunnel::exposer::{
-    PUBLIC_STREAM_PERMITS, PublicPool, PublicSession, RAW_STREAM_OPEN_PERMITS, SessionPeer,
-    serve_session,
+    PROVEN_STREAM_PERMITS, PUBLIC_STREAM_PERMITS, PublicPool, PublicSession,
+    RAW_STREAM_OPEN_PERMITS, SessionPeer, serve_session,
 };
 use crate::tunnel::fixtures::{
     GatedNoop, OpenNoop, ServiceStream, family_gate, prove, services, svc,
@@ -79,6 +79,7 @@ fn open_serving(services: Services, permits: Semaphore) -> std::sync::Arc<super:
         services,
         raw_stream_opens: permits,
         public_pool: PublicPool::new(),
+        proven_pool: Arc::new(Semaphore::new(PROVEN_STREAM_PERMITS)),
         enabled: Box::new(AllEnabled),
         cuts: None,
     })
@@ -286,6 +287,10 @@ fn admit(
             public,
             public_unsafe,
             pool: &PublicPool::new(),
+            proven: super::Proven {
+                routes: &Services(HashMap::new()),
+                pool: &Arc::new(Semaphore::new(PROVEN_STREAM_PERMITS)),
+            },
         },
         &PublicSession::default(),
         peer,
@@ -367,6 +372,7 @@ async fn an_open_witness_is_refused_before_ok_for_a_never_handler() {
             .expect("`locked` binds"),
         raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
         public_pool: PublicPool::new(),
+        proven_pool: Arc::new(Semaphore::new(PROVEN_STREAM_PERMITS)),
         enabled: Box::new(AllEnabled),
         cuts: None,
     });
@@ -419,6 +425,7 @@ async fn a_saturated_public_pool_never_starves_a_gated_member() {
             sessions: Arc::new(Semaphore::new(1)),
             streams: Arc::new(Semaphore::new(4)),
         },
+        proven_pool: Arc::new(Semaphore::new(PROVEN_STREAM_PERMITS)),
         enabled: Box::new(AllEnabled),
         cuts: None,
     });
@@ -520,6 +527,7 @@ async fn a_public_stream_over_the_cap_is_refused_and_released_when_it_ends() {
             sessions: Arc::new(Semaphore::new(4)),
             streams: Arc::new(Semaphore::new(1)),
         },
+        proven_pool: Arc::new(Semaphore::new(PROVEN_STREAM_PERMITS)),
         enabled: Box::new(AllEnabled),
         cuts: None,
     });
@@ -609,6 +617,7 @@ async fn four_public_streams_hold_the_node_wide_pool_and_the_fifth_is_refused() 
         raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
         // The PRODUCTION pool (not the small hand-built ones the other cap tests isolate with).
         public_pool: PublicPool::new(),
+        proven_pool: Arc::new(Semaphore::new(PROVEN_STREAM_PERMITS)),
         enabled: Box::new(AllEnabled),
         cuts: None,
     });
@@ -698,6 +707,7 @@ fn public_lossy_broadcast() -> (Arc<super::Serving>, tokio::io::DuplexStream) {
         services,
         raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
         public_pool: PublicPool::new(),
+        proven_pool: Arc::new(Semaphore::new(PROVEN_STREAM_PERMITS)),
         enabled: Box::new(AllEnabled),
         cuts: None,
     });
@@ -1028,6 +1038,7 @@ async fn a_disabled_service_is_refused_then_restored_live_on_re_enable() {
         services,
         raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
         public_pool: PublicPool::new(),
+        proven_pool: Arc::new(Semaphore::new(PROVEN_STREAM_PERMITS)),
         enabled: Box::new(enabled),
         cuts: None,
     });
@@ -1101,6 +1112,7 @@ async fn a_disabled_service_is_refused_after_admission_not_before_the_gate() {
         services: services(&["doc=tcp:127.0.0.1:80"]),
         raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
         public_pool: PublicPool::new(),
+        proven_pool: Arc::new(Semaphore::new(PROVEN_STREAM_PERMITS)),
         enabled: Box::new(CountingDisabled(Arc::clone(&count))),
         cuts: None,
     });
@@ -1131,6 +1143,7 @@ async fn a_disabled_service_is_refused_after_admission_not_before_the_gate() {
         services: services(&["doc=tcp:127.0.0.1:80"]),
         raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
         public_pool: PublicPool::new(),
+        proven_pool: Arc::new(Semaphore::new(PROVEN_STREAM_PERMITS)),
         enabled: Box::new(CountingDisabled(Arc::clone(&count))),
         cuts: None,
     });
@@ -1445,6 +1458,7 @@ async fn an_announced_session_is_refused_at_admission_with_the_uniform_answer() 
         services: services(&["web=tcp:127.0.0.1:80"]),
         raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
         public_pool: PublicPool::new(),
+        proven_pool: Arc::new(Semaphore::new(PROVEN_STREAM_PERMITS)),
         enabled: Box::new(AllEnabled),
         cuts: None,
     });

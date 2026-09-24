@@ -7,7 +7,7 @@ use bifrost_core::Refusal;
 use nauthy::{Admission, Admitted, Origin, VerifyKey};
 use tokio::io;
 
-use crate::open_policy::{Compatible, PublicUse};
+use crate::open_policy::{self, Compatible, PublicUse};
 
 /// A boxed writer half handed to a handler (the accepted stream is already `Send + 'static`, so boxing it
 /// as a trait object is a small per-stream allocation, invisible next to the splice it feeds).
@@ -40,8 +40,9 @@ pub enum ServeError {
     /// unchanged, so a caller matches it instead of parsing text.
     #[error(transparent)]
     Refused(#[from] Refusal),
-    /// A rooted witness is required for this serving proof, but the gate admitted by an open policy.
-    /// Produced only by [`Served::into_rooted`], for an engine whose safety precondition is a verified peer.
+    /// A rooted witness is required for this serving proof, but the gate admitted by an open policy or
+    /// witnessed a proven key with no token. Produced only by [`Served::into_rooted`], for an engine whose
+    /// safety precondition is a verified peer.
     #[error("this service requires a rooted admission")]
     OpenAdmission,
     /// The stream failed at the transport level.
@@ -58,7 +59,8 @@ pub enum ServeError {
 /// Whether the handler may EVER face an unauthenticated stranger is a COMPILE-TIME property, stated once as
 /// the associated [`type Exposure`](Handler::Exposure): a keyless shell names
 /// [`Never`](crate::open_policy::Never) (an open gate over it is refused when the proof is prepared), a
-/// legitimately-public responder names [`OptIn`](crate::open_policy::OptIn). There is no default and no
+/// legitimately-public responder names [`OptIn`](crate::open_policy::OptIn), and a service that answers a
+/// proven key with no standing names [`ProvenOnly`](crate::open_policy::ProvenOnly). There is no default and no
 /// runtime bool: omitting the choice does not compile, and the marker is sealed + uninhabited, so "a keyless
 /// service mislabeled open" is unrepresentable rather than a guarded default.
 ///
@@ -69,9 +71,10 @@ pub enum ServeError {
 /// [`Served<Self>`](Served).
 pub trait Handler: Send + Sync + 'static {
     /// This handler's open-safety CEILING, stated as a type (no default, so the author MUST pick one of
-    /// [`Never`](crate::open_policy::Never) / [`OptIn`](crate::open_policy::OptIn)). Erased to a frozen
-    /// `const bool` at the [`ErasedHandler`](crate::bridge::ErasedHandler) bridge, read once when the proof
-    /// is prepared, to refuse an open witness for a [`Never`](crate::open_policy::Never) handler.
+    /// [`Never`](crate::open_policy::Never) / [`OptIn`](crate::open_policy::OptIn) /
+    /// [`ProvenOnly`](crate::open_policy::ProvenOnly)). Read when the proof is prepared, to refuse a witness
+    /// whose origin the marker does not accept, and erased at the
+    /// [`ErasedHandler`](crate::bridge::ErasedHandler) bridge for a dispatcher's construction checks.
     type Exposure: PublicUse;
 
     /// The responder-side rate limit this handler enforces, read from its constructor config so a banner
@@ -103,12 +106,15 @@ pub trait Handler: Send + Sync + 'static {
 /// a stream): the same handler under two names shares the type, and the proof still carries one per-stream
 /// witness.
 ///
-/// The proof is minted only when the handler's ceiling allows the witness: an `OptIn` handler accepts an
-/// open witness, a `Never` handler requires a rooted one ([`Origin::Rooted`](nauthy::Origin::Rooted)). That
-/// refusal happens before any success response because preparation is monomorphized on the concrete `H`.
+/// The proof is minted only when the handler's marker accepts the witness's origin: a `Never` handler
+/// requires a rooted one ([`Origin::Rooted`](nauthy::Origin::Rooted)), an `OptIn` handler also accepts an
+/// open one, and a `ProvenOnly` handler accepts a proven one ([`Origin::Proven`](nauthy::Origin::Proven))
+/// and nothing else. No other marker accepts a proven witness. That refusal happens before any success
+/// response because preparation is monomorphized on the concrete `H`.
 ///
 /// A laundering delegation is a compile error, not a runtime refusal: `delegate` requires
-/// `H::Exposure: Compatible<I::Exposure>`, and `OptIn` is not compatible with `Never`.
+/// `H::Exposure: Compatible<I::Exposure>`, and `OptIn` is not compatible with `Never`, nor `ProvenOnly`
+/// with any other marker.
 ///
 /// ```compile_fail
 /// use tightbeam_handler::open_policy::{Never, OptIn};
@@ -147,6 +153,46 @@ pub trait Handler: Send + Sync + 'static {
 /// }
 /// ```
 ///
+/// A proven proof cannot be delegated into a `Never` inner either, so a handler built for a proven key can
+/// never hand its witness to a keyless shell:
+///
+/// ```compile_fail
+/// use tightbeam_handler::open_policy::{Never, ProvenOnly};
+/// use tightbeam_handler::{BoxRead, BoxWrite, Handler, ServeError, Served};
+///
+/// struct Proven;
+/// struct Shell;
+///
+/// impl Handler for Proven {
+///     type Exposure = ProvenOnly;
+///     async fn serve(
+///         &self,
+///         _served: Served<Self>,
+///         _writer: BoxWrite,
+///         _reader: BoxRead,
+///     ) -> Result<(), ServeError> {
+///         Ok(())
+///     }
+/// }
+///
+/// impl Handler for Shell {
+///     type Exposure = Never;
+///     async fn serve(
+///         &self,
+///         _served: Served<Self>,
+///         _writer: BoxWrite,
+///         _reader: BoxRead,
+///     ) -> Result<(), ServeError> {
+///         Ok(())
+///     }
+/// }
+///
+/// // E0277 `ProvenOnly: Compatible<Never>`.
+/// fn launder(served: Served<Proven>) {
+///     let _ = served.delegate::<Shell>();
+/// }
+/// ```
+///
 /// ```compile_fail
 /// use tightbeam_handler::Served;
 ///
@@ -165,9 +211,10 @@ pub struct Served<H: Handler + ?Sized> {
 
 impl<H: Handler + ?Sized> Served<H> {
     /// The only mint: crate-private, reached by the erased bridge's `prepare` (for the registered `H`) and
-    /// by [`delegate`](Served::delegate). Refuses an open witness for a `Never` handler, fail-closed.
+    /// by [`delegate`](Served::delegate). Refuses a witness whose origin `H`'s marker does not accept,
+    /// fail-closed.
     pub(crate) fn mint(admitted: Admitted) -> Result<Self, Refusal> {
-        if !<H::Exposure as PublicUse>::OPEN_SAFE && !matches!(admitted.origin(), Origin::Rooted) {
+        if !open_policy::accepts::<H::Exposure>(admitted.origin()) {
             return Err(Refusal::NotAdmitted);
         }
         Ok(Self {
@@ -177,7 +224,8 @@ impl<H: Handler + ?Sized> Served<H> {
     }
 
     /// The identity the gate admitted: verified on a rooted route ([`origin`](Self::origin) is
-    /// [`Origin::Rooted`]), the key the peer announced on an open route ([`Origin::Open`]). A per-caller
+    /// [`Origin::Rooted`]), proven by the transport but holding no standing on a proven route
+    /// ([`Origin::Proven`]), the key the peer announced on an open route ([`Origin::Open`]). A per-caller
     /// policy that needs proof checks the origin first.
     pub fn peer(&self) -> VerifyKey {
         self.admitted.peer()
@@ -193,14 +241,14 @@ impl<H: Handler + ?Sized> Served<H> {
         self.admitted.is_member()
     }
 
-    /// How the gate minted the witness (rooted token ruling or an open admit).
+    /// How the gate minted the witness (a rooted token ruling, an open admit, or a proven key).
     pub fn origin(&self) -> Origin {
         self.admitted.origin()
     }
 
     /// The one narrowing seam: hand the ROOTED witness to a proof-free engine. Fails with
-    /// [`ServeError::OpenAdmission`] when the gate admitted by an open policy, so an engine whose safety
-    /// precondition is a verified peer cannot be handed an open witness.
+    /// [`ServeError::OpenAdmission`] when the witness is not rooted (an open admit or a proven key), so an
+    /// engine whose safety precondition is a verified peer cannot be handed either.
     pub fn into_rooted(self) -> Result<RootedAdmitted, ServeError> {
         if !matches!(self.admitted.origin(), Origin::Rooted) {
             return Err(ServeError::OpenAdmission);
@@ -225,7 +273,7 @@ impl<H: Handler + ?Sized> Served<H> {
 /// A gate witness narrowed to a ROOTED admission: the engine seam for a service whose safety precondition is
 /// that the gate verified a token (a keyless shell). Private field, no public constructor: the only mint is
 /// [`Served::into_rooted`], which consumes a handler-bound proof, so an engine that demands this type cannot
-/// be reached with an open witness.
+/// be reached with an open or a proven witness.
 #[derive(Debug)]
 #[must_use = "a RootedAdmitted witness proves a rooted gate ruling; serve the one stream it authorized"]
 pub struct RootedAdmitted {
@@ -250,8 +298,8 @@ impl RootedAdmitted {
 
     /// Consume the rooted proof back into the gate witness it wraps: the transitional seam for an engine
     /// that still takes the untyped [`Admitted`]. No authority is added: this type is minted only by
-    /// [`Served::into_rooted`], which refuses an open witness, so the witness handed on is rooted by
-    /// construction. Deleted when the engine takes `RootedAdmitted` directly.
+    /// [`Served::into_rooted`], which refuses every witness that is not rooted, so the witness handed on is
+    /// rooted by construction. Deleted when the engine takes `RootedAdmitted` directly.
     pub fn into_admitted(self) -> Admitted {
         self.admitted
     }

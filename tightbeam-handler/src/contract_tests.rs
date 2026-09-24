@@ -1,6 +1,7 @@
-//! The serving-proof wall: the mint refuses an open witness for a `Never` handler, delegation preserves
-//! the witness and re-applies the target ceiling, `into_rooted` is the one narrowing seam, and the erased
-//! bridge refuses at `prepare` before any success and serves only through the prepared step.
+//! The serving-proof wall: the mint refuses an open witness for a `Never` handler and a proven witness for
+//! every handler but a `ProvenOnly` one, which accepts nothing else; delegation preserves the witness and
+//! re-applies the target ceiling, `into_rooted` is the one narrowing seam, and the erased bridge refuses at
+//! `prepare` before any success and serves only through the prepared step.
 //!
 //! The mint is crate-private, so these proofs are only reachable from inside this crate: an outside crate
 //! consumes a proof through the erased bridge, pinned by the compile-fail doc tests on [`Served`].
@@ -11,12 +12,12 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use bifrost_core::Refusal;
-use nauthy::{Gate, ProvenPeer, Service};
+use nauthy::{Gate, Origin, ProvenPeer, Service};
 use tokio::io::{empty, sink};
 
 use crate::bridge::ErasedHandler as _;
 use crate::contract::{RootedAdmitted, ServeError, Served};
-use crate::open_policy::{Never, OptIn};
+use crate::open_policy::{Never, OptIn, ProvenOnly};
 use crate::{BoxRead, BoxWrite, Handler};
 
 /// A do-nothing GATED handler (`type Exposure = Never`): a handler with no public use of its own, so an open
@@ -42,6 +43,23 @@ struct OpenNoop;
 
 impl Handler for OpenNoop {
     type Exposure = OptIn;
+
+    async fn serve(
+        &self,
+        _served: Served<Self>,
+        _writer: BoxWrite,
+        _reader: BoxRead,
+    ) -> Result<(), ServeError> {
+        Ok(())
+    }
+}
+
+/// A do-nothing PROVEN handler (`type Exposure = ProvenOnly`): it answers a transport-proven key with no
+/// standing, so a proven witness is the only one that mints its proof.
+struct ProvenNoop;
+
+impl Handler for ProvenNoop {
+    type Exposure = ProvenOnly;
 
     async fn serve(
         &self,
@@ -94,6 +112,24 @@ fn witness(rooted: bool) -> nauthy::Admitted {
             .admit_witnessed(ProvenPeer::from_handshake(peer), None, &service)
             .expect("an open gate admits anyone")
     }
+}
+
+/// A [`Proven`](Origin::Proven) witness, minted the only way one is: the gate witnessing a transport-proven
+/// key that presented no token.
+fn proven_witness() -> nauthy::Admitted {
+    let signet = nauthy::Identity::from_secret(&[7u8; 32]).expect("valid secret");
+    let peer = nauthy::Identity::from_secret(&[9u8; 32])
+        .expect("valid secret")
+        .verifying_key();
+    let gate = Gate::rooted(
+        signet.verifying_key(),
+        nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-handler-witness-proven")),
+    );
+    let witness = gate
+        .proven(ProvenPeer::from_handshake(peer))
+        .expect("an unrevoked proven key is witnessed");
+    assert_eq!(witness.origin(), Origin::Proven);
+    witness
 }
 
 /// The proof mint wall, in both directions: a rooted witness mints a `Never` handler's proof, an open
@@ -212,5 +248,77 @@ fn into_rooted_narrows_a_rooted_proof_and_refuses_an_open_one() {
         admitted.peer(),
         peer,
         "the transitional conversion preserves the admitted peer"
+    );
+}
+
+/// A proven witness mints no `Never` or `OptIn` proof. It carries no authority, so a `Never` handler (one
+/// that trusts its peer, a keyless shell) must not run for it, and an `OptIn` handler would serve the proven
+/// key everything it serves a stranger.
+#[test]
+fn served_mint_refuses_a_proven_origin_for_never_and_optin() {
+    assert!(
+        Served::<GatedNoop>::mint(proven_witness()).is_err(),
+        "a proven witness cannot mint a Never handler's proof"
+    );
+    assert!(
+        Served::<OpenNoop>::mint(proven_witness()).is_err(),
+        "a proven witness cannot mint an OptIn handler's proof"
+    );
+}
+
+/// The same wall at the dispatcher's seam: the erased bridge refuses a proven witness for a `Never` and an
+/// `OptIn` handler before any success, with the uniform refusal, and reads the same rule at construction.
+#[test]
+fn never_and_optin_refuse_a_proven_origin() {
+    assert!(
+        matches!(
+            GatedNoop.prepare(proven_witness()),
+            Err(Refusal::NotAdmitted)
+        ),
+        "a Never handler refuses a proven witness before any success"
+    );
+    assert!(
+        matches!(
+            OpenNoop.prepare(proven_witness()),
+            Err(Refusal::NotAdmitted)
+        ),
+        "an OptIn handler refuses a proven witness before any success"
+    );
+    assert!(!GatedNoop.accepts(Origin::Proven));
+    assert!(!OpenNoop.accepts(Origin::Proven));
+    assert!(ProvenNoop.accepts(Origin::Proven));
+}
+
+/// A `ProvenOnly` handler accepts a proven witness and nothing else: a rooted one would let a member's
+/// token reach a route built for keys with no standing, and an open one would let an unproven stranger
+/// reach it.
+#[test]
+fn a_proven_only_handler_refuses_rooted_and_open() {
+    assert!(
+        Served::<ProvenNoop>::mint(proven_witness()).is_ok(),
+        "a proven witness mints a ProvenOnly handler's proof"
+    );
+    assert!(
+        Served::<ProvenNoop>::mint(witness(true)).is_err(),
+        "a rooted witness cannot mint a ProvenOnly handler's proof"
+    );
+    assert!(
+        Served::<ProvenNoop>::mint(witness(false)).is_err(),
+        "an open witness cannot mint a ProvenOnly handler's proof"
+    );
+    assert!(!ProvenNoop.accepts(Origin::Rooted));
+    assert!(!ProvenNoop.accepts(Origin::Open));
+}
+
+/// A proven proof never narrows to a rooted one: an engine whose safety rests on a verified peer cannot be
+/// handed a key that holds no standing here.
+#[test]
+fn into_rooted_refuses_a_proven_origin() {
+    let proven = Served::<ProvenNoop>::mint(proven_witness())
+        .expect("a proven witness mints a ProvenOnly proof")
+        .into_rooted();
+    assert!(
+        matches!(proven, Err(ServeError::OpenAdmission)),
+        "a proven witness cannot narrow to a rooted token"
     );
 }

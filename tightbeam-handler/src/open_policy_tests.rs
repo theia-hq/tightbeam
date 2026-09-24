@@ -5,13 +5,15 @@
 
 use core::marker::PhantomData;
 
-use crate::open_policy::{Never, OptIn, PublicUse};
+use crate::open_policy::{Never, OptIn, ProvenOnly, PublicUse};
 
-/// The whole payload of each marker, checked at compile time: a `Never` handler is never open-safe, an
-/// `OptIn` handler may be. An assembler reads exactly this const to refuse an open gate over a `Never`.
+/// The public payload of each marker, checked at compile time: a `Never` handler is never open-safe, an
+/// `OptIn` handler may be, and a `ProvenOnly` handler never is. An assembler reads exactly this const to
+/// refuse an open gate over a `Never` or a `ProvenOnly` handler.
 const _: () = {
     assert!(!<Never as PublicUse>::OPEN_SAFE);
     assert!(<OptIn as PublicUse>::OPEN_SAFE);
+    assert!(!<ProvenOnly as PublicUse>::OPEN_SAFE);
 };
 
 /// A generic reader projects `OPEN_SAFE` through the trait bound, the shape a later assembler uses to read
@@ -38,4 +40,5 @@ fn a_public_use_marker_rides_in_a_send_wrapper() {
     }
     ride::<Never>();
     ride::<OptIn>();
+    ride::<ProvenOnly>();
 }
