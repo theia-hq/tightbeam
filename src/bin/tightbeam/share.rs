@@ -1,8 +1,10 @@
 //! `tightbeam share`: mint a `sheer:` capability link for one of this node's services.
 
+use bifrost::NodeId;
 use clap::Args;
 use nauthy::{Identity, Link, Service};
 use tightbeam::duration::Lifetime;
+use tightbeam::identity::AsNodeId as _;
 
 /// Mint a share-link that IS a capability: a signed, expiring, attenuable grant to one service.
 ///
@@ -23,8 +25,20 @@ pub struct ShareCmd {
 }
 
 impl ShareCmd {
-    /// Mint the link and print it.
-    pub fn run(self, identity: &Identity) -> eyre::Result<()> {
+    /// Mint the link and print it, unless this node trusts a signet other than its own key.
+    ///
+    /// A link roots at this node's key, and a gate on a node pinned to another signet admits only caps
+    /// rooted there, so a link minted under a foreign pin is refused everywhere, this node included.
+    /// Refusing here, before anything is printed, is the one place the person minting it can be told why.
+    pub fn run(self, identity: &Identity, signet: Option<NodeId>) -> eyre::Result<()> {
+        let own = identity.verifying_key().node_id();
+        if let Some(signet) = signet.filter(|signet| *signet != own) {
+            eyre::bail!(
+                "this node trusts root {signet}. A link made here would be signed by this node's key \
+                 ({own}), and no node would admit it, this one included. Issue it with `swoosh grant \
+                 issue` on a machine that serves the service"
+            );
+        }
         let link = Link::mint(identity, &self.service, self.expires.duration())?;
         // A non-delegable link is sealed so no holder can append a narrower block; a delegable one is left
         // open. Verification is unaffected either way.
