@@ -210,12 +210,13 @@ for manifest in $manifests; do
   # 2. FLAG check: a prime LIBRARY must not allude to a consumer CLI flag. Two surfaces name
   # flags legitimately and are derived, not listed:
   #   * An APPLICATION crate (its primary product IS the CLI) -- signalled by a `src/main.rs`
-  #     (Cargo's primary-binary convention). The app IS the consumer; its flags are its own.
-  #     Such a crate is skipped ENTIRELY.
+  #     (Cargo's primary-binary convention), or in this repo's copy by a bin tree named for the
+  #     package, `src/bin/<package>/main.rs`, the app's own layout. The app IS the consumer; its
+  #     flags are its own. Such a crate is skipped ENTIRELY.
   #   * A library that also ships an auxiliary demo binary under `src/bin/` -- the
   #     library is the product and IS policed, but its `src/bin/` files are the CLI surface
   #     ("the bin's OWN flags are fine") and are excluded from THIS check only.
-  if [ ! -f "$dir/src/main.rs" ]; then
+  if [ ! -f "$dir/src/main.rs" ] && [ ! -f "$dir/src/bin/$own/main.rs" ]; then
     libfiles=""
     for f in "$@"; do
       case "$f" in */src/bin/*) continue ;; esac
