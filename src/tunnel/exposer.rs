@@ -354,7 +354,7 @@ impl Exposer {
         let security = <T::Security as SecurityProfile>::SECURITY;
         if self.gate.wants_capability() && !peer_proven(security) {
             eyre::bail!(
-                "this node gates on a signet, but the bound transport declares {} peer proof, so a gated \
+                "this node gates on a root, but the bound transport declares {} peer proof, so a gated \
                  dial could never be admitted; bind a transport that proves the peer (the default iroh \
                  transport does), or serve with an open gate (`Gate::Open`), which needs no peer proof",
                 proof_label(&security.peer)

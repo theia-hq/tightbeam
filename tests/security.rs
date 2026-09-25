@@ -28,8 +28,8 @@ use tightbeam::tunnel::{self, CancellationToken, Connector, PresentingConnector,
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
-/// The signet every gate here roots at and every badge is minted from.
-const SIGNET_SECRET: [u8; 32] = [42u8; 32];
+/// The root every gate here trusts and every badge is minted from.
+const ROOT_SECRET: [u8; 32] = [42u8; 32];
 
 /// A transport whose declared profile is `P`, moving the same in-process bytes as [`MemTransport`].
 ///
@@ -132,8 +132,8 @@ async fn a_gated_dial_over_an_announced_transport_refuses_before_any_write() {
             let peer_id = peer.node_id();
             let consumer = Node::new(profiled::<Announced>(MemTransport::bind()), NoDiscovery);
 
-            let signet = Identity::from_secret(&SIGNET_SECRET).unwrap();
-            let badge = signet
+            let root = Identity::from_secret(&ROOT_SECRET).unwrap();
+            let badge = root
                 .mint_member(
                     consumer.node_id().verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(Duration::from_secs(3600)),
@@ -183,7 +183,7 @@ async fn a_sealed_transport_carries_a_gated_dial_unchanged() {
             let exposer = Node::new(profiled::<Sealed>(MemTransport::bind()), NoDiscovery);
             let exposer_id = exposer.node_id();
             tokio::task::spawn_local(async move {
-                let gate = tunnel::resolve_gate(Some(signet_id()), empty_denylist().await).unwrap();
+                let gate = tunnel::resolve_gate(Some(root_id()), empty_denylist().await).unwrap();
                 Router::new(gate)
                     .forward("web".parse().unwrap(), &format!("tcp:{echo}"))
                     .unwrap()
@@ -226,7 +226,7 @@ async fn a_presenting_connector_dials_a_gated_service_over_a_proven_profile() {
             let exposer = Node::new(MemTransport::bind(), NoDiscovery);
             let exposer_id = exposer.node_id();
             tokio::task::spawn_local(async move {
-                let gate = tunnel::resolve_gate(Some(signet_id()), empty_denylist().await).unwrap();
+                let gate = tunnel::resolve_gate(Some(root_id()), empty_denylist().await).unwrap();
                 Router::new(gate)
                     .forward("web".parse().unwrap(), &format!("tcp:{echo}"))
                     .unwrap()
@@ -265,7 +265,7 @@ async fn a_rooted_gate_over_an_announced_transport_refuses_to_arm() {
     let node = Node::new(profiled::<Announced>(MemTransport::bind()), NoDiscovery);
 
     let rooted =
-        Router::new(tunnel::resolve_gate(Some(signet_id()), empty_denylist().await).unwrap())
+        Router::new(tunnel::resolve_gate(Some(root_id()), empty_denylist().await).unwrap())
             .forward("web".parse().unwrap(), "tcp:127.0.0.1:80")
             .unwrap()
             .expose()
@@ -298,15 +298,15 @@ async fn a_rooted_gate_over_an_announced_transport_refuses_to_arm() {
     }
 }
 
-/// The signet's node id: the root every test gate trusts.
-fn signet_id() -> NodeId {
-    NodeId::from_ed25519_secret(&SIGNET_SECRET)
+/// The root's node id: the root every test gate trusts.
+fn root_id() -> NodeId {
+    NodeId::from_ed25519_secret(&ROOT_SECRET)
 }
 
-/// A member badge bound to `device`, rooted at the test signet: valid on its own, and meaningless over
+/// A member badge bound to `device`, rooted at the test root: valid on its own, and meaningless over
 /// an announced transport because the binding rests on a key the transport did not prove.
 fn member_badge<T: Transport, D: bifrost::Discovery>(device: &Node<T, D>) -> nauthy::Link {
-    Identity::from_secret(&SIGNET_SECRET)
+    Identity::from_secret(&ROOT_SECRET)
         .unwrap()
         .mint_member(
             device.node_id().verify_key().expect("a checked key"),

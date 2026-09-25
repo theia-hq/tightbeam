@@ -76,9 +76,9 @@ impl Connector {
         })
     }
 
-    /// Also present `badge` in the SECOND slot: a membership badge under the foreign fleet a signet-bound
+    /// Also present `badge` in the SECOND slot: a membership badge under the foreign root an authority-bound
     /// slip in `capability` (slot 1) names. The host ANDs the two (the slip valid at its own root, the badge
-    /// valid under the fleet the slip names) before admitting. A no-op for every plain dial, whose slot 1
+    /// valid under the foreign root the slip names) before admitting. A no-op for every other dial, whose slot 1
     /// admits alone and whose host never consults slot 2.
     #[must_use]
     pub fn with_membership(mut self, badge: Link) -> Self {
@@ -252,7 +252,7 @@ impl PresentingConnector {
         })
     }
 
-    /// Also present `badge` in slot 2 (the signet-bound AND); see
+    /// Also present `badge` in slot 2 (the authority-bound AND); see
     /// [`Connector::with_membership`].
     #[must_use]
     pub fn with_membership(mut self, badge: Link) -> Self {

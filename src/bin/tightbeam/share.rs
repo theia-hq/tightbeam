@@ -25,16 +25,16 @@ pub struct ShareCmd {
 }
 
 impl ShareCmd {
-    /// Mint the link and print it, unless this node trusts a signet other than its own key.
+    /// Mint the link and print it, unless this node trusts a root other than its own key.
     ///
-    /// A link roots at this node's key, and a gate on a node pinned to another signet admits only caps
+    /// A link roots at this node's key, and a gate on a node pinned to another root admits only caps
     /// rooted there, so a link minted under a foreign pin is refused everywhere, this node included.
     /// Refusing here, before anything is printed, is the one place the person minting it can be told why.
-    pub fn run(self, identity: &Identity, signet: Option<NodeId>) -> eyre::Result<()> {
+    pub fn run(self, identity: &Identity, root: Option<NodeId>) -> eyre::Result<()> {
         let own = identity.verifying_key().node_id()?;
-        if let Some(signet) = signet.filter(|signet| *signet != own) {
+        if let Some(root) = root.filter(|root| *root != own) {
             eyre::bail!(
-                "this node trusts root {signet}. A link made here would be signed by this node's key \
+                "this node trusts root {root}. A link made here would be signed by this node's key \
                  ({own}), and no node would admit it, this one included. Make the link with `tightbeam \
                  share` on the node whose key is that root"
             );

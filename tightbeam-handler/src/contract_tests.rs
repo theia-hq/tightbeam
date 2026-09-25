@@ -92,17 +92,17 @@ impl Handler for ObservedNoop {
 /// Mint an [`Admitted`](nauthy::Admitted) witness through the only public mint (the gate), for the proof
 /// tests below. `rooted` picks a rooted gate with a member badge vs an open gate.
 fn witness(rooted: bool) -> nauthy::Admitted {
-    let signet = nauthy::Identity::from_secret(&[7u8; 32]).expect("valid secret");
+    let root = nauthy::Identity::from_secret(&[7u8; 32]).expect("valid secret");
     let peer = nauthy::Identity::from_secret(&[9u8; 32])
         .expect("valid secret")
         .verifying_key();
     let service: Service = "locked".parse().expect("valid service name");
     if rooted {
-        let badge = signet
+        let badge = root
             .mint_member(peer, nauthy::Request::expires_in(Duration::from_secs(300)))
             .expect("mint a member badge");
         let gate = Gate::rooted(
-            signet.verifying_key(),
+            root.verifying_key(),
             nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-handler-witness-rooted")),
         );
         gate.admit_witnessed(ProvenPeer::from_handshake(peer), Some(&badge), &service)
@@ -117,12 +117,12 @@ fn witness(rooted: bool) -> nauthy::Admitted {
 /// A [`Proven`](Origin::Proven) witness, minted the only way one is: the gate witnessing a transport-proven
 /// key that presented no token.
 fn proven_witness() -> nauthy::Admitted {
-    let signet = nauthy::Identity::from_secret(&[7u8; 32]).expect("valid secret");
+    let root = nauthy::Identity::from_secret(&[7u8; 32]).expect("valid secret");
     let peer = nauthy::Identity::from_secret(&[9u8; 32])
         .expect("valid secret")
         .verifying_key();
     let gate = Gate::rooted(
-        signet.verifying_key(),
+        root.verifying_key(),
         nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-handler-witness-proven")),
     );
     let witness = gate

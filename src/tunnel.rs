@@ -4,7 +4,7 @@
 //! sessions and forwards inbound streams to local services, a [`Connector`] that reaches a peer's exposed
 //! service, the [`resolve_gate`] policy, and the offline credential operations on a
 //! [`Link`](nauthy::Link) (mint, narrow, revoke). It prints NOTHING and reads no config path: a caller
-//! loads the signet, denylist, and identity,
+//! loads the root, denylist, and identity,
 //! prints its own banner, and drives this core. Everything here already speaks `bifrost` and `nauthy`, never
 //! clap or a store.
 

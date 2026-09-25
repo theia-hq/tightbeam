@@ -2,14 +2,14 @@
 // only test-attributed functions); panicking on failed test setup is exactly the intent.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-//! The signet-bound slip, end to end over the in-process transport (delib-42): work issues ONE slip for a
-//! service, bound to a hire's whole fleet `X` (their signet). A hire DEVICE reaches work presenting BOTH the
+//! The authority-bound slip, end to end over the in-process transport: work issues ONE slip for a service,
+//! bound to a hire's authority `X` (their root). A hire DEVICE reaches work presenting BOTH the
 //! slip (slot 1) AND its own membership badge under `X` (slot 2). The gate admits iff the slip is valid at
 //! work's own root AND the presenter's proven device is a member of `X` (its badge verifies under `X`, bound
-//! to the proven device). Any one alone fails, and a badge under the WRONG fleet fails.
+//! to the proven device). Any one alone fails, and a badge under the WRONG authority fails.
 //!
-//! Over `mem` the proven peer is the transport's synthetic node id, independent of either signet's cap key,
-//! which is exactly what lets this test bind the fleet badge to the connector's proven id and exercise the
+//! Over `mem` the proven peer is the transport's synthetic node id, independent of either root's cap key,
+//! which is exactly what lets this test bind the member badge to the connector's proven id and exercise the
 //! device binding without a keyed transport.
 
 use core::time::Duration;
@@ -22,17 +22,17 @@ use tightbeam::tunnel::{self, CancellationToken, Connector, Router};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
-/// Work's signet secret: its ed25519 public half is the ONE root the family gate trusts, and the root the
-/// signet-bound slip is issued under.
+/// Work's root secret: its ed25519 public half is the ONE root the family gate trusts, and the root the
+/// authority-bound slip is issued under.
 const WORK_SECRET: [u8; 32] = [7u8; 32];
-/// The hire's fleet signet secret `X`: it signs the hire's device badges. Work never holds it; work only
+/// The hire's root secret `X`: it signs the hire's device badges. Work never holds it; work only
 /// NAMES its public half in the slip.
 const HIRE_SECRET: [u8; 32] = [2u8; 32];
-/// A third, unrelated fleet `Y`: a badge under it must never satisfy a slip bound to `X`.
+/// A third, unrelated authority `Y`: a badge under it must never satisfy a slip bound to `X`.
 const OTHER_SECRET: [u8; 32] = [3u8; 32];
 
 #[tokio::test]
-async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership() {
+async fn an_authority_bound_slip_admits_a_hire_device_that_proves_membership() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -40,12 +40,12 @@ async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership()
             let exposer = Node::new(MemTransport::bind(), NoDiscovery);
             let exposer_id = exposer.node_id();
 
-            // Work exposes `web=<echo>` behind the DEFAULT family gate, rooted at WORK's signet: the one and
-            // only anchor. The hire's fleet `X` rides transitively inside a slip work signed, never as a
+            // Work exposes `web=<echo>` behind the DEFAULT family gate, rooted at WORK's key: the one and
+            // only anchor. The hire's authority `X` rides transitively inside a slip work signed, never as a
             // second trusted root.
-            let work_signet = NodeId::from_ed25519_secret(&WORK_SECRET);
+            let work_root = NodeId::from_ed25519_secret(&WORK_SECRET);
             tokio::task::spawn_local(async move {
-                let gate = tunnel::resolve_gate(Some(work_signet), empty_denylist().await).unwrap();
+                let gate = tunnel::resolve_gate(Some(work_root), empty_denylist().await).unwrap();
                 Router::new(gate)
                     .parse(&[format!("web=tcp:{echo_addr}")])
                     .unwrap()
@@ -60,9 +60,9 @@ async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership()
             let hire = Identity::from_secret(&HIRE_SECRET).unwrap();
             let web: Service = "web".parse().unwrap();
 
-            // The slip work issues for the whole hire fleet `X`: valid at WORK's root, naming `X` as the
-            // fleet whose devices may use it. Sealed and inert alone (it grants nothing without a fleet badge).
-            let slip = Link::mint_signet(
+            // The slip work issues to the hire's authority `X`: valid at WORK's root, naming `X` as the
+            // authority whose members may use it. Inert alone (it admits no one without a member badge).
+            let slip = Link::mint_authority_bound(
                 &work,
                 &web,
                 Identity::from_secret(&HIRE_SECRET).unwrap().verifying_key(),
@@ -73,7 +73,7 @@ async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership()
             // (a) ADMIT: the hire device presents the slip (slot 1) AND its own badge under `X` bound to the
             // proven dialer (slot 2). Both leaves hold, so the two-token AND admits and the tunnel echoes.
             let device = Node::new(MemTransport::bind(), NoDiscovery);
-            let fleet_badge = hire
+            let member_badge = hire
                 .mint_member(
                     device.node_id().verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(Duration::from_secs(3600)),
@@ -86,22 +86,22 @@ async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership()
                 exposer_id,
                 "web",
                 slip.as_str(),
-                Some(fleet_badge.as_str()),
+                Some(member_badge.as_str()),
             )
             .await;
             assert_eq!(
                 echoed.as_deref(),
                 Some(&b"a hire reaching work"[..]),
-                "slip + a valid fleet badge under X, bound to the proven device, admits"
+                "slip + a valid member badge under X, bound to the proven device, admits"
             );
 
-            // (b) SLIP ALONE: drop slot 2. The slip is inert on the plain path and the signet-bound arm has
+            // (b) SLIP ALONE: drop slot 2. The slip is inert on its own and the authority-bound arm has
             // no badge to verify, so the gate refuses and the port never binds.
             let no_badge = Node::new(MemTransport::bind(), NoDiscovery);
             let refused = connect_and_echo(no_badge, exposer_id, "web", slip.as_str(), None).await;
-            assert_eq!(refused, None, "the slip alone (no fleet badge) is refused");
+            assert_eq!(refused, None, "the slip alone (no member badge) is refused");
 
-            // (c) WRONG FLEET: present a badge under `Y`, a signet the slip does NOT name. Its root does not
+            // (c) WRONG AUTHORITY: present a badge under `Y`, a root the slip does NOT name. Its root does not
             // match the `X` the slip pins, so the badge fails and the AND cannot hold.
             let other = Identity::from_secret(&OTHER_SECRET).unwrap();
             let stray = Node::new(MemTransport::bind(), NoDiscovery);
@@ -121,12 +121,15 @@ async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership()
                 Some(wrong_badge.as_str()),
             )
             .await;
-            assert_eq!(refused, None, "a badge under the wrong fleet Y is refused");
+            assert_eq!(
+                refused, None,
+                "a badge under the wrong authority Y is refused"
+            );
         })
         .await;
 }
 
-/// Run a `connect` from `consumer` presenting the signet-bound `slip` in slot 1 and an optional fleet
+/// Run a `connect` from `consumer` presenting the authority-bound `slip` in slot 1 and an optional member
 /// `badge` in slot 2, send a probe, and return the echo if the tunnel carried it within a short window (a
 /// refused connection never echoes). The consumer node is passed in so its PROVEN id can be bound into the
 /// badge before the dial.
@@ -203,8 +206,10 @@ async fn free_port() -> u16 {
 /// An empty revocation denylist (an absent file is an empty set); this test exercises admission, not
 /// revocation.
 async fn empty_denylist() -> FileDenylist {
-    let path =
-        std::env::temp_dir().join(format!("tightbeam-signet-denylist-{}", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "tightbeam-authority-bound-denylist-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&path);
     FileDenylist::load(path).await.unwrap()
 }

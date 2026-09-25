@@ -95,7 +95,7 @@ where
     }
 
     /// Like [`open_with`](Self::open_with) but also presents a second `membership` slot: a badge under
-    /// the foreign fleet a signet-bound slip names, so a test can drive the two-token AND at the gate.
+    /// the foreign root an authority-bound slip names, so a test can drive the two-token AND at the gate.
     pub(super) async fn open_with_slots<S>(
         session: &S,
         service: &str,
@@ -136,9 +136,9 @@ where
 
 /// A family gate + a `speed` service; a helper to build the two postures the per-service tests need.
 pub(super) fn family_gate(tag: &str) -> Gate {
-    let signet = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
+    let root = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
     Gate::rooted(
-        signet.verifying_key(),
+        root.verifying_key(),
         nauthy::FileDenylist::empty(std::env::temp_dir().join(format!("tb-per-service-{tag}"))),
     )
 }

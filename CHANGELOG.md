@@ -2,6 +2,17 @@
 
 All notable changes to tightbeam, newest first.
 
+## v0.18.0
+
+The key a node trusts is its root, in code, in its config file and in its environment.
+
+### Breaking
+- **The trusted key lives in `~/.config/tightbeam/root`, overridable with `TIGHTBEAM_ROOT`.** `expose`
+  and `share` read it from there.
+- **`config::load_root`, `config::write_root` and `config::root_path` read, write and locate the trusted
+  key.**
+- **Built on nauthy 0.11.0.** An authority-bound slip is minted with `Link::mint_authority_bound`.
+
 ## v0.17.1
 
 ### Fixed

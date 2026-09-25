@@ -6,7 +6,7 @@
 //! hands back a bidirectional stream (bound to a local port, or piped over stdio). A caller supplies the
 //! services, the identity, and the output; the core prints nothing and reads no config path.
 //!
-//! Who may connect is decided by the [`nauthy`] crate's authorization gate: by default the node's signet
+//! Who may connect is decided by the [`nauthy`] crate's authorization gate: by default the node's root
 //! (its own devices and their delegates), else an open gate for anyone. A named service is a
 //! [`Handler`](tunnel::Handler) a caller binds to a name on a
 //! [`Router`](tunnel::Router); tightbeam knows only the contract, never what a handler does, and

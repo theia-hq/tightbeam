@@ -32,11 +32,11 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
             let exposer_id = exposer.node_id();
 
             // Expose `ssh=<echo>` behind a capability gate rooted at the exposer's cap identity.
-            // The runner is provisioned to trust the exposer's signet: its family gate admits tokens
+            // The runner is provisioned to trust the exposer's root: its family gate admits tokens
             // rooted at that key (badges or slips), which is what these cap tests present.
-            let signet = NodeId::from_ed25519_secret(&EXPOSER_SECRET);
+            let root = NodeId::from_ed25519_secret(&EXPOSER_SECRET);
             tokio::task::spawn_local(async move {
-                let gate = tunnel::resolve_gate(Some(signet), empty_denylist().await).unwrap();
+                let gate = tunnel::resolve_gate(Some(root), empty_denylist().await).unwrap();
                 Router::new(gate)
                     .parse(&[format!("ssh=tcp:{echo_addr}")])
                     .unwrap()

@@ -2,8 +2,8 @@
 // only test-attributed functions); panicking on failed test setup is exactly the intent.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-//! `tightbeam share`, run as the binary: a link is minted only when the node trusts no signet or trusts
-//! its own key. Under a foreign signet a link would be rooted at a key no gate admits, so the verb refuses
+//! `tightbeam share`, run as the binary: a link is minted only when the node trusts no root or trusts
+//! its own key. Under a foreign root a link would be rooted at a key no gate admits, so the verb refuses
 //! and prints nothing to stdout.
 
 use std::path::PathBuf;
@@ -33,21 +33,21 @@ impl Drop for TempDir {
     }
 }
 
-/// Persist the node's identity in `dir`, pin `signet` (none: no signet file), and run `share ssh`.
-async fn share_under(dir: &TempDir, signet: Option<NodeId>) -> Output {
+/// Persist the node's identity in `dir`, pin `root` (none: no root file), and run `share ssh`.
+async fn share_under(dir: &TempDir, root: Option<NodeId>) -> Output {
     let key = dir.0.join("identity.key");
-    let signet_path = dir.0.join("signet");
+    let root_path = dir.0.join("root");
     tightbeam::identity::write(&OWN_SECRET, Some(&key))
         .await
         .expect("persist the node identity");
-    if let Some(signet) = signet {
-        std::fs::write(&signet_path, format!("{signet}\n")).expect("pin the signet");
+    if let Some(root) = root {
+        std::fs::write(&root_path, format!("{root}\n")).expect("pin the root");
     }
     std::process::Command::new(env!("CARGO_BIN_EXE_tightbeam"))
         .args(["share", "ssh"])
         .env("HOME", &dir.0)
         .env("TIGHTBEAM_KEY", &key)
-        .env("TIGHTBEAM_SIGNET", &signet_path)
+        .env("TIGHTBEAM_ROOT", &root_path)
         .output()
         .expect("run tightbeam share")
 }
@@ -99,6 +99,37 @@ async fn tightbeam_share_refuses_under_a_foreign_pin() {
     );
 }
 
+/// With no `TIGHTBEAM_ROOT`, the pin is read from `root` in the config directory, so a foreign key written
+/// there refuses the link exactly as the override does.
+#[tokio::test]
+async fn tightbeam_share_reads_the_pin_from_the_config_root_file() {
+    let dir = TempDir::new("config-root");
+    let key = dir.0.join("identity.key");
+    tightbeam::identity::write(&OWN_SECRET, Some(&key))
+        .await
+        .expect("persist the node identity");
+    let config = dir.0.join(".config").join("tightbeam");
+    std::fs::create_dir_all(&config).expect("create the config dir");
+    let foreign = NodeId::from_ed25519_secret(&[9u8; 32]);
+    std::fs::write(config.join("root"), format!("{foreign}\n")).expect("pin the root");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tightbeam"))
+        .args(["share", "ssh"])
+        .env("HOME", &dir.0)
+        .env("TIGHTBEAM_KEY", &key)
+        .env_remove("TIGHTBEAM_ROOT")
+        .output()
+        .expect("run tightbeam share");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "share must fail under the foreign root in the config dir"
+    );
+    assert!(
+        stderr.contains(&format!("this node trusts root {foreign}")),
+        "the refusal names the root read from the config dir: {stderr}"
+    );
+}
+
 #[tokio::test]
 async fn tightbeam_share_mints_under_its_own_pin() {
     let dir = TempDir::new("own");
@@ -118,7 +149,7 @@ async fn tightbeam_share_mints_with_no_pin() {
     let output = share_under(&dir, None).await;
     assert!(
         output.status.success(),
-        "share with no signet must mint: {}",
+        "share with no root must mint: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let link = String::from_utf8(output.stdout).expect("utf-8 link");

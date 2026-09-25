@@ -20,7 +20,7 @@ use tightbeam::tunnel::{
 /// only. A named handler service is bound by value in an embedder, so it is not served here.
 ///
 /// Authorization is a property of the node, not a per-expose choice: by default a service is gated to this
-/// node's signet (set once when the node adopts an identity), admitting the owner's own devices (membership
+/// node's root (set once when the node adopts an identity), admitting the owner's own devices (membership
 /// badges) and
 /// anyone they delegate a slip to. `--public` is the one deliberate exception: it opens a service to
 /// anyone, unauthenticated.
@@ -29,7 +29,7 @@ pub struct ExposeCmd {
     /// expose local services as `name=target`
     #[arg(required = true, value_name = "name=target")]
     pub services: Vec<String>,
-    /// open the WHOLE node to anyone, unauthenticated (the one opt-out from the signet)
+    /// open the WHOLE node to anyone, unauthenticated (the one opt-out from the family gate)
     // A whole-node BOOLEAN, never a per-service list: this bin exposes the library primitive directly, so
     // `--public` sets the gate's BASE posture and every service under it opens at once. The help spells the
     // whole-node scope out loud, because a layer above can offer the same word per service and an operator
@@ -63,7 +63,7 @@ pub struct ExposeCmd {
 impl ExposeCmd {
     /// tightbeam's `expose` adapter: a thin glue over [`tightbeam::tunnel`], symmetric with any richer
     /// consumer's. Parse the services, resolve the gate through the shared `resolve_gate` policy (`--public`
-    /// opens, else a family gate on the signet, else a loud error), print tightbeam's OWN banner, and run the
+    /// opens, else a family gate on the root, else a loud error), print tightbeam's OWN banner, and run the
     /// exposer. The core prints nothing; the banner is this CLI's to own.
     ///
     /// tightbeam's binary is a thin demo of the tunnel: it exposes only the raw primitives
@@ -73,7 +73,7 @@ impl ExposeCmd {
     pub async fn run<T: Transport, D: bifrost::Discovery>(
         self,
         node: &Node<T, D>,
-        signet: Option<NodeId>,
+        root: Option<NodeId>,
         revocations: Arc<Latch<FileDenylist>>,
     ) -> eyre::Result<()>
     where
@@ -87,7 +87,7 @@ impl ExposeCmd {
         let gate = if self.public {
             nauthy::Gate::Open
         } else {
-            tunnel::resolve_gate(signet, Arc::clone(&revocations))?
+            tunnel::resolve_gate(root, Arc::clone(&revocations))?
         };
         // Assemble the one route table: the `name=target` grammar absorbs the raw primitives (a
         // `tcp:`/`unix:` local forward, or a `file:`/`fifo:`/`stdin:` raw-stream source; an unknown scheme
@@ -119,7 +119,7 @@ impl ExposeCmd {
             expose_banner(
                 node.node_id(),
                 names.iter().map(String::as_str),
-                &gate_description(&self, signet),
+                &gate_description(&self, root),
             );
             // The manifest declares which raw streams read Open (proven unsafe) and their resolved absolute
             // source, so the loud warning names the exact bytes a stranger can read, not the operator's typed
@@ -136,7 +136,7 @@ impl ExposeCmd {
 
 /// Print tightbeam's readiness banner: the copyable node id set off by blank lines, a header, and a trailer
 /// naming the exposed services, the effective gate, and how to stop. Points at `tightbeam share` (this
-/// CLI's own mint verb). Only public material (the node id) is printed; the host seed and signet secret
+/// CLI's own mint verb). Only public material (the node id) is printed; the host seed and root secret
 /// never appear. Withheld under `--quiet`.
 ///
 /// Printed to STDERR, never stdout: a `stdin:` producer pipes its bytes into this process's stdin, and stdout
@@ -183,11 +183,11 @@ fn expose_unsafe_warning(manifest: &[ManifestEntry]) {
 }
 
 /// A one-line description of the effective gate, for the readiness banner: trust made visible.
-fn gate_description(cmd: &ExposeCmd, signet: Option<NodeId>) -> String {
+fn gate_description(cmd: &ExposeCmd, root: Option<NodeId>) -> String {
     if cmd.public {
         "public (anyone, unauthenticated)".to_owned()
     } else {
-        match signet {
+        match root {
             Some(root) => format!("root {}", root.short()),
             None => "unprovisioned".to_owned(),
         }
