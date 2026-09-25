@@ -206,7 +206,7 @@ fn an_exposer_refuses_an_open_gate_over_a_gated_only_handler() {
         "an open gate over a gated-only handler must be refused"
     );
     // The same handler behind a real gate is fine; only the open-gate pairing is refused. A family gate
-    // needs a signet and denylist, so prove the inverse with a plain forward under the open gate.
+    // needs a root and denylist, so prove the inverse with a forward under the open gate.
     let web = services(&["web=tcp:127.0.0.1:80"]);
     assert!(
         prove(
@@ -864,10 +864,10 @@ async fn an_unadmitted_dialer_gets_one_uniform_refusal_no_reason_no_menu() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            // The signet that roots the family, and a real exposed service (`ssh`) plus a second name
+            // The root of the family, and a real exposed service (`ssh`) plus a second name
             // (`web`) so the node has a genuine menu that MUST NOT leak. The bodies are irrelevant: every
             // dial here is refused at the gate or at the unknown-service arm, never served.
-            let signet = Identity::from_secret(&[7u8; 32]).expect("valid secret");
+            let root = Identity::from_secret(&[7u8; 32]).expect("valid secret");
             let hour = nauthy::Request::expires_in(core::time::Duration::from_secs(3600));
 
             let mut map = HashMap::new();
@@ -886,7 +886,7 @@ async fn an_unadmitted_dialer_gets_one_uniform_refusal_no_reason_no_menu() {
             let services = Services(map);
 
             // A slip the family once honored for `ssh`, now REVOKED: the revoked-but-persistent holder.
-            let revoked_slip = signet.mint(&svc("ssh"), hour).expect("mint ssh slip");
+            let revoked_slip = root.mint(&svc("ssh"), hour).expect("mint ssh slip");
             let path =
                 std::env::temp_dir().join(format!("tb-uniform-refusal-{}", std::process::id()));
             let _ = std::fs::remove_file(&path);
@@ -900,7 +900,7 @@ async fn an_unadmitted_dialer_gets_one_uniform_refusal_no_reason_no_menu() {
 
             let exposer = Exposer {
                 services,
-                gate: Gate::rooted(signet.verifying_key(), denylist),
+                gate: Gate::rooted(root.verifying_key(), denylist),
                 public: PublicServices::default(),
                 public_unsafe: PublicServices::default(),
                 enabled: Box::new(AllEnabled),
@@ -937,7 +937,7 @@ async fn an_unadmitted_dialer_gets_one_uniform_refusal_no_reason_no_menu() {
             let unknown = dial("admin", None).await;
             // (d) a WRONG-SERVICE slip: a valid, UNREVOKED slip for `web` presented for `ssh` -> gate
             //     refuses (NotGranted). Distinct internal reason, must still be the same wire class.
-            let wrong_slip = signet.mint(&svc("web"), hour).expect("mint web slip");
+            let wrong_slip = root.mint(&svc("web"), hour).expect("mint web slip");
             let not_granted = dial("ssh", Some(wrong_slip.link().expect("link").to_string())).await;
 
             // The whole point: all four are the SAME payload-free `NotAdmitted`, so no consumer can

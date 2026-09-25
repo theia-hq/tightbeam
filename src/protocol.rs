@@ -100,8 +100,8 @@ impl core::fmt::Display for WireVersion {
     }
 }
 
-/// A connector's opening frame: reach the named service, optionally presenting a capability and, for a
-/// signet-bound slip, a membership badge under the foreign fleet the slip names.
+/// A connector's opening frame: reach the named service, optionally presenting a capability and, for an
+/// authority-bound slip, a membership badge under the foreign root the slip names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     /// The service to reach, as named in `expose`.
@@ -109,8 +109,8 @@ pub struct Request {
     /// Slot 1: a presented capability link (`<key>.<token>`), when the host gates on capabilities. Absent when
     /// the host gates on identity (open/strict/paired), where the proven `NodeId` is the whole story.
     pub capability: Option<String>,
-    /// Slot 2: a membership badge under the FOREIGN fleet a signet-bound slip in `capability` names. The
-    /// host ANDs it against the slip (the two-token signet-bound admission); absent on every other path.
+    /// Slot 2: a membership badge under the FOREIGN root an authority-bound slip in `capability` names. The
+    /// host ANDs it against the slip (the two-token authority-bound admission); absent on every other path.
     pub membership: Option<String>,
 }
 

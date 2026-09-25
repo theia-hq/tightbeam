@@ -2,17 +2,17 @@
 // only test-attributed functions); panicking on failed test setup is exactly the intent.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-//! The membership badge, end to end over the in-process transport: a device presenting a badge its signet
+//! The membership badge, end to end over the in-process transport: a device presenting a badge its root
 //! signed (a cap carrying a `member(true)` fact in its authority block) reaches ANY service on a
 //! family-gated node, with no per-service slip. And a badge BOUND to one device (`mint_member`) is
 //! refused when a different device presents it, so a leaked badge is useless off its key.
 //!
 //! The family gate rules on the presented token AND the proven dialer: `admit_family` injects the peer the
 //! transport proved as a `bound_device` fact, and a bound badge grants only when that fact matches its
-//! binding. Over `mem` the proven peer is the transport's synthetic node id, independent of the signet's
+//! binding. Over `mem` the proven peer is the transport's synthetic node id, independent of the root's
 //! cap key, which is exactly what lets this test bind a badge to the connector's proven id and exercise
 //! the binding check without a keyed transport. Over iroh/quirk the two coincide (the node binds under the
-//! signet secret), so the same badge both proves membership and matches its own binding.
+//! root secret), so the same badge both proves membership and matches its own binding.
 
 use core::time::Duration;
 
@@ -24,9 +24,9 @@ use tightbeam::tunnel::{self, CancellationToken, Connector, Router};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
-/// The signet's fixed secret. Its ed25519 public half is the signet the family gate trusts, and it roots
+/// The root's fixed secret. Its ed25519 public half is the root the family gate trusts, and it roots
 /// every badge minted here.
-const SIGNET_SECRET: [u8; 32] = [42u8; 32];
+const ROOT_SECRET: [u8; 32] = [42u8; 32];
 
 #[tokio::test]
 async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_binding() {
@@ -37,12 +37,12 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             let exposer = Node::new(MemTransport::bind(), NoDiscovery);
             let exposer_id = exposer.node_id();
 
-            // Expose `web=<echo>` behind the DEFAULT family gate, rooted at the signet. Admission is by
+            // Expose `web=<echo>` behind the DEFAULT family gate on the root. Admission is by
             // membership alone, no per-service grant. The service is `web`, NOT the badge's service, to
             // prove a membership badge is whole-node (any service), not a per-service slip.
-            let signet = NodeId::from_ed25519_secret(&SIGNET_SECRET);
+            let root = NodeId::from_ed25519_secret(&ROOT_SECRET);
             tokio::task::spawn_local(async move {
-                let gate = tunnel::resolve_gate(Some(signet), empty_denylist().await).unwrap();
+                let gate = tunnel::resolve_gate(Some(root), empty_denylist().await).unwrap();
                 Router::new(gate)
                     .parse(&[format!("web=tcp:{echo_addr}")])
                     .unwrap()
@@ -53,13 +53,13 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
                     .unwrap();
             });
 
-            let signet = Identity::from_secret(&SIGNET_SECRET).unwrap();
+            let root = Identity::from_secret(&ROOT_SECRET).unwrap();
 
-            // The owner's device: a consumer node whose PROVEN id the signet binds the badge to. The badge
-            // grants membership (whole-node), bound to this device: the shape a signet holder mints for a
+            // The owner's device: a consumer node whose PROVEN id the root binds the badge to. The badge
+            // grants membership (whole-node), bound to this device: the shape a root holder mints for a
             // device.
             let device = Node::new(MemTransport::bind(), NoDiscovery);
-            let device_badge = signet
+            let device_badge = root
                 .mint_member(
                     device.node_id().verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(Duration::from_secs(3600)),
@@ -81,7 +81,7 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             // A badge bound to a DIFFERENT device, presented by this one: the proven dialer does not match
             // the binding, so the family gate refuses it. A leaked badge is useless off its key.
             let other_device_id = Node::new(MemTransport::bind(), NoDiscovery).node_id();
-            let foreign_badge = signet
+            let foreign_badge = root
                 .mint_member(
                     other_device_id.verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(Duration::from_secs(3600)),
@@ -112,10 +112,10 @@ async fn a_refused_forward_fails_at_preflight_with_the_reason() {
             let exposer = Node::new(MemTransport::bind(), NoDiscovery);
             let exposer_id = exposer.node_id();
 
-            // A family-gated node rooted at the signet: only a member is admitted.
-            let signet = NodeId::from_ed25519_secret(&SIGNET_SECRET);
+            // A family-gated node on the root: only a member is admitted.
+            let root = NodeId::from_ed25519_secret(&ROOT_SECRET);
             tokio::task::spawn_local(async move {
-                let gate = tunnel::resolve_gate(Some(signet), empty_denylist().await).unwrap();
+                let gate = tunnel::resolve_gate(Some(root), empty_denylist().await).unwrap();
                 Router::new(gate)
                     .parse(&[format!("web=tcp:{echo_addr}")])
                     .unwrap()

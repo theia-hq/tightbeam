@@ -33,7 +33,7 @@ use crate::tunnel::{
 const PICKUP: &str = "pickup";
 
 /// The key a rooted gate roots at in these tests.
-fn signet() -> Identity {
+fn root() -> Identity {
     Identity::from_secret(&[41u8; 32]).expect("valid secret")
 }
 
@@ -106,7 +106,7 @@ impl Handler for Hold {
 /// A router over a rooted gate on `keys`: the proven-only [`PICKUP`] route knowing exactly `known`, the
 /// family `ping` echo, and the member-only `locked` route.
 fn router(keys: &Arc<Keys>, known: HashSet<VerifyKey>, entered: &Arc<Notify>) -> Router {
-    Router::new(Gate::rooted(signet().verifying_key(), Arc::clone(keys)))
+    Router::new(Gate::rooted(root().verifying_key(), Arc::clone(keys)))
         .proven_service(
             svc(PICKUP),
             Hold {
@@ -173,7 +173,7 @@ fn serving_state(
         },
     );
     Serving {
-        gate: Gate::rooted(signet().verifying_key(), Arc::clone(keys)),
+        gate: Gate::rooted(root().verifying_key(), Arc::clone(keys)),
         public: PublicServices::default(),
         public_unsafe: PublicServices::default(),
         services: Services(routes),
@@ -403,7 +403,7 @@ fn proven_only_route_cannot_be_made_public() {
         "the refusal names the proven-only route: {open}"
     );
 
-    let gated = Router::new(Gate::rooted(signet().verifying_key(), Arc::clone(&keys)));
+    let gated = Router::new(Gate::rooted(root().verifying_key(), Arc::clone(&keys)));
     let Err(bound) = gated.service(svc(PICKUP), Hold { entered }) else {
         panic!("a proven-only handler must not bind on a family route");
     };
@@ -586,7 +586,7 @@ fn a_proven_session_as_the_sign_twin_of_a_revoked_key_is_cut() {
     let twin = VerifyKey::try_new(bytes).expect("the sign twin of a real key is a real key");
 
     let keys = Arc::new(Keys::default());
-    let gate = Gate::rooted(signet().verifying_key(), Arc::clone(&keys));
+    let gate = Gate::rooted(root().verifying_key(), Arc::clone(&keys));
     let cuts = Cuts::new(Box::new(Arc::clone(&keys)));
     let session = cuts.watch();
     session
@@ -648,7 +648,7 @@ fn a_proven_key_is_checked_before_a_slot_is_taken() {
         }
     });
     serving.gate = Gate::rooted(
-        signet().verifying_key(),
+        root().verifying_key(),
         PoolWatch {
             pool: Arc::clone(&pool),
             free: Arc::clone(&revoked_free),

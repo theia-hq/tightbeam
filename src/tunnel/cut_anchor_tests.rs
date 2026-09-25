@@ -15,7 +15,7 @@ use nauthy::{
 };
 
 use super::super::{AdmittedChains, CUT_SWEEP, LiveCuts};
-use super::{gated_echo, host_ends, hour, scratch, serve, signet, still_echoes, store};
+use super::{gated_echo, host_ends, hour, root, scratch, serve, still_echoes, store};
 use crate::identity::AsVerifyKey as _;
 use crate::tunnel::Exposer;
 use crate::tunnel::fixtures::{ServiceStream, prove, services, svc};
@@ -259,9 +259,9 @@ async fn a_pin_change_cuts_sessions_of_the_old_root() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_fleet_grant_session_survives_the_sweep() {
-    // The two-token path: a slip the pinned root issued naming a fleet's root, and that root's badge for
-    // the dialer. The fleet root is never the pin, so were the badge taken for an anchor the first sweep
+async fn an_authority_bound_session_survives_the_sweep() {
+    // The two-token path: a slip the pinned root issued naming a foreign root, and that root's badge for
+    // the dialer. The foreign root is never the pin, so were the badge taken for an anchor the first sweep
     // would cut the session.
     let local = tokio::task::LocalSet::new();
     local
@@ -269,16 +269,16 @@ async fn a_fleet_grant_session_survives_the_sweep() {
             let node = Anchored::new();
             let host = serve(node.exposer(node.cut()));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let fleet = Identity::from_secret(&[24u8; 32]).expect("valid secret");
+            let foreign = Identity::from_secret(&[24u8; 32]).expect("valid secret");
             let slip = old_root()
-                .mint_authority_slip(&svc("demo"), fleet.verifying_key(), hour())
+                .mint_authority_slip(&svc("demo"), foreign.verifying_key(), hour())
                 .expect("mint slip");
-            let badge = fleet
+            let badge = foreign
                 .mint_member(
                     consumer.node_id().verify_key().expect("a checked key"),
                     hour(),
                 )
-                .expect("mint fleet badge");
+                .expect("mint member badge");
 
             let session = consumer.connect(host).await.expect("connect");
             let mut stream = ServiceStream::open_with_slots(
@@ -288,13 +288,13 @@ async fn a_fleet_grant_session_survives_the_sweep() {
                 Some(badge.link().expect("link").to_string()),
             )
             .await
-            .expect("the fleet member is admitted");
+            .expect("the foreign member is admitted");
 
             for sweep in 0..10 {
                 tokio::time::sleep(CUT_SWEEP).await;
                 assert!(
                     still_echoes(&mut stream).await,
-                    "a fleet grant's session survives sweep {sweep}"
+                    "an authority-bound session survives sweep {sweep}"
                 );
             }
         })
@@ -367,7 +367,7 @@ async fn the_default_oracle_trusts_every_anchor() {
         .run_until(async {
             let (store, _roots, _denylist) = store("default-trust").await;
             for key in [
-                signet().verifying_key(),
+                root().verifying_key(),
                 old_root().verifying_key(),
                 own().verifying_key(),
             ] {
@@ -377,7 +377,7 @@ async fn the_default_oracle_trusts_every_anchor() {
 
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let badge = signet()
+            let badge = root()
                 .mint_member(
                     consumer.node_id().verify_key().expect("a checked key"),
                     hour(),

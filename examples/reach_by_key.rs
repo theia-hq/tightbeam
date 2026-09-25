@@ -56,7 +56,7 @@ async fn run() -> eyre::Result<()> {
     println!("exposer is reachable at key {exposer_key}");
 
     // 3. The exposer forwards every admitted overlay stream to the local echo service. `Gate::Open` admits
-    //    anyone who reaches the key; in production you pass a signet gate so only your own devices and the
+    //    anyone who reaches the key; in production you pass a family gate so only your own devices and the
     //    delegates you signed get in. One `Router` call binds the `echo` name to the built-in local forward,
     //    and the whole node is proven at `.expose()`.
     tokio::task::spawn_local(async move {

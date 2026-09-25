@@ -5,38 +5,38 @@ use std::path::PathBuf;
 use bifrost::NodeId;
 use eyre::eyre;
 
-/// The persisted signet location, `~/.config/tightbeam/signet`, overridable with `TIGHTBEAM_SIGNET`.
-/// Holds one thing: the public [`NodeId`] of the signet this node trusts, written once by provisioning
+/// The persisted root location, `~/.config/tightbeam/root`, overridable with `TIGHTBEAM_ROOT`.
+/// Holds one thing: the public [`NodeId`] of the root this node trusts, written once by provisioning
 /// (an adopt step). Public material (a key you already share), so it sits beside the secret identity,
 /// never inside it.
-pub fn signet_path() -> eyre::Result<PathBuf> {
-    if let Some(path) = std::env::var_os("TIGHTBEAM_SIGNET") {
+pub fn root_path() -> eyre::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("TIGHTBEAM_ROOT") {
         return Ok(PathBuf::from(path));
     }
-    Ok(config_dir()?.join("signet"))
+    Ok(config_dir()?.join("root"))
 }
 
-/// Load this node's signet: the [`NodeId`] it was provisioned to trust, or `None` if it was never
+/// Load this node's root: the [`NodeId`] it was provisioned to trust, or `None` if it was never
 /// provisioned. The file is a single public node id; an absent file means unprovisioned, which `expose`
 /// treats as "no default gate" (a loud error), never a silent open.
 // `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
 #[allow(clippy::std_instead_of_core)]
-pub async fn load_signet() -> eyre::Result<Option<NodeId>> {
-    match tokio::fs::read_to_string(signet_path()?).await {
+pub async fn load_root() -> eyre::Result<Option<NodeId>> {
+    match tokio::fs::read_to_string(root_path()?).await {
         Ok(text) => Ok(Some(text.trim().parse::<NodeId>()?)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
 
-/// Write this node's signet: the public [`NodeId`] its default gate will trust, as `adopt` sets it from
-/// an authkey. Overwrites any prior signet (re-provisioning re-trusts), creating the config dir.
-pub async fn write_signet(signet: NodeId) -> eyre::Result<()> {
-    let path = signet_path()?;
+/// Write this node's root: the public [`NodeId`] its default gate will trust, as `adopt` sets it from
+/// an authkey. Overwrites any prior root (re-provisioning re-trusts), creating the config dir.
+pub async fn write_root(root: NodeId) -> eyre::Result<()> {
+    let path = root_path()?;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    tokio::fs::write(&path, format!("{signet}\n")).await?;
+    tokio::fs::write(&path, format!("{root}\n")).await?;
     Ok(())
 }
 

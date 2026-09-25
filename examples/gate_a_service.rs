@@ -2,7 +2,7 @@
 //!
 //! The companion to [`reach_by_key`](../reach_by_key/index.html): that one admits
 //! anyone who reaches the key ([`Gate::Open`](nauthy::Gate::Open)); this one admits only a caller holding a
-//! capability the exposer's identity signed. The exposer stands its service behind a *signet gate*
+//! capability the exposer's identity signed. The exposer stands its service behind a *family gate*
 //! (its own key); the owner [`Link::mint`](nauthy::Link::mint)s a capability granting one service;
 //! a connector presents it. No allowlist, no server in the delegation loop: the exposer verifies the signed
 //! chain offline.
@@ -64,17 +64,17 @@ async fn run() -> eyre::Result<()> {
     let exposer_key = exposer.node_id();
     let consumer = Node::new(MemTransport::bind(), NoDiscovery);
 
-    // 3. Stand the `ssh` service behind a signet gate rooted at that identity: only a caller presenting a
+    // 3. Stand the `ssh` service behind a family gate rooted at that identity: only a caller presenting a
     //    capability this identity signed (for this service, unexpired) is admitted. `resolve_gate(..)`
-    //    is the same policy every embedder applies: not-public means a family gate on the signet, and an
+    //    is the same policy every embedder applies: not-public means a family gate on the root, and an
     //    empty denylist admits everything not yet revoked.
     // Nothing is revoked yet, so an empty denylist. A real node loads this from where it persists
     // revocations (`FileDenylist::load`); the empty set admits everything not yet revoked.
     // `identity.verifying_key()` is nauthy's `VerifyKey`; `.node_id()` is the `AsNodeId` bridge to bifrost's
     // `NodeId` (two names for the same ed25519 key on either side of the cap/transport boundary). A real
-    // exposer loads this signet from config as a `NodeId` already and never crosses the bridge by hand.
-    let signet = identity.verifying_key().node_id()?;
-    let gate = tunnel::resolve_gate(Some(signet), FileDenylist::empty(PathBuf::new()))?;
+    // exposer loads this root from config as a `NodeId` already and never crosses the bridge by hand.
+    let root = identity.verifying_key().node_id()?;
+    let gate = tunnel::resolve_gate(Some(root), FileDenylist::empty(PathBuf::new()))?;
     tokio::task::spawn_local(async move {
         if let Err(e) = async {
             Router::new(gate)

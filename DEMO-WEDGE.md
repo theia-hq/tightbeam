@@ -12,13 +12,13 @@ real iroh transport today.
 ## The verbs
 
 ```
-tightbeam expose ssh=127.0.0.1:22                # gated to the signet by default, which accepts caps
+tightbeam expose ssh=127.0.0.1:22                # gated to its root by default, which accepts caps
 tightbeam share ssh --expires 2h --delegable     # mint a <key>.<token> link
 tightbeam attenuate <link> --service ssh --expires 30m   # narrow a link, offline, no key
 tightbeam connect <link> --to 2222               # dial + present the token, from the link alone
 ```
 
-The default signet gate already admits a presented capability, so no extra flag turns it on. The exposer
+The default family gate already admits a presented capability, so no extra flag turns it on. The exposer
 mints with its persisted `NodeId` as the biscuit root and verifies presented caps against it. No server,
 no allowlist file to sync. A holder runs `attenuate` locally (offline) to narrow before handing off; the
 exposer verifies the whole chain without ever seeing the delegation.
@@ -30,7 +30,7 @@ a capability. The cap is minted by the exposer, narrowed twice offline (once by 
 party), then used by the connector. The refusals share the same live tunnel.
 
 ```
-### 1. exposer publishes ssh=<echo> behind its signet gate (no allowlist anywhere)
+### 1. exposer publishes ssh=<echo> behind its family gate (no allowlist anywhere)
     exposer node id: ed01mjwxs225tml3yqnrm64zrwysqxmzpkutp5w7y3j7hu3zq5qp3b6a
 
 ### 2. exposer mints a delegable ssh cap, valid 2h -> a link

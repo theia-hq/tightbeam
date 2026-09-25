@@ -30,7 +30,7 @@ use crate::security::{peer_proven, proof_label};
 use crate::splice_halves;
 
 /// Resolve the exposer's node BASE gate, in ONE place so every embedder applies the SAME policy: a family
-/// gate on the node's provisioned `signet`; an UNPROVISIONED
+/// gate on the node's provisioned `root`; an UNPROVISIONED
 /// node fails LOUD rather than ever defaulting to open. The caller loads its revocation store and passes
 /// it as a value. This exists so the two security-relevant conventions (fail-loud-on-unprovisioned,
 /// real-loaded-store) are enforced once, not hand-copied into each caller.
@@ -48,18 +48,18 @@ use crate::splice_halves;
 /// gate-resolution policy hands back from a flag: that node-wide-open flag was exactly the whole-node blast
 /// radius per-service exposure removes.
 pub fn resolve_gate(
-    signet: Option<NodeId>,
+    root: Option<NodeId>,
     revocations: impl Revocations + Send + Sync + 'static,
 ) -> eyre::Result<Gate> {
-    let root = signet.ok_or_else(|| {
+    let root = root.ok_or_else(|| {
         eyre::eyre!(
-            "this node has no signet to gate on: provision it (adopt a signet), or open individual services \
+            "this node has no root to gate on: provision it (adopt a root), or open individual services \
              to anyone"
         )
     })?;
     let root = root
         .verify_key()
-        .map_err(|error| eyre::eyre!("the signet {root} is not a usable key: {error}"))?;
+        .map_err(|error| eyre::eyre!("the root {root} is not a usable key: {error}"))?;
     Ok(Gate::rooted(root, revocations))
 }
 
@@ -693,7 +693,7 @@ fn admit(
     // hit on either reveals only the already-public fact that the service admits anyone; a miss on both takes
     // the identical family path below.
     if public.contains(service.as_str()) || public_unsafe.contains(service.as_str()) {
-        // An open service needs no badge, so the signet-bound membership slot is irrelevant on this path.
+        // An open service needs no badge, so the authority-bound membership slot is irrelevant on this path.
         // The witness is `Origin::Open` with `Admission::Slip`: no token is ruled on and nothing about the
         // peer is verified, so the `ProvenPeer` minted here records the key the peer announced and carries
         // no authority. That is what lets an announced transport keep serving a service the operator opened
@@ -779,11 +779,11 @@ fn admit(
         Ok(cap) => cap,
         Err(error) => return Err(HostRefusal::MalformedCapability(error)),
     };
-    // Parse the SECOND slot ONLY when the first is a signet-bound slip: that is the sole path that ANDs a
-    // fleet badge, so a plain/bearer/device slip (or none) never triggers the extra `Cap::parse`. The server
+    // Parse the SECOND slot ONLY when the first is an authority-bound slip: that is the sole path that ANDs a
+    // membership badge, so a bearer or device slip (or none) never triggers the extra `Cap::parse`. The server
     // guards this independently of the dialer (a hostile client ignores the dialer's attach logic), which
     // bounds the second slot's parse work behind the cheap, root-free `is_authority_bound` check. A malformed
-    // badge on the signet path is a refusal, not a hard error; both slots inherit `Cap::parse`'s bounds.
+    // badge on the authority-bound path is a refusal, not a hard error; both slots inherit `Cap::parse`'s bounds.
     let membership = match cap.as_ref() {
         Some(slip) if slip.is_authority_bound() => match membership.map(Cap::parse).transpose() {
             Ok(membership) => membership,

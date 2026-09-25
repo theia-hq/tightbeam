@@ -48,7 +48,7 @@ capabilities). Three runnable examples show the whole library, no network needed
 
 - [`reach_by_key`](examples/reach_by_key.rs): expose a service on one node and reach it by key from another
   (the core loop).
-- [`gate_a_service`](examples/gate_a_service.rs): put it behind a signet gate, mint a capability, and watch
+- [`gate_a_service`](examples/gate_a_service.rs): put it behind a family gate, mint a capability, and watch
   it admitted with the cap and refused without.
 - [`named_handler`](examples/named_handler.rs): inject your own `Handler` and reach it by name (the
   extension point every named service is built on).
@@ -100,7 +100,7 @@ use tightbeam::tunnel::{self, CancellationToken, Router};
 
 // `echo` is the built-in loopback reflector: it opens no host resource, so it is the safe public demo.
 // `forward` is the built-in local forward. A `handler` you wrote binds the same way (see below).
-let gate = tunnel::resolve_gate(Some(signet), denylist)?;   // family gate on the node's signet
+let gate = tunnel::resolve_gate(Some(root), denylist)?;   // family gate on the node's root
 let exposer = Router::new(gate)
     .echo("demo".parse()?)?
     .forward("web".parse()?, "tcp:127.0.0.1:8080")?
@@ -169,7 +169,7 @@ other witness, no other handler accepts its witness, and the route cannot be ope
 
 ## Hand out an expiring key
 
-A gate rooted at a node's signet admits the node's own devices and their delegates. A delegate holds a
+A gate on a node's root admits the node's own devices and their delegates. A delegate holds a
 capability: a signed, expiring, attenuable link the gate verifies offline, with no server in the
 loop and no allowlist to sync. The link is a [`nauthy::Link`], and minting, narrowing, and revoking are
 methods on it.
@@ -184,9 +184,9 @@ let link = Link::mint(&identity, &service, Duration::from_secs(2 * 3600))?;
 // Bind a link to one device, so a copy observed in flight or at rest grants no one.
 let bound = Link::mint_bound(&identity, &service, device_key, Duration::from_secs(3600))?;
 
-// Issue once to a whole fleet: every device that fleet vouches for may use it, and only when the
-// presenter ALSO proves membership under that fleet (the two-token admission the wire carries below).
-let slip = Link::mint_signet(&identity, &service, fleet_root, Duration::from_secs(3600))?;
+// Issue once to another authority: every device it vouches for may use the slip, and only when the
+// presenter ALSO proves membership under that authority (the two-token admission the wire carries below).
+let slip = Link::mint_authority_bound(&identity, &service, foreign_root, Duration::from_secs(3600))?;
 
 // A holder narrows a link further, offline, before delegating (no key, no network).
 let tighter = link.narrow(Some(&service), Some(Duration::from_secs(1800)))?;
@@ -220,9 +220,10 @@ Each stream opens with a small versioned preamble, `TB04`, before any bytes flow
 optional capability in slot 1, and an optional membership badge in slot 2. The host replies reached or
 refused, then the transparent byte pipe begins.
 
-- **Two-cap admit.** A signet-bound slip in slot 1 grants a service to a whole fleet without naming a
-  device. The host admits it only when slot 2 also proves the presenter is a member of that fleet, ANDing
-  the two. Every plain dial presents slot 1 alone, and the host never consults slot 2.
+- **Two-cap admit.** An authority-bound slip in slot 1 grants a service to every member of another
+  authority without naming a device. The host admits it only when slot 2 also proves the presenter is a
+  member of that authority, ANDing the two. Every other dial presents slot 1 alone, and the host never
+  consults slot 2.
 - **One uniform refusal.** A dialer the gate does not admit gets one payload-free refusal (`Refused`): no
   reason that separates a stranger from a revoked token from a wrong service, and no service menu. The
   existence and shape of a service are revealed only after the gate admits you for it, so the wire is not a
@@ -243,7 +244,7 @@ raw streams, and an ssh `ProxyCommand`.
 ## The limit
 
 A capability is a bearer token: whoever holds an unexpired, un-revoked one gets that one service until it
-expires or you revoke it. A device-bound or signet-bound link narrows that (a copy alone grants no one), and
+expires or you revoke it. A device-bound or authority-bound link limits that (a copy alone grants no one), and
 short expiry and revocation bound the rest.
 
 ## The name

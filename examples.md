@@ -149,13 +149,13 @@ Everything so far used `--public`: anyone who reaches the host gets in. The norm
 service is **gated**, and you hand one person a **key** to it. The key is a link: signed, scoped to
 one service, and expiring. It reaches that one service and nothing else on the host.
 
-A node gates every service on a **signet**: the authority whose devices it trusts. For one machine that
+A node gates every service on a **root**: the authority whose devices it trusts. For one machine that
 vouches for itself, that authority is its own key. Set it once. Run `expose` to see this node's key in the
 banner, stop it with ctrl-c, then trust that key:
 
 ```sh
 tightbeam expose demo=echo:          # prints this node's key in the banner; ctrl-c
-echo <your-node-id> > ~/.config/tightbeam/signet
+echo <your-node-id> > ~/.config/tightbeam/root
 ```
 
 Now expose the service gated (no `--public`) and mint a link to it:

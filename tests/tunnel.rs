@@ -40,7 +40,7 @@ async fn tunnels_tcp_over_bifrost() {
             let exposer_id = exposer.node_id();
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
 
-            // Drive the tunnel core directly (no CLI, no banner): an open gate needs no identity or signet,
+            // Drive the tunnel core directly (no CLI, no banner): an open gate needs no identity or root,
             // so any peer reaching the key is served (this test exercises the tunnel path, not authorization).
             tokio::task::spawn_local(async move {
                 Router::new(Gate::Open)

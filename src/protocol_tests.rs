@@ -70,8 +70,8 @@ async fn request_roundtrips_with_a_capability() {
 
 #[tokio::test]
 async fn request_roundtrips_with_both_slots() {
-    // TB03 added this second slot: a signet-bound dial carries slot 1 (the slip) AND slot 2 (a badge under
-    // the foreign fleet). Both present must round-trip byte-for-byte, so the gate reads the same two tokens
+    // TB03 added this second slot: an authority-bound dial carries slot 1 (the slip) AND slot 2 (a badge under
+    // the foreign root). Both present must round-trip byte-for-byte, so the gate reads the same two tokens
     // the dialer wrote.
     let request = Request {
         service: "ssh".to_owned(),

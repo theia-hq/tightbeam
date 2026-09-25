@@ -394,14 +394,14 @@ async fn an_open_witness_is_refused_before_ok_for_a_never_handler() {
 async fn a_saturated_public_pool_never_starves_a_gated_member() {
     use crate::identity::AsVerifyKey as _;
 
-    let signet = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
+    let root = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
     let gate = Gate::rooted(
-        signet.verifying_key(),
+        root.verifying_key(),
         nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-public-starvation")),
     );
     // The badge is bound to the peer `drive_open_in` dials as, so the rooted gate admits it.
     let peer = bifrost::NodeId::from_ed25519_secret(&[9u8; 32]);
-    let badge = signet
+    let badge = root
         .mint_member(
             peer.verify_key().expect("a checked key"),
             nauthy::Request::expires_in(core::time::Duration::from_secs(300)),
@@ -1101,10 +1101,10 @@ async fn a_disabled_service_is_refused_after_admission_not_before_the_gate() {
     }
 
     let count = Arc::new(AtomicUsize::new(0));
-    let signet = nauthy::Identity::from_secret(&[5u8; 32]).expect("valid secret");
+    let root = nauthy::Identity::from_secret(&[5u8; 32]).expect("valid secret");
     let rooted = Arc::new(super::Serving {
         gate: Gate::rooted(
-            signet.verifying_key(),
+            root.verifying_key(),
             nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-disabled-order")),
         ),
         public: PublicServices::default(),
@@ -1256,19 +1256,19 @@ fn a_public_member_admits_a_stranger_and_every_miss_takes_the_family_path() {
     );
 }
 
-/// Server-side slot-2 guard: the second slot is parsed ONLY when slot 1 is a signet-bound
+/// Server-side slot-2 guard: the second slot is parsed ONLY when slot 1 is an authority-bound
 /// slip. A plain member badge admits on slot 1 alone, so a hostile client's garbage in slot 2 is never
 /// parsed and cannot turn a valid member dial into a refusal. The server guards this itself, never
 /// trusting the dialer's attach logic.
 #[test]
-fn a_member_dial_ignores_a_second_slot_when_slot_one_is_not_signet_bound() {
+fn a_member_dial_ignores_a_second_slot_when_slot_one_is_not_authority_bound() {
     use crate::identity::AsVerifyKey as _;
 
-    let signet = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
+    let root = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
     let gate = family_gate("guard");
     let public = super::PublicServices::default();
     let peer = bifrost::NodeId::from_ed25519_secret(&[5u8; 32]);
-    let badge = signet
+    let badge = root
         .mint_member(
             peer.verify_key().expect("a checked key"),
             nauthy::Request::expires_in(core::time::Duration::from_secs(3600)),
@@ -1296,7 +1296,7 @@ fn a_member_dial_ignores_a_second_slot_when_slot_one_is_not_signet_bound() {
 }
 
 /// The peer-proof predicate at the admission seam: an announced session cannot root-admit, even
-/// with a genuine member badge bound to the announced key. The badge verifies (it is the signet's
+/// with a genuine member badge bound to the announced key. The badge verifies (it is the root's
 /// own signature); that is exactly the replay an announced transport enables, so the predicate
 /// refuses before the ruling and the node's own log names the declared profile.
 #[test]
@@ -1307,10 +1307,10 @@ fn an_announced_session_cannot_root_admit_a_valid_badge() {
         peer: PeerProof::Announced,
         channel: ChannelProtection::Plain,
     };
-    let signet = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
+    let root = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
     let gate = family_gate("announced");
     let peer = bifrost::NodeId::from_ed25519_secret(&[5u8; 32]);
-    let badge = signet
+    let badge = root
         .mint_member(
             peer.verify_key().expect("a checked key"),
             nauthy::Request::expires_in(core::time::Duration::from_secs(3600)),
@@ -1441,9 +1441,9 @@ async fn an_announced_session_is_refused_at_admission_with_the_uniform_answer() 
     use crate::identity::AsVerifyKey as _;
     use crate::protocol::{Request, Response};
 
-    let signet = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
+    let root = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
     let peer = bifrost::NodeId::from_ed25519_secret(&[5u8; 32]);
-    let badge = signet
+    let badge = root
         .mint_member(
             peer.verify_key().expect("a checked key"),
             nauthy::Request::expires_in(core::time::Duration::from_secs(3600)),
@@ -1577,9 +1577,9 @@ async fn a_member_only_route_serves_a_member_and_uniformly_refuses_a_slip_and_a_
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let signet = nauthy::Identity::from_secret(&[7u8; 32]).expect("valid secret");
+            let root = nauthy::Identity::from_secret(&[7u8; 32]).expect("valid secret");
             let gate = Gate::rooted(
-                signet.verifying_key(),
+                root.verifying_key(),
                 nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-member-floor")),
             );
             let services = services(&["reflect=echo:"])
@@ -1607,9 +1607,9 @@ async fn a_member_only_route_serves_a_member_and_uniformly_refuses_a_slip_and_a_
                     .expect("runs");
             });
 
-            // A whole-node member: a badge the signet signed, bound to the member's proven mem id.
+            // A whole-node member: a badge the root signed, bound to the member's proven mem id.
             let member = Node::new(MemTransport::bind(), NoDiscovery);
-            let badge = signet
+            let badge = root
                 .mint_member(
                     member.node_id().verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(core::time::Duration::from_secs(300)),
@@ -1628,7 +1628,7 @@ async fn a_member_only_route_serves_a_member_and_uniformly_refuses_a_slip_and_a_
             // service to this device), and the route floor turns that admission into the uniform refusal
             // a gate miss gives. A tokenless stranger gets the same refusal.
             let delegate = Node::new(MemTransport::bind(), NoDiscovery);
-            let slip = signet
+            let slip = root
                 .mint_bound(
                     &svc("locked"),
                     delegate.node_id().verify_key().expect("a checked key"),

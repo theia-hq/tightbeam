@@ -12,7 +12,7 @@
 //! adapter that loads the identity and denylist, resolves the gate through the shared
 //! [`resolve_gate`](tightbeam::tunnel::resolve_gate) policy, prints its own banner, and drives the core.
 //!
-//! By default a service is gated to the machine's signet (the key it trusts, provisioned when the machine
+//! By default a service is gated to the machine's root (the key it trusts, provisioned when the machine
 //! adopts an identity), admitting the owner's own devices and their delegates; `--public` is the one
 //! deliberate opt-out (never a handler with no auth of its own). The identity is always persisted, since it
 //! is both the address peers dial and the key a
@@ -27,7 +27,7 @@ use bifrost::Node;
 use bifrost_iroh::Endpoint;
 use clap::{CommandFactory, Parser, Subcommand};
 use nauthy::{DisabledRoots, FileDenylist, Latch};
-use tightbeam::config::{disabled_roots_path, load_signet, revoked_path};
+use tightbeam::config::{disabled_roots_path, load_root, revoked_path};
 use tightbeam::identity::{self, Secret};
 use tightbeam::peer::{Discovery, Peer, Role};
 
@@ -122,17 +122,17 @@ async fn run() -> eyre::Result<()> {
         // `revoke` adds to the local revocation denylist; local, no node, no identity.
         Command::Revoke(cmd) => cmd.run().await,
         // `share` needs the signing identity but no bound node: minting is offline. It also reads the
-        // signet, because a link signed under a foreign one would be admitted nowhere.
+        // root, because a link signed under a foreign one would be admitted nowhere.
         Command::Share(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
-            let signet = load_signet().await?;
-            cmd.run(&secret.cap_identity()?, signet)
+            let root = load_root().await?;
+            cmd.run(&secret.cap_identity()?, root)
         }
-        // `expose`/`connect` bind a node. `expose` also reads the persisted signet: the key its default
+        // `expose`/`connect` bind a node. `expose` also reads the persisted root: the key its default
         // gate trusts (a family gate admits the owner's devices and their delegates).
         Command::Expose(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
-            let signet = load_signet().await?;
+            let root = load_root().await?;
             // Load tightbeam's own denylist and disabled roots here in the adapter and pass them as one
             // composed value; the core takes the loaded store, never a path (the same interface any richer
             // consumer drives on its own store). Shared, because the gate and the live cut must read the
@@ -143,7 +143,7 @@ async fn run() -> eyre::Result<()> {
             ));
             let node =
                 bind_node(secret, cli.peer, cli.offline, cli.bind_addr, Role::Serving).await?;
-            let outcome = run_until_signalled(cmd.run(&node, signet, revocations)).await;
+            let outcome = run_until_signalled(cmd.run(&node, root, revocations)).await;
             node.close().await;
             outcome
         }

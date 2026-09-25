@@ -38,17 +38,17 @@ fn run<F: Future>(future: F) -> F::Output {
 /// Mint an admission witness through the only public mint (the gate). `rooted` picks a rooted gate with
 /// a member badge against an open gate admitting a stranger.
 fn witness(rooted: bool) -> nauthy::Admitted {
-    let signet = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
+    let root = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
     let peer = nauthy::Identity::from_secret(&[5u8; 32])
         .expect("valid secret")
         .verifying_key();
     let service: nauthy::Service = "typed".parse().expect("valid service name");
     if rooted {
-        let badge = signet
+        let badge = root
             .mint_member(peer, nauthy::Request::expires_in(Duration::from_secs(300)))
             .expect("mint a member badge");
         let gate = Gate::rooted(
-            signet.verifying_key(),
+            root.verifying_key(),
             nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-handler-typed-rooted")),
         );
         gate.admit_witnessed(ProvenPeer::from_handshake(peer), Some(&badge), &service)

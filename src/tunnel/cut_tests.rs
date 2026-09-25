@@ -37,8 +37,8 @@ fn scratch(tag: &str) -> PathBuf {
     path
 }
 
-/// The signet every gated test roots at.
-fn signet() -> Identity {
+/// The root every gated test trusts.
+fn root() -> Identity {
     Identity::from_secret(&[9u8; 32]).expect("valid secret")
 }
 
@@ -73,7 +73,7 @@ async fn store(tag: &str) -> (Arc<Latch<FileDenylist>>, PathBuf, PathBuf) {
 fn gated_echo(store: &Arc<Latch<FileDenylist>>) -> Exposer {
     prove(
         services(&["demo=echo:"]),
-        Gate::rooted(signet().verifying_key(), Arc::clone(store)),
+        Gate::rooted(root().verifying_key(), Arc::clone(store)),
         PublicRequest::none(),
         PublicUnsafeRequest::none(),
     )
@@ -127,7 +127,7 @@ async fn a_session_is_cut_when_a_cap_it_was_admitted_on_is_revoked() {
             let (store, _roots, denylist) = store("revoked").await;
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let badge = signet()
+            let badge = root()
                 .mint_member(
                     consumer.node_id().verify_key().expect("a checked key"),
                     hour(),
@@ -164,7 +164,7 @@ async fn a_session_is_cut_when_the_root_it_was_admitted_under_is_disabled() {
             let (store, roots, _denylist) = store("disabled").await;
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let badge = signet()
+            let badge = root()
                 .mint_member(
                     consumer.node_id().verify_key().expect("a checked key"),
                     hour(),
@@ -183,7 +183,7 @@ async fn a_session_is_cut_when_the_root_it_was_admitted_under_is_disabled() {
 
             let mut writer = DisabledRoots::open_for_repair(roots.clone());
             writer
-                .disable(signet().verifying_key())
+                .disable(root().verifying_key())
                 .await
                 .expect("disable the root");
 
@@ -206,7 +206,7 @@ async fn a_session_admitted_through_a_foreign_badge_is_cut_when_that_root_is_dis
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let foreign = Identity::from_secret(&[11u8; 32]).expect("valid secret");
-            let slip = signet()
+            let slip = root()
                 .mint_authority_slip(&svc("demo"), foreign.verifying_key(), hour())
                 .expect("mint slip");
             let badge = foreign
@@ -249,7 +249,7 @@ async fn a_session_nothing_recalled_keeps_running_across_sweeps() {
             let (store, _roots, denylist) = store("survives").await;
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let badge = signet()
+            let badge = root()
                 .mint_member(
                     consumer.node_id().verify_key().expect("a checked key"),
                     hour(),
@@ -265,7 +265,7 @@ async fn a_session_nothing_recalled_keeps_running_across_sweeps() {
             .expect("the member is admitted");
 
             // Some OTHER grant is revoked: the cut is keyed on this session's chains, not on the file.
-            let unrelated = signet().mint(&svc("demo"), hour()).expect("mint slip");
+            let unrelated = root().mint(&svc("demo"), hour()).expect("mint slip");
             let mut writer = FileDenylist::empty(denylist.clone());
             writer
                 .revoke(&unrelated)
@@ -289,7 +289,7 @@ async fn a_session_is_cut_once_the_grant_it_was_admitted_on_expires() {
             let (store, _roots, _denylist) = store("expired").await;
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let badge = signet()
+            let badge = root()
                 .mint_member(
                     consumer.node_id().verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(SHORT),
@@ -318,14 +318,14 @@ async fn a_session_is_cut_once_the_grant_it_was_admitted_on_expires() {
 #[tokio::test]
 async fn a_session_is_cut_at_a_narrowed_expiry_not_the_issuers() {
     // The holder narrowed an hour-long badge to seconds and passed it on. The session admitted on it must
-    // end at the narrower instant: the chain's earliest bound, not the one the signet signed.
+    // end at the earlier instant: the chain's earliest bound, not the one the root signed.
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let (store, _roots, _denylist) = store("narrowed").await;
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let narrowed = signet()
+            let narrowed = root()
                 .mint_member(
                     consumer.node_id().verify_key().expect("a checked key"),
                     hour(),
@@ -395,7 +395,7 @@ async fn a_stream_on_a_cap_whose_expiry_cannot_be_read_is_refused() {
             let (store, _roots, _denylist) = store("unreadable").await;
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let badge = signet()
+            let badge = root()
                 .mint_member(
                     consumer.node_id().verify_key().expect("a checked key"),
                     hour(),
@@ -446,7 +446,7 @@ async fn a_stream_on_a_clock_bound_past_the_clocks_range_is_refused_and_the_node
             let (store, _roots, _denylist) = store("far-date").await;
             let host = serve(gated_echo(&store));
             let hostile = Node::new(MemTransport::bind(), NoDiscovery);
-            let badge = signet()
+            let badge = root()
                 .mint_member(
                     hostile.node_id().verify_key().expect("a checked key"),
                     hour(),
@@ -480,14 +480,14 @@ async fn a_stream_on_a_clock_bound_past_the_clocks_range_is_refused_and_the_node
 
             // Another peer, on a fresh session, is still served: the node did not go down.
             let other = Node::new(MemTransport::bind(), NoDiscovery);
-            let plain = signet()
+            let fresh = root()
                 .mint_member(other.node_id().verify_key().expect("a checked key"), hour())
                 .expect("mint badge");
             let session = other.connect(host).await.expect("the node still accepts");
             let mut stream = ServiceStream::open_with(
                 &session,
                 "demo",
-                Some(plain.link().expect("link").to_string()),
+                Some(fresh.link().expect("link").to_string()),
             )
             .await
             .expect("the node still admits");
@@ -506,13 +506,13 @@ async fn a_session_ends_when_the_first_grant_it_was_admitted_on_runs_out() {
             let (store, _roots, _denylist) = store("first-out").await;
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let brief = signet()
+            let brief = root()
                 .mint_member(
                     consumer.node_id().verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(SHORT),
                 )
                 .expect("mint the short badge");
-            let lasting = signet()
+            let lasting = root()
                 .mint_member(
                     consumer.node_id().verify_key().expect("a checked key"),
                     hour(),
@@ -548,7 +548,7 @@ async fn a_session_ends_when_the_first_grant_it_was_admitted_on_runs_out() {
 fn gated_pair(store: &Arc<Latch<FileDenylist>>) -> Exposer {
     prove(
         services(&["demo=echo:", "other=echo:"]),
-        Gate::rooted(signet().verifying_key(), Arc::clone(store)),
+        Gate::rooted(root().verifying_key(), Arc::clone(store)),
         PublicRequest::none(),
         PublicUnsafeRequest::none(),
     )
@@ -566,10 +566,10 @@ async fn a_short_grant_is_not_carried_past_its_expiry_by_a_later_grant_for_anoth
             let (store, _roots, _denylist) = store("carried").await;
             let host = serve(gated_pair(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let short = signet()
+            let short = root()
                 .mint(&svc("demo"), nauthy::Request::expires_in(SHORT))
                 .expect("mint the short slip");
-            let later = signet()
+            let later = root()
                 .mint(&svc("other"), hour())
                 .expect("mint the later slip");
 
@@ -608,10 +608,10 @@ async fn a_stream_refused_after_the_gate_does_not_hold_a_session_open() {
             let (store, _roots, _denylist) = store("refused-holds").await;
             let host = serve(gated_pair(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let short = signet()
+            let short = root()
                 .mint(&svc("demo"), nauthy::Request::expires_in(SHORT))
                 .expect("mint the short slip");
-            let lasting = signet()
+            let lasting = root()
                 .mint_member(
                     consumer.node_id().verify_key().expect("a checked key"),
                     hour(),
@@ -655,10 +655,10 @@ async fn a_stream_refused_after_the_gate_leaves_the_session_lease_untouched() {
             let (store, _roots, _denylist) = store("refused-untouched").await;
             let host = serve(gated_pair(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let lasting = signet()
+            let lasting = root()
                 .mint(&svc("demo"), hour())
                 .expect("mint the lasting slip");
-            let brief = signet()
+            let brief = root()
                 .mint_member(
                     consumer.node_id().verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(SHORT),
@@ -705,7 +705,7 @@ async fn a_raw_stream_whose_open_is_refused_leaves_the_session_lease_untouched()
             let host = serve(
                 prove(
                     services(&["demo=echo:", &format!("dir=file:{}", directory.display())]),
-                    Gate::rooted(signet().verifying_key(), Arc::clone(&store)),
+                    Gate::rooted(root().verifying_key(), Arc::clone(&store)),
                     PublicRequest::none(),
                     PublicUnsafeRequest::none(),
                 )
@@ -713,10 +713,10 @@ async fn a_raw_stream_whose_open_is_refused_leaves_the_session_lease_untouched()
                 .with_live_cuts(Arc::clone(&store)),
             );
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let lasting = signet()
+            let lasting = root()
                 .mint(&svc("demo"), hour())
                 .expect("mint the lasting slip");
-            let brief = signet()
+            let brief = root()
                 .mint(&svc("dir"), nauthy::Request::expires_in(SHORT))
                 .expect("mint the short slip");
 
@@ -791,7 +791,7 @@ fn a_lease_lapses_at_the_first_grant_of_any_stream() {
 
     // One: good through its expiry instant, lapsed strictly after.
     let mut one = AdmittedChains::default();
-    one.record(&signet().mint(&svc("demo"), at(10)).expect("mint"));
+    one.record(&root().mint(&svc("demo"), at(10)).expect("mint"));
     assert!(!one.lapsed(at(10)), "a grant is good through its expiry");
     assert!(one.lapsed(at(11)), "and lapsed after it");
     one.record_all(dialer(), &[])
@@ -804,7 +804,7 @@ fn a_lease_lapses_at_the_first_grant_of_any_stream() {
     // Many streams: the session ends at the FIRST grant to run out, in whichever order they came.
     let mut many = AdmittedChains::default();
     for secs in [20, 30, 10] {
-        many.record(&signet().mint(&svc("demo"), at(secs)).expect("mint"));
+        many.record(&root().mint(&svc("demo"), at(secs)).expect("mint"));
     }
     assert!(!many.lapsed(at(10)), "held through the earliest grant");
     assert!(many.lapsed(at(11)), "lapsed once any grant has");
@@ -826,11 +826,11 @@ fn a_lease_lapses_at_the_first_grant_of_any_stream() {
 
     // One stream ruled on two caps needed both, so its grant ends at the EARLIER.
     let foreign = Identity::from_secret(&[11u8; 32]).expect("valid secret");
-    let slip = signet()
+    let slip = root()
         .mint_authority_slip(&svc("demo"), foreign.verifying_key(), at(40))
         .expect("mint slip");
     let badge = foreign
-        .mint_member(signet().verifying_key(), at(15))
+        .mint_member(root().verifying_key(), at(15))
         .expect("mint badge");
     let mut paired = AdmittedChains::default();
     paired
@@ -895,8 +895,8 @@ async fn closed_sessions_free_their_slots_with_the_cut_wired() {
 #[tokio::test]
 async fn the_latch_cuts_on_a_kept_root_or_a_kept_id_and_nothing_else() {
     let (store, roots, denylist) = store("oracle").await;
-    let clean = signet().mint(&svc("demo"), hour()).expect("mint");
-    let revoked = signet().mint(&svc("web"), hour()).expect("mint");
+    let clean = root().mint(&svc("demo"), hour()).expect("mint");
+    let revoked = root().mint(&svc("web"), hour()).expect("mint");
     let foreign = Identity::from_secret(&[12u8; 32]).expect("valid secret");
     let foreign_cap = foreign.mint(&svc("demo"), hour()).expect("mint");
 
@@ -939,7 +939,7 @@ async fn a_session_is_refused_streams_past_its_chain_ceiling() {
             let (store, _roots, _denylist) = store("ceiling").await;
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let badge = signet()
+            let badge = root()
                 .mint_member(
                     consumer.node_id().verify_key().expect("a checked key"),
                     hour(),
@@ -995,7 +995,7 @@ fn a_refused_record_keeps_nothing() {
     // Fill the record to the ceiling exactly, one id per grant; the next is refused whole and the record
     // is unchanged, while a grant already kept is still accepted.
     let caps: Vec<nauthy::Cap> = (0..=super::MAX_SESSION_CHAIN_IDS)
-        .map(|_| signet().mint(&svc("demo"), hour()).expect("mint"))
+        .map(|_| root().mint(&svc("demo"), hour()).expect("mint"))
         .collect();
     let (fill, over) = caps.split_at(super::MAX_SESSION_CHAIN_IDS);
     let mut chains = AdmittedChains::default();
@@ -1064,7 +1064,7 @@ async fn a_cut_closes_the_session_rather_than_only_dropping_it() {
         .run_until(async {
             let (store, _roots, denylist) = store("close").await;
             let serving = Arc::new(super::super::exposer::Serving {
-                gate: Gate::rooted(signet().verifying_key(), Arc::clone(&store)),
+                gate: Gate::rooted(root().verifying_key(), Arc::clone(&store)),
                 public: super::super::router::PublicServices::default(),
                 public_unsafe: super::super::router::PublicServices::default(),
                 services: services(&["demo=echo:"]),
@@ -1103,7 +1103,7 @@ async fn a_cut_closes_the_session_rather_than_only_dropping_it() {
                 }
             });
 
-            let badge = signet()
+            let badge = root()
                 .mint_member(
                     consumer.node_id().verify_key().expect("a checked key"),
                     hour(),
