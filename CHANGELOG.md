@@ -8,10 +8,9 @@ The key a node trusts is its root, in code, in its config file and in its enviro
 
 ### Breaking
 - **The trusted key lives in `~/.config/tightbeam/root`, overridable with `TIGHTBEAM_ROOT`.** `expose`
-  and `share` read only that file and that variable; `~/.config/tightbeam/signet` and `TIGHTBEAM_SIGNET`
-  are not read.
-- **`config::load_signet`, `config::write_signet` and `config::signet_path` are renamed `config::load_root`,
-  `config::write_root` and `config::root_path`**, with no alias.
+  and `share` read it from there.
+- **`config::load_root`, `config::write_root` and `config::root_path` read, write and locate the trusted
+  key.**
 - **Built on nauthy 0.11.0.** An authority-bound slip is minted with `Link::mint_authority_bound`.
 
 ## v0.17.1

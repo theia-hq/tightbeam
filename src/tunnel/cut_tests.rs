@@ -316,37 +316,37 @@ async fn a_session_is_cut_once_the_grant_it_was_admitted_on_expires() {
 }
 
 #[tokio::test]
-async fn a_session_is_cut_at_a_narrowed_expiry_not_the_issuers() {
-    // The holder narrowed an hour-long badge to seconds and passed it on. The session admitted on it must
+async fn a_session_is_cut_at_an_attenuated_expiry_not_the_issuers() {
+    // The holder attenuated an hour-long badge to seconds and passed it on. The session admitted on it must
     // end at the earlier instant: the chain's earliest bound, not the one the root signed.
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (store, _roots, _denylist) = store("narrowed").await;
+            let (store, _roots, _denylist) = store("attenuated").await;
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let narrowed = root()
+            let attenuated = root()
                 .mint_member(
                     consumer.node_id().verify_key().expect("a checked key"),
                     hour(),
                 )
                 .expect("mint badge")
                 .attenuate(None, Some(nauthy::Request::expires_in(SHORT)))
-                .expect("narrow the badge");
+                .expect("attenuate the badge");
 
             let session = consumer.connect(host).await.expect("connect");
             let mut stream = ServiceStream::open_with(
                 &session,
                 "demo",
-                Some(narrowed.link().expect("link").to_string()),
+                Some(attenuated.link().expect("link").to_string()),
             )
             .await
-            .expect("the narrowed badge is admitted");
+            .expect("the attenuated badge is admitted");
             assert!(still_echoes(&mut stream).await, "served before the expiry");
 
             assert!(
                 host_ends(&mut stream.reader).await,
-                "a session must end at the narrowed expiry, not run on to the issuer's"
+                "a session must end at the attenuated expiry, not run on to the issuer's"
             );
         })
         .await;
