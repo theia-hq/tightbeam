@@ -31,30 +31,36 @@ use zeroize::{ZeroizeOnDrop, Zeroizing};
 /// key on either side of the cap/transport boundary.
 ///
 /// nauthy is standalone (it carries no bifrost dependency), so it names a key by [`VerifyKey`] while
-/// bifrost names the same key by [`NodeId`]. Both are the same 32 raw bytes under the same key text, so the
-/// conversion is an infallible byte copy. It lives here, at the one crate that sees both
-/// types, so no call site open-codes the byte shuffle. The orphan rule forbids a `From` impl (both types
-/// are foreign to tightbeam), hence the extension traits.
+/// bifrost names the same key by [`NodeId`]. Both are the same 32 raw bytes under the same key text. It
+/// lives here, at the one crate that sees both types, so no call site open-codes the byte shuffle. The
+/// orphan rule forbids a `From` impl (both types are foreign to tightbeam), hence the extension traits.
+///
+/// Each side checks its own bytes and refuses a key that is not the canonical encoding of a prime-order
+/// point, so the conversion re-runs the other side's check and returns its refusal. Today the two checks
+/// are the same and a key one side holds always passes the other; the conversion still returns the
+/// refusal rather than assume that, so a key from the wire can never reach a panic here.
 pub trait AsVerifyKey {
-    /// This identity as a nauthy [`VerifyKey`] (the type caps root at and gates admit).
-    fn verify_key(&self) -> VerifyKey;
+    /// This identity as a nauthy [`VerifyKey`] (the type caps root at and gates admit), or nauthy's reason
+    /// the bytes are not a usable key.
+    fn verify_key(&self) -> Result<VerifyKey, nauthy::KeyError>;
 }
 
 impl AsVerifyKey for NodeId {
-    fn verify_key(&self) -> VerifyKey {
-        VerifyKey::new(*self.key())
+    fn verify_key(&self) -> Result<VerifyKey, nauthy::KeyError> {
+        VerifyKey::try_new(*self.key())
     }
 }
 
 /// The other direction: a [`VerifyKey`] back to the bifrost [`NodeId`] a peer is dialed at.
 pub trait AsNodeId {
-    /// This key as a bifrost [`NodeId`], tagged ed25519 (the only suite these keys carry).
-    fn node_id(&self) -> NodeId;
+    /// This key as a bifrost [`NodeId`], tagged ed25519 (the only suite these keys carry), or bifrost's
+    /// reason the bytes are not a usable identity.
+    fn node_id(&self) -> Result<NodeId, bifrost::KeyError>;
 }
 
 impl AsNodeId for VerifyKey {
-    fn node_id(&self) -> NodeId {
-        NodeId::new(CryptoKind::Ed25519, *self.bytes())
+    fn node_id(&self) -> Result<NodeId, bifrost::KeyError> {
+        NodeId::try_new(CryptoKind::Ed25519, *self.bytes())
     }
 }
 

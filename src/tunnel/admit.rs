@@ -57,7 +57,10 @@ pub fn resolve_gate(
              to anyone"
         )
     })?;
-    Ok(Gate::rooted(root.verify_key(), revocations))
+    let root = root
+        .verify_key()
+        .map_err(|error| eyre::eyre!("the signet {root} is not a usable key: {error}"))?;
+    Ok(Gate::rooted(root, revocations))
 }
 
 /// How long to wait for a connector to send its opening request before dropping the stream. Bounds the
@@ -347,7 +350,7 @@ where
                         chains.record_proven(proven.key);
                         Ok(())
                     }
-                    None => chains.record_all(peer.node.verify_key(), &admitted.ruled),
+                    None => chains.record_all(admitted.peer, &admitted.ruled),
                 }
             };
             if let Err(unrecorded) = recorded {
@@ -499,6 +502,10 @@ enum HostRefusal {
     /// a stranger never holds one.
     #[error("the key is not one this proven-only route knows")]
     UnknownKey,
+    /// The peer's key is not one nauthy accepts. The transport already checked it under bifrost's rules,
+    /// which are the same today, so this is reached only if the two ever disagree.
+    #[error("the peer's key is not a usable key")]
+    PeerKey(#[source] nauthy::KeyError),
     /// Every proven-only slot is taken. Reached only by a key the route knows.
     #[error("the proven-only streams are all in use; refusing rather than queueing")]
     ProvenAtCapacity,
@@ -526,6 +533,7 @@ fn wire_refusal(refusal: &HostRefusal) -> Refusal {
     match refusal {
         HostRefusal::MalformedCapability(_)
         | HostRefusal::PeerNotProven { .. }
+        | HostRefusal::PeerKey(_)
         | HostRefusal::PublicAtCapacity { .. }
         | HostRefusal::UnknownKey
         | HostRefusal::ProvenAtCapacity
@@ -589,6 +597,9 @@ impl From<nauthy::Refusal> for HostRefusal {
 /// lifetime; a gated stream carries `None` and touches no pool.
 struct AdmittedStream {
     witness: Admitted,
+    /// The dialer's key as nauthy names it, checked once at admission. The live cut records the ruled caps
+    /// under it.
+    peer: VerifyKey,
     /// Every cap the gate asked its revocation store about: the presented cap first, and on the
     /// authority-bound path the foreign badge after it. The live cut re-asks about exactly these, so it can
     /// end a session only for a recall the gate itself would have refused on, and takes the first as the
@@ -614,6 +625,7 @@ impl core::fmt::Debug for AdmittedStream {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("AdmittedStream")
             .field("witness", &self.witness)
+            .field("peer", &self.peer)
             .field("ruled", &self.ruled.len())
             .field("proven", &self.proven)
             .field("_stream_permit", &self._stream_permit)
@@ -668,6 +680,9 @@ fn admit(
         pool,
         proven,
     } = admission;
+    // The transport checked this key under bifrost's rules; nauthy checks it again under its own, and a
+    // key it refuses is refused here, before any route is ruled on.
+    let peer_key = peer.node.verify_key().map_err(HostRefusal::PeerKey)?;
     // Admission branches on the service NAME in two places only: this open-set membership test and the
     // proven-only test below, and both run BEFORE any dispatch (the `services.get` in `serve_request` is reached only past this admit). A HIT on
     // EITHER overlay is the sole fast/open path: the service was proven open at `with_public` (safe) or at
@@ -684,11 +699,7 @@ fn admit(
         // no authority. That is what lets an announced transport keep serving a service the operator opened
         // to anyone, while every gated route (below) refuses.
         let witness = Gate::Open
-            .admit_witnessed(
-                ProvenPeer::from_handshake(peer.node.verify_key()),
-                None,
-                service,
-            )
+            .admit_witnessed(ProvenPeer::from_handshake(peer_key), None, service)
             .map_err(HostRefusal::from)?;
         // The ONE place the public caps are taken. A public stream first takes a
         // public-stream permit (held for the stream's life) and then classifies its session (one
@@ -708,6 +719,7 @@ fn admit(
             })?;
         return Ok(AdmittedStream {
             witness,
+            peer: peer_key,
             ruled: Vec::new(),
             proven: None,
             _stream_permit: Some(stream_permit),
@@ -724,9 +736,8 @@ fn admit(
                 declared: peer.security.peer,
             });
         }
-        let key = peer.node.verify_key();
         // The base gate's store refuses a revoked key and its sign twin; an open base refuses outright.
-        let witness = base.proven(ProvenPeer::from_handshake(key))?;
+        let witness = base.proven(ProvenPeer::from_handshake(peer_key))?;
         let key = witness.revocable_peer().ok_or(HostRefusal::Unrevocable)?;
         if !knows(&key) {
             return Err(HostRefusal::UnknownKey);
@@ -736,6 +747,7 @@ fn admit(
             .map_err(|_| HostRefusal::ProvenAtCapacity)?;
         return Ok(AdmittedStream {
             witness,
+            peer: peer_key,
             ruled: Vec::new(),
             proven: Some(ProvenStream {
                 key,
@@ -782,7 +794,7 @@ fn admit(
     // Mint the peer the transport attested: the declared profile (a completed handshake for `Proven`,
     // exact-by-construction for `InProcess`) is the transport's CLAIM, not a proof this seam re-derives.
     // A rooted gate reaches here only past the predicate above; an open gate needs no peer proof at all.
-    let peer = ProvenPeer::from_handshake(peer.node.verify_key());
+    let peer = ProvenPeer::from_handshake(peer_key);
     // Route the two-cap authority-bound path (a foreign slip AND the membership badge that vouches for the
     // dialer under the slip's foreign authority) through `admit_foreign_witnessed`; every other shape (a
     // membership badge, a plain/bearer/device slip, or no token) is the single-cap path. A `membership` is
@@ -804,6 +816,7 @@ fn admit(
     };
     Ok(AdmittedStream {
         witness,
+        peer: peer_key,
         ruled,
         proven: None,
         _stream_permit: None,

@@ -62,13 +62,18 @@ impl Connector {
 
     /// Connect via a capability link, requesting `service`. The link supplies the node to dial
     /// (the cap's root) and carries the token; the host refuses unless the token actually grants `service`.
-    pub fn from_link(link: &Link, service: Service) -> Self {
-        Self {
-            dial: link.root().node_id(),
+    ///
+    /// # Errors
+    ///
+    /// bifrost's [`KeyError`](bifrost::KeyError) when the root key is not a usable identity under its
+    /// rules. nauthy checked the key when the link parsed, under the same rules today.
+    pub fn from_link(link: &Link, service: Service) -> Result<Self, bifrost::KeyError> {
+        Ok(Self {
+            dial: link.root().node_id()?,
             service,
             capability: Some(Link::clone(link)),
             membership: None,
-        }
+        })
     }
 
     /// Also present `badge` in the SECOND slot: a membership badge under the foreign fleet a signet-bound
@@ -217,7 +222,7 @@ impl Connector {
 /// #
 /// # fn dial(node: &Node<AnnouncedTransport, NoDiscovery>, link: &Link, service: Service) {
 /// // `Announced` does not implement `PeerProven`, so this does not compile:
-/// let _ = PresentingConnector::from_link(link, service).preflight(node, 0);
+/// let _ = PresentingConnector::from_link(link, service).map(|dial| dial.preflight(node, 0));
 /// # }
 /// ```
 pub struct PresentingConnector {
@@ -237,10 +242,14 @@ impl PresentingConnector {
 
     /// Dial the node a link names, presenting the link (slot 1). The compile-time twin of
     /// [`Connector::from_link`].
-    pub fn from_link(link: &Link, service: Service) -> Self {
-        Self {
-            connector: Connector::from_link(link, service),
-        }
+    ///
+    /// # Errors
+    ///
+    /// As [`Connector::from_link`].
+    pub fn from_link(link: &Link, service: Service) -> Result<Self, bifrost::KeyError> {
+        Ok(Self {
+            connector: Connector::from_link(link, service)?,
+        })
     }
 
     /// Also present `badge` in slot 2 (the signet-bound AND); see

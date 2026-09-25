@@ -135,7 +135,7 @@ async fn a_gated_dial_over_an_announced_transport_refuses_before_any_write() {
             let signet = Identity::from_secret(&SIGNET_SECRET).unwrap();
             let badge = signet
                 .mint_member(
-                    consumer.node_id().verify_key(),
+                    consumer.node_id().verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(Duration::from_secs(3600)),
                 )
                 .unwrap()
@@ -309,7 +309,7 @@ fn member_badge<T: Transport, D: bifrost::Discovery>(device: &Node<T, D>) -> nau
     Identity::from_secret(&SIGNET_SECRET)
         .unwrap()
         .mint_member(
-            device.node_id().verify_key(),
+            device.node_id().verify_key().expect("a checked key"),
             nauthy::Request::expires_in(Duration::from_secs(3600)),
         )
         .unwrap()

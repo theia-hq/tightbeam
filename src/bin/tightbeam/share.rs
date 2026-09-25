@@ -31,7 +31,7 @@ impl ShareCmd {
     /// rooted there, so a link minted under a foreign pin is refused everywhere, this node included.
     /// Refusing here, before anything is printed, is the one place the person minting it can be told why.
     pub fn run(self, identity: &Identity, signet: Option<NodeId>) -> eyre::Result<()> {
-        let own = identity.verifying_key().node_id();
+        let own = identity.verifying_key().node_id()?;
         if let Some(signet) = signet.filter(|signet| *signet != own) {
             eyre::bail!(
                 "this node trusts root {signet}. A link made here would be signed by this node's key \

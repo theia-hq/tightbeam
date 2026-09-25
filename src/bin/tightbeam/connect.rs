@@ -156,7 +156,7 @@ impl ConnectCmd {
                     .transpose()?;
                 Ok(Connector::to_node(*node, service, present))
             }
-            Target::Capability(text) => Ok(Connector::from_link(&text.parse::<Link>()?, service)),
+            Target::Capability(text) => Ok(Connector::from_link(&text.parse::<Link>()?, service)?),
         }
     }
 }
@@ -211,6 +211,31 @@ mod tests {
         assert!(
             format!("app:{link}").parse::<Target>().is_err(),
             "anything before the key fails to parse"
+        );
+    }
+
+    /// A key with a torsion component is a twin of another key its holder can sign for, so it is refused
+    /// as a dial target, alone or as the root of a link, with an error naming why. `[1u8; 32]` is one.
+    #[test]
+    fn connect_refuses_a_key_with_a_torsion_component() {
+        let torsioned = "ed01aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq";
+        let refused = torsioned
+            .parse::<Target>()
+            .expect_err("a torsioned key is not a dial target");
+        assert!(
+            format!("{refused:#}").contains("torsion"),
+            "the refusal names the check: {refused:#}"
+        );
+
+        let identity = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
+        let service = "web".parse::<nauthy::Service>().expect("a service name");
+        let link = nauthy::Link::mint(&identity, &service, core::time::Duration::from_secs(60))
+            .expect("mint a link")
+            .to_string();
+        let (_, token) = link.split_once('.').expect("a link holds a `.`");
+        assert!(
+            format!("{torsioned}.{token}").parse::<Target>().is_err(),
+            "a link rooted at a torsioned key is not a dial target"
         );
     }
 

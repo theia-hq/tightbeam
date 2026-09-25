@@ -2,6 +2,22 @@
 
 All notable changes to tightbeam, newest first.
 
+## v0.17.0
+
+A key that is not a usable ed25519 key is refused wherever it reaches tightbeam, with an error that says
+why.
+
+### Breaking
+- **Built on nauthy 0.10.0 and bifrost 0.8.0.** A key must be the canonical encoding of a prime-order
+  point. Key text, a link's root, a signet file, and a peer's handshake key are refused when the point is
+  off the curve, non-canonically encoded, of small order, or carries a torsion component. `[1u8; 32]`
+  has a torsion component and is refused; the key the seed `[7; 32]` binds prints as
+  `ed015jfgyy7ctrjavpxvkb5rglwf7gkuo5vox27hxescd3vgsfcg2iwa`.
+- **`AsVerifyKey::verify_key` and `AsNodeId::node_id` return a `Result`**, carrying the other crate's
+  `KeyError` when its check refuses the key.
+- **`Connector::from_link` and `PresentingConnector::from_link` return a `Result`**, refusing a link whose
+  root key bifrost does not accept.
+
 ## v0.16.0
 
 Links are bare `<key>.<token>`, keys print as `ed01…`, a node can answer a proven key that holds no
