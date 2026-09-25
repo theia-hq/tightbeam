@@ -240,7 +240,10 @@ async fn a_pin_change_cuts_sessions_of_the_old_root() {
             let host = serve(node.exposer(node.cut()));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = old_root()
-                .mint_member(consumer.node_id().verify_key(), hour())
+                .mint_member(
+                    consumer.node_id().verify_key().expect("a checked key"),
+                    hour(),
+                )
                 .expect("mint badge");
 
             let session = consumer.connect(host).await.expect("connect");
@@ -271,7 +274,10 @@ async fn a_fleet_grant_session_survives_the_sweep() {
                 .mint_authority_slip(&svc("demo"), fleet.verifying_key(), hour())
                 .expect("mint slip");
             let badge = fleet
-                .mint_member(consumer.node_id().verify_key(), hour())
+                .mint_member(
+                    consumer.node_id().verify_key().expect("a checked key"),
+                    hour(),
+                )
                 .expect("mint fleet badge");
 
             let session = consumer.connect(host).await.expect("connect");
@@ -304,7 +310,10 @@ async fn a_session_mixing_an_old_pin_stream_and_a_self_slip_is_cut_on_pin_change
             let host = serve(node.exposer(node.cut()));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = old_root()
-                .mint_member(consumer.node_id().verify_key(), hour())
+                .mint_member(
+                    consumer.node_id().verify_key().expect("a checked key"),
+                    hour(),
+                )
                 .expect("mint badge");
             let slip = node.ledger.issue("other");
 
@@ -330,13 +339,17 @@ async fn a_revoked_peer_key_cuts_its_open_session() {
             let host = serve(node.exposer(node.cut()));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = old_root()
-                .mint_member(consumer.node_id().verify_key(), hour())
+                .mint_member(
+                    consumer.node_id().verify_key().expect("a checked key"),
+                    hour(),
+                )
                 .expect("mint badge");
 
             let session = consumer.connect(host).await.expect("connect");
             let mut stream = open(&session, "demo", &badge).await;
 
-            node.recalls.revoke_key(consumer.node_id().verify_key());
+            node.recalls
+                .revoke_key(consumer.node_id().verify_key().expect("a checked key"));
             assert!(
                 host_ends(&mut stream.reader).await,
                 "a session whose peer key is revoked ends, though its badge is not"
@@ -365,7 +378,10 @@ async fn the_default_oracle_trusts_every_anchor() {
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = signet()
-                .mint_member(consumer.node_id().verify_key(), hour())
+                .mint_member(
+                    consumer.node_id().verify_key().expect("a checked key"),
+                    hour(),
+                )
                 .expect("mint badge");
             let session = consumer.connect(host).await.expect("connect");
             let mut stream = open(&session, "demo", &badge).await;
@@ -443,7 +459,10 @@ async fn ends_under(oracle: impl LiveCuts + 'static) -> bool {
     let host = serve(node.exposer(oracle));
     let consumer = Node::new(MemTransport::bind(), NoDiscovery);
     let badge = old_root()
-        .mint_member(consumer.node_id().verify_key(), hour())
+        .mint_member(
+            consumer.node_id().verify_key().expect("a checked key"),
+            hour(),
+        )
         .expect("mint badge");
     let session = consumer.connect(host).await.expect("connect");
     // No echo first: the oracle rules against the session from the first sweep, which may land before the
@@ -552,7 +571,7 @@ async fn a_key_revoked_in_a_latched_store_cuts_its_open_session() {
             let oracle = Arc::new(latch("latch-keyed", Keyed(Arc::clone(&node.recalls))).await);
             let host = serve(node.exposer(Arc::clone(&oracle)));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let peer = consumer.node_id().verify_key();
+            let peer = consumer.node_id().verify_key().expect("a checked key");
             let badge = old_root().mint_member(peer, hour()).expect("mint badge");
 
             let session = consumer.connect(host).await.expect("connect");

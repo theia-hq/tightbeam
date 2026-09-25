@@ -61,7 +61,7 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             let device = Node::new(MemTransport::bind(), NoDiscovery);
             let device_badge = signet
                 .mint_member(
-                    device.node_id().verify_key(),
+                    device.node_id().verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(Duration::from_secs(3600)),
                 )
                 .unwrap()
@@ -83,7 +83,7 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             let other_device_id = Node::new(MemTransport::bind(), NoDiscovery).node_id();
             let foreign_badge = signet
                 .mint_member(
-                    other_device_id.verify_key(),
+                    other_device_id.verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(Duration::from_secs(3600)),
                 )
                 .unwrap()

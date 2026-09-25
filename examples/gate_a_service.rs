@@ -73,7 +73,7 @@ async fn run() -> eyre::Result<()> {
     // `identity.verifying_key()` is nauthy's `VerifyKey`; `.node_id()` is the `AsNodeId` bridge to bifrost's
     // `NodeId` (two names for the same ed25519 key on either side of the cap/transport boundary). A real
     // exposer loads this signet from config as a `NodeId` already and never crosses the bridge by hand.
-    let signet = identity.verifying_key().node_id();
+    let signet = identity.verifying_key().node_id()?;
     let gate = tunnel::resolve_gate(Some(signet), FileDenylist::empty(PathBuf::new()))?;
     tokio::task::spawn_local(async move {
         if let Err(e) = async {

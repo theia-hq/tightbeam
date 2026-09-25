@@ -403,7 +403,7 @@ async fn a_saturated_public_pool_never_starves_a_gated_member() {
     let peer = bifrost::NodeId::from_ed25519_secret(&[9u8; 32]);
     let badge = signet
         .mint_member(
-            peer.verify_key(),
+            peer.verify_key().expect("a checked key"),
             nauthy::Request::expires_in(core::time::Duration::from_secs(300)),
         )
         .expect("mint member badge")
@@ -1270,7 +1270,7 @@ fn a_member_dial_ignores_a_second_slot_when_slot_one_is_not_signet_bound() {
     let peer = bifrost::NodeId::from_ed25519_secret(&[5u8; 32]);
     let badge = signet
         .mint_member(
-            peer.verify_key(),
+            peer.verify_key().expect("a checked key"),
             nauthy::Request::expires_in(core::time::Duration::from_secs(3600)),
         )
         .expect("mint member badge")
@@ -1312,7 +1312,7 @@ fn an_announced_session_cannot_root_admit_a_valid_badge() {
     let peer = bifrost::NodeId::from_ed25519_secret(&[5u8; 32]);
     let badge = signet
         .mint_member(
-            peer.verify_key(),
+            peer.verify_key().expect("a checked key"),
             nauthy::Request::expires_in(core::time::Duration::from_secs(3600)),
         )
         .expect("mint member badge")
@@ -1445,7 +1445,7 @@ async fn an_announced_session_is_refused_at_admission_with_the_uniform_answer() 
     let peer = bifrost::NodeId::from_ed25519_secret(&[5u8; 32]);
     let badge = signet
         .mint_member(
-            peer.verify_key(),
+            peer.verify_key().expect("a checked key"),
             nauthy::Request::expires_in(core::time::Duration::from_secs(3600)),
         )
         .expect("mint member badge")
@@ -1611,7 +1611,7 @@ async fn a_member_only_route_serves_a_member_and_uniformly_refuses_a_slip_and_a_
             let member = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = signet
                 .mint_member(
-                    member.node_id().verify_key(),
+                    member.node_id().verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(core::time::Duration::from_secs(300)),
                 )
                 .expect("mint a member badge")
@@ -1631,7 +1631,7 @@ async fn a_member_only_route_serves_a_member_and_uniformly_refuses_a_slip_and_a_
             let slip = signet
                 .mint_bound(
                     &svc("locked"),
-                    delegate.node_id().verify_key(),
+                    delegate.node_id().verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(core::time::Duration::from_secs(300)),
                 )
                 .expect("mint a bound slip")

@@ -349,7 +349,7 @@ async fn a_proven_witness_reaches_no_family_or_member_route() {
         .run_until(async {
             let entered = Arc::new(Notify::new());
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let known = HashSet::from([consumer.node_id().verify_key()]);
+            let known = HashSet::from([consumer.node_id().verify_key().expect("a checked key")]);
             let host = serve(router(&keys, known, &entered).expose().expect("assembles"));
             let session = consumer.connect(host).await.expect("connect");
             let _held = hold(&session, &entered, 1).await;
@@ -423,7 +423,7 @@ async fn a_stranger_flood_does_not_hold_a_proven_permit() {
             let keys = Arc::new(Keys::default());
             let entered = Arc::new(Notify::new());
             let member = Node::new(MemTransport::bind(), NoDiscovery);
-            let known = HashSet::from([member.node_id().verify_key()]);
+            let known = HashSet::from([member.node_id().verify_key().expect("a checked key")]);
             let host = serve(router(&keys, known, &entered).expose().expect("assembles"));
 
             let stranger = Node::new(MemTransport::bind(), NoDiscovery);
@@ -459,7 +459,7 @@ async fn a_full_proven_pool_answers_like_a_miss() {
             let keys = Arc::new(Keys::default());
             let entered = Arc::new(Notify::new());
             let member = Node::new(MemTransport::bind(), NoDiscovery);
-            let known = HashSet::from([member.node_id().verify_key()]);
+            let known = HashSet::from([member.node_id().verify_key().expect("a checked key")]);
             let host = serve(router(&keys, known, &entered).expose().expect("assembles"));
 
             let session = member.connect(host).await.expect("connect");
@@ -487,7 +487,7 @@ async fn a_silent_proven_peer_releases_its_permit_by_the_deadline() {
             let keys = Arc::new(Keys::default());
             let entered = Arc::new(Notify::new());
             let member = Node::new(MemTransport::bind(), NoDiscovery);
-            let known = HashSet::from([member.node_id().verify_key()]);
+            let known = HashSet::from([member.node_id().verify_key().expect("a checked key")]);
             let host = serve(router(&keys, known, &entered).expose().expect("assembles"));
 
             let session = member.connect(host).await.expect("connect");
@@ -532,7 +532,7 @@ async fn a_revoked_proven_peer_is_cut_mid_stream() {
             let keys = Arc::new(Keys::default());
             let entered = Arc::new(Notify::new());
             let member = Node::new(MemTransport::bind(), NoDiscovery);
-            let key = member.node_id().verify_key();
+            let key = member.node_id().verify_key().expect("a checked key");
             let exposer = router(&keys, HashSet::from([key]), &entered)
                 .expose()
                 .expect("assembles")

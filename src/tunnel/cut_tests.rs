@@ -128,7 +128,10 @@ async fn a_session_is_cut_when_a_cap_it_was_admitted_on_is_revoked() {
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = signet()
-                .mint_member(consumer.node_id().verify_key(), hour())
+                .mint_member(
+                    consumer.node_id().verify_key().expect("a checked key"),
+                    hour(),
+                )
                 .expect("mint badge");
 
             let session = consumer.connect(host).await.expect("connect");
@@ -162,7 +165,10 @@ async fn a_session_is_cut_when_the_root_it_was_admitted_under_is_disabled() {
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = signet()
-                .mint_member(consumer.node_id().verify_key(), hour())
+                .mint_member(
+                    consumer.node_id().verify_key().expect("a checked key"),
+                    hour(),
+                )
                 .expect("mint badge");
 
             let session = consumer.connect(host).await.expect("connect");
@@ -204,7 +210,10 @@ async fn a_session_admitted_through_a_foreign_badge_is_cut_when_that_root_is_dis
                 .mint_authority_slip(&svc("demo"), foreign.verifying_key(), hour())
                 .expect("mint slip");
             let badge = foreign
-                .mint_member(consumer.node_id().verify_key(), hour())
+                .mint_member(
+                    consumer.node_id().verify_key().expect("a checked key"),
+                    hour(),
+                )
                 .expect("mint foreign badge");
 
             let session = consumer.connect(host).await.expect("connect");
@@ -241,7 +250,10 @@ async fn a_session_nothing_recalled_keeps_running_across_sweeps() {
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = signet()
-                .mint_member(consumer.node_id().verify_key(), hour())
+                .mint_member(
+                    consumer.node_id().verify_key().expect("a checked key"),
+                    hour(),
+                )
                 .expect("mint badge");
             let session = consumer.connect(host).await.expect("connect");
             let mut stream = ServiceStream::open_with(
@@ -279,7 +291,7 @@ async fn a_session_is_cut_once_the_grant_it_was_admitted_on_expires() {
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = signet()
                 .mint_member(
-                    consumer.node_id().verify_key(),
+                    consumer.node_id().verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(SHORT),
                 )
                 .expect("mint badge");
@@ -314,7 +326,10 @@ async fn a_session_is_cut_at_a_narrowed_expiry_not_the_issuers() {
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let narrowed = signet()
-                .mint_member(consumer.node_id().verify_key(), hour())
+                .mint_member(
+                    consumer.node_id().verify_key().expect("a checked key"),
+                    hour(),
+                )
                 .expect("mint badge")
                 .attenuate(None, Some(nauthy::Request::expires_in(SHORT)))
                 .expect("narrow the badge");
@@ -381,7 +396,10 @@ async fn a_stream_on_a_cap_whose_expiry_cannot_be_read_is_refused() {
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = signet()
-                .mint_member(consumer.node_id().verify_key(), hour())
+                .mint_member(
+                    consumer.node_id().verify_key().expect("a checked key"),
+                    hour(),
+                )
                 .expect("mint badge");
             let odd = with_raw_block(&badge, "check if time($t), $t < 2100-01-01T00:00:00Z;");
             assert!(
@@ -429,7 +447,10 @@ async fn a_stream_on_a_clock_bound_past_the_clocks_range_is_refused_and_the_node
             let host = serve(gated_echo(&store));
             let hostile = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = signet()
-                .mint_member(hostile.node_id().verify_key(), hour())
+                .mint_member(
+                    hostile.node_id().verify_key().expect("a checked key"),
+                    hour(),
+                )
                 .expect("mint badge");
             let far = with_block(
                 &badge,
@@ -460,7 +481,7 @@ async fn a_stream_on_a_clock_bound_past_the_clocks_range_is_refused_and_the_node
             // Another peer, on a fresh session, is still served: the node did not go down.
             let other = Node::new(MemTransport::bind(), NoDiscovery);
             let plain = signet()
-                .mint_member(other.node_id().verify_key(), hour())
+                .mint_member(other.node_id().verify_key().expect("a checked key"), hour())
                 .expect("mint badge");
             let session = other.connect(host).await.expect("the node still accepts");
             let mut stream = ServiceStream::open_with(
@@ -487,12 +508,15 @@ async fn a_session_ends_when_the_first_grant_it_was_admitted_on_runs_out() {
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let brief = signet()
                 .mint_member(
-                    consumer.node_id().verify_key(),
+                    consumer.node_id().verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(SHORT),
                 )
                 .expect("mint the short badge");
             let lasting = signet()
-                .mint_member(consumer.node_id().verify_key(), hour())
+                .mint_member(
+                    consumer.node_id().verify_key().expect("a checked key"),
+                    hour(),
+                )
                 .expect("mint the lasting badge");
 
             let session = consumer.connect(host).await.expect("connect");
@@ -588,7 +612,10 @@ async fn a_stream_refused_after_the_gate_does_not_hold_a_session_open() {
                 .mint(&svc("demo"), nauthy::Request::expires_in(SHORT))
                 .expect("mint the short slip");
             let lasting = signet()
-                .mint_member(consumer.node_id().verify_key(), hour())
+                .mint_member(
+                    consumer.node_id().verify_key().expect("a checked key"),
+                    hour(),
+                )
                 .expect("mint the lasting badge");
 
             let session = consumer.connect(host).await.expect("connect");
@@ -633,7 +660,7 @@ async fn a_stream_refused_after_the_gate_leaves_the_session_lease_untouched() {
                 .expect("mint the lasting slip");
             let brief = signet()
                 .mint_member(
-                    consumer.node_id().verify_key(),
+                    consumer.node_id().verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(SHORT),
                 )
                 .expect("mint the short badge");
@@ -913,7 +940,10 @@ async fn a_session_is_refused_streams_past_its_chain_ceiling() {
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = signet()
-                .mint_member(consumer.node_id().verify_key(), hour())
+                .mint_member(
+                    consumer.node_id().verify_key().expect("a checked key"),
+                    hour(),
+                )
                 .expect("mint badge");
             let session = consumer.connect(host).await.expect("connect");
 
@@ -1074,7 +1104,10 @@ async fn a_cut_closes_the_session_rather_than_only_dropping_it() {
             });
 
             let badge = signet()
-                .mint_member(consumer.node_id().verify_key(), hour())
+                .mint_member(
+                    consumer.node_id().verify_key().expect("a checked key"),
+                    hour(),
+                )
                 .expect("mint badge");
             let _stream = ServiceStream::open_with(
                 &dialed,

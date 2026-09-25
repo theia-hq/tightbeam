@@ -75,7 +75,7 @@ async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership()
             let device = Node::new(MemTransport::bind(), NoDiscovery);
             let fleet_badge = hire
                 .mint_member(
-                    device.node_id().verify_key(),
+                    device.node_id().verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(Duration::from_secs(3600)),
                 )
                 .unwrap()
@@ -107,7 +107,7 @@ async fn a_signet_bound_slip_admits_a_hire_device_that_proves_fleet_membership()
             let stray = Node::new(MemTransport::bind(), NoDiscovery);
             let wrong_badge = other
                 .mint_member(
-                    stray.node_id().verify_key(),
+                    stray.node_id().verify_key().expect("a checked key"),
                     nauthy::Request::expires_in(Duration::from_secs(3600)),
                 )
                 .unwrap()

@@ -20,14 +20,15 @@ license = "MIT OR Apache-2.0"
 # `.cargo/config.toml` still [patch]es these by URL to sibling PATH checkouts, so a `rev` here does not
 # slow local builds (the patch wins locally regardless of the rev); CI resolves the rev from GitHub. All
 # bifrost-* crates live in one repo, so they share one rev. Bump deliberately each release.
-bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "ed7cd8d591b4bef3ff1d005ad4f8b9b6a82b8359" }
-bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "ed7cd8d591b4bef3ff1d005ad4f8b9b6a82b8359" }
-bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "ed7cd8d591b4bef3ff1d005ad4f8b9b6a82b8359" }
-# The key file store, in bifrost's repo beside the identity it stores. v0.7.0: a key file starts with
-# `KEYSTORE`, and key text starts with `ed01`.
-keystore = { git = "https://github.com/theia-hq/bifrost", rev = "ed7cd8d591b4bef3ff1d005ad4f8b9b6a82b8359" }
-# v0.9.0: a link is `<key>.<token>` with no scheme, and key text starts with `ed01`.
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "2b2a8a94cd3ee211efb94aa0173f6009b5d1ba4f" }
+bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "a4eaaa7ad9bb7d50c8f7576965334f069dba52ce" }
+bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "a4eaaa7ad9bb7d50c8f7576965334f069dba52ce" }
+bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "a4eaaa7ad9bb7d50c8f7576965334f069dba52ce" }
+# The key file store, in bifrost's repo beside the identity it stores. v0.8.0: a key that is not the
+# canonical encoding of a prime-order point is refused wherever it enters, and `NodeId` has only `try_new`.
+keystore = { git = "https://github.com/theia-hq/bifrost", rev = "a4eaaa7ad9bb7d50c8f7576965334f069dba52ce" }
+# v0.10.0: a key that is not the canonical encoding of a prime-order point is refused, and `VerifyKey` has
+# only `try_new`.
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "a9e8424d99fdd41d10be26b5ddb3cec6c1c41ce6" }
 # The handler contract, in-tree beside its only dispatcher. A path dep (not a git self-dep): the workspace
 # member resolves within this checkout, and the package stays separately pinnable by a consumer.
 tightbeam-handler = { path = "tightbeam-handler" }
@@ -54,7 +55,7 @@ libc = "0.2"
 # today only through feature unification via iroh, so a dependency bump could drop it and break the
 # test build. Every sibling repo using the paused clock declares it explicitly.
 tokio = { version = "1", features = ["test-util"] }
-bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "ed7cd8d591b4bef3ff1d005ad4f8b9b6a82b8359" }
+bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "a4eaaa7ad9bb7d50c8f7576965334f069dba52ce" }
 # A hostile holder appends raw datalog to a cap it was given; nauthy's API writes only its own shapes, so
 # the live cut's fail-closed read is tested with a token built the way that holder builds one. Both are
 # already in the tree through nauthy.
