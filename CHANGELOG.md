@@ -2,6 +2,14 @@
 
 All notable changes to tightbeam, newest first.
 
+## v0.17.1
+
+### Fixed
+- **The live cut ends a proven-route session held under the sign twin of a revoked key.** The gate
+  already refuses the negated key `-A` of a revoked key `A` on a proven-only route, since whoever holds
+  `A`'s secret can prove `-A`; a session admitted as `-A` before the revocation now ends at the next
+  sweep instead of running until its next stream.
+
 ## v0.17.0
 
 A key that is not a usable ed25519 key is refused wherever it reaches tightbeam, with an error that says

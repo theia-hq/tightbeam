@@ -10,7 +10,7 @@ use bifrost::{
     Announced, ChannelProtection, NoDiscovery, Node, NodeId, PeerProof, Refusal, Security, Session,
 };
 use bifrost_mem::MemTransport;
-use nauthy::{Cap, Gate, Identity, Origin, Revocations, VerifyKey};
+use nauthy::{Cap, Gate, Identity, Origin, ProvenPeer, Revocations, VerifyKey};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Notify, Semaphore};
 
@@ -18,7 +18,7 @@ use super::{Admission, HostRefusal, Proven, admit};
 use crate::enabled::{AllEnabled, EnabledServices};
 use crate::identity::AsVerifyKey as _;
 use crate::open_policy::ProvenOnly;
-use crate::tunnel::cut::{AdmittedChains, LiveCuts};
+use crate::tunnel::cut::{AdmittedChains, Cut, Cuts, LiveCuts};
 use crate::tunnel::exposer::{
     PROVEN_STREAM_DEADLINE, PROVEN_STREAM_PERMITS, PublicPool, PublicSession, Serving, SessionPeer,
     serve_session,
@@ -571,6 +571,42 @@ fn record_proven_keeps_the_key_and_nothing_else() {
     assert_eq!(chains.roots().count(), 0);
     assert_eq!(chains.anchors().count(), 0);
     assert!(!chains.lapsed(std::time::SystemTime::now() + Duration::from_secs(3600 * 24 * 365)));
+}
+
+/// A session proven as the sign twin `-A` of a key `A` is cut when `A` is revoked: the holder of `A`'s
+/// secret proves `-A` by signing with the negated scalar, and the gate already refuses that twin on this
+/// path, so the cut does too rather than letting the session run until its next stream.
+#[test]
+fn a_proven_session_as_the_sign_twin_of_a_revoked_key_is_cut() {
+    let key = Identity::from_secret(&[46u8; 32])
+        .expect("valid secret")
+        .verifying_key();
+    let mut bytes = *key.bytes();
+    bytes[31] ^= 0x80;
+    let twin = VerifyKey::try_new(bytes).expect("the sign twin of a real key is a real key");
+
+    let keys = Arc::new(Keys::default());
+    let gate = Gate::rooted(signet().verifying_key(), Arc::clone(&keys));
+    let cuts = Cuts::new(Box::new(Arc::clone(&keys)));
+    let session = cuts.watch();
+    session
+        .chains()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .record_proven(twin);
+
+    let now = std::time::SystemTime::now();
+    assert_eq!(cuts.cuts(&session, now), None, "nothing is revoked yet");
+    keys.revoke(key);
+    assert!(
+        gate.proven(ProvenPeer::from_handshake(twin)).is_err(),
+        "the gate refuses the twin of a revoked key"
+    );
+    assert_eq!(
+        cuts.cuts(&session, now),
+        Some(Cut::PeerRevoked),
+        "a session already admitted as that twin is cut as well"
+    );
 }
 
 /// A store that answers "not revoked" and notes how many proven slots were free each time it was asked.
