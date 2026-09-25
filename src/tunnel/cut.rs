@@ -99,6 +99,9 @@ pub struct AdmittedChains {
     ids: HashSet<RevocationId>,
     anchors: HashSet<VerifyKey>,
     peer: Option<VerifyKey>,
+    /// Whether any stream was admitted on a proven-only route, whose gate also refuses the sign twin of a
+    /// revoked key, so the cut asks about that twin too.
+    proven: bool,
     lease: Lease,
 }
 
@@ -182,6 +185,14 @@ impl AdmittedChains {
     /// finds the session by this key alone, through [`LiveCuts::revoked_peer`].
     pub(super) fn record_proven(&mut self, peer: VerifyKey) {
         self.peer = Some(peer);
+        self.proven = true;
+    }
+
+    /// The keys whose revocation ends this session: its peer's, and on a proven-only route that key's
+    /// sign twin as well, the same pair [`nauthy::Gate::proven`] refuses at admission.
+    fn peer_keys(&self) -> impl Iterator<Item = VerifyKey> + '_ {
+        let twin = self.peer.filter(|_| self.proven).and_then(sign_twin);
+        self.peer.into_iter().chain(twin)
     }
 
     /// How many revocation ids this session keeps.
@@ -251,6 +262,17 @@ impl Lease {
     fn lapsed(self, now: SystemTime) -> bool {
         matches!(self, Self::Until(until) if now > until)
     }
+}
+
+/// The sign twin of `key`: the negated point, which the holder of `key`'s secret proves by signing with
+/// the negated scalar. Negating an ed25519 point negates its x, which flips only the sign bit the
+/// compressed form carries in the top bit of its last byte; x is never zero on a key that passed
+/// [`VerifyKey::try_new`], so the flip is exact. `None` never happens for such a key and only keeps this
+/// free of a panic.
+fn sign_twin(key: VerifyKey) -> Option<VerifyKey> {
+    let mut bytes = *key.bytes();
+    bytes[31] ^= 0x80;
+    VerifyKey::try_new(bytes).ok()
 }
 
 /// Why the cut ended a session, for the node's own log.
@@ -382,8 +404,8 @@ impl Cuts {
             return Some(Cut::Untrusted);
         }
         if chains
-            .peer()
-            .is_some_and(|peer| self.oracle.revoked_peer(&peer))
+            .peer_keys()
+            .any(|peer| self.oracle.revoked_peer(&peer))
         {
             return Some(Cut::PeerRevoked);
         }
