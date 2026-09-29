@@ -28,7 +28,7 @@ bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "a4eaaa7ad9b
 keystore = { git = "https://github.com/theia-hq/bifrost", rev = "a4eaaa7ad9bb7d50c8f7576965334f069dba52ce" }
 # v0.11.0: a key that is not the canonical encoding of a prime-order point is refused, `VerifyKey` has
 # only `try_new`, and a link naming the authority it is bound to is minted by `Link::mint_authority_bound`.
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "3adae5a19487781b944e2a4ca4361227b0ba8dcc" }
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "c649869379c3dbdf80afc546dc4fb5b03f80dc08" }
 # The handler contract, in-tree beside its only dispatcher. A path dep (not a git self-dep): the workspace
 # member resolves within this checkout, and the package stays separately pinnable by a consumer.
 tightbeam-handler = { path = "tightbeam-handler" }
