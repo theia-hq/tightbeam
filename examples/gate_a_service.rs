@@ -21,11 +21,10 @@
 //! the link alone. The gate logic is identical either way.
 
 use core::time::Duration;
-use std::path::PathBuf;
 
 use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
-use nauthy::{FileDenylist, Identity, Link, Service};
+use nauthy::{Denylist, Identity, Link, Service};
 use tightbeam::identity::AsNodeId as _;
 use tightbeam::tunnel::{self, CancellationToken, PresentingConnector, Router};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -66,15 +65,15 @@ async fn run() -> eyre::Result<()> {
 
     // 3. Stand the `ssh` service behind a family gate rooted at that identity: only a caller presenting a
     //    capability this identity signed (for this service, unexpired) is admitted. `resolve_gate(..)`
-    //    is the same policy every embedder applies: not-public means a family gate on the root, and an
-    //    empty denylist admits everything not yet revoked.
-    // Nothing is revoked yet, so an empty denylist. A real node loads this from where it persists
-    // revocations (`FileDenylist::load`); the empty set admits everything not yet revoked.
+    //    is the same policy every embedder applies: not-public means a family gate on the root. The
+    //    denylist is loaded from where the node persists revocations; nothing is revoked yet, so it is
+    //    empty and admits everything not yet revoked.
     // `identity.verifying_key()` is nauthy's `VerifyKey`; `.node_id()` is the `AsNodeId` bridge to bifrost's
     // `NodeId` (two names for the same ed25519 key on either side of the cap/transport boundary). A real
     // exposer loads this root from config as a `NodeId` already and never crosses the bridge by hand.
     let root = identity.verifying_key().node_id()?;
-    let gate = tunnel::resolve_gate(Some(root), FileDenylist::empty(PathBuf::new()))?;
+    let denylist = Denylist::load(std::env::temp_dir().join("tightbeam-gate-a-service.deny"))?;
+    let gate = tunnel::resolve_gate(Some(root), denylist)?;
     tokio::task::spawn_local(async move {
         if let Err(e) = async {
             Router::new(gate)

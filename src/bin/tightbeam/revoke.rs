@@ -1,7 +1,7 @@
 //! `tightbeam revoke`: revoke a capability so this node refuses it, offline and at once.
 
 use clap::Args;
-use nauthy::{FileDenylist, Link};
+use nauthy::{Denylist, Link};
 use tightbeam::config::revoked_path;
 
 /// Revoke a capability link so this node refuses it from now on.
@@ -20,12 +20,16 @@ pub struct RevokeCmd {
 
 impl RevokeCmd {
     /// Add the cap's revocation id to the persisted denylist.
-    pub async fn run(self) -> eyre::Result<()> {
+    pub fn run(self) -> eyre::Result<()> {
         let link = self.link.parse::<Link>()?;
         // The adapter opens tightbeam's own denylist and passes it by ref to the link, which never reads
-        // a config path.
-        let mut denylist = FileDenylist::load(revoked_path()?).await?;
-        link.revoke(&mut denylist).await?;
+        // a config path. tightbeam has no lock of its own, so the write takes the denylist's, which
+        // serializes it against another `revoke` in a second process. Synchronous: this command runs
+        // nothing else, so blocking on the lock stalls no one.
+        let denylist = Denylist::load(revoked_path()?)?;
+        let held = denylist.lock()?;
+        link.revoke(&denylist, &held)?;
+        drop(held);
         println!("revoked ({})", denylist.path().display());
         Ok(())
     }

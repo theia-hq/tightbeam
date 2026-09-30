@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use bifrost::{Node, NodeId, Session, Transport};
 use clap::Args;
-use nauthy::{FileDenylist, Latch, Service};
+use nauthy::{Denylist, Service};
 use tightbeam::tunnel::{
     self, CancellationToken, ManifestEntry, Posture, RawSource, Router, TargetKind,
 };
@@ -74,7 +74,7 @@ impl ExposeCmd {
         self,
         node: &Node<T, D>,
         root: Option<NodeId>,
-        revocations: Arc<Latch<FileDenylist>>,
+        revocations: Arc<Denylist>,
     ) -> eyre::Result<()>
     where
         <T::Session as Session>::Write: Send + 'static,
@@ -107,7 +107,7 @@ impl ExposeCmd {
         };
         let names: Vec<String> = router.names().map(str::to_owned).collect();
         // The live cut reads the same store the gate does, so a session admitted on a cap since revoked,
-        // or rooted at a key since disabled, ends itself. Under `--public` nothing is ruled on, so
+        // or rooted at a key since revoked, ends itself. Under `--public` nothing is ruled on, so
         // nothing is ever cut.
         let exposer = router.expose()?.with_live_cuts(revocations);
         // Prove the transport can carry this gate BEFORE any ready output: a

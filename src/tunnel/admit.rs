@@ -35,11 +35,10 @@ use crate::splice_halves;
 /// it as a value. This exists so the two security-relevant conventions (fail-loud-on-unprovisioned,
 /// real-loaded-store) are enforced once, not hand-copied into each caller.
 ///
-/// The store is the WHOLE per-token revocation policy the gate sees, so the caller composes it: a bare
-/// [`FileDenylist`](nauthy::FileDenylist) refuses revoked grants only, and a [`Latch`](nauthy::Latch)
-/// over one also refuses every cap rooted at a disabled key. A node that passes the bare denylist gets no
-/// root disable. Pass an `Arc` of the store to share the one instance with
-/// [`Exposer::with_live_cuts`](super::Exposer::with_live_cuts).
+/// The store is the WHOLE per-token revocation policy the gate sees. nauthy's
+/// [`Denylist`](nauthy::Denylist) holds both kinds: a revoked id refuses the grant that carries it, and a
+/// revoked key refuses that peer and every cap rooted at it. Pass an `Arc` of the store to share the one
+/// instance with [`Exposer::with_live_cuts`](super::Exposer::with_live_cuts).
 ///
 /// The base gate is the node-wide FAMILY authority; opening individual services is a SEPARATE, per-service
 /// overlay ([`Router::public`](super::Router::public)), never a node-wide value this function returns.

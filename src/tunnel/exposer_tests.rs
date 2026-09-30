@@ -859,7 +859,7 @@ async fn a_lossy_source_fans_out_to_many_consumers() {
 /// revealed only AFTER admission.
 #[tokio::test]
 async fn an_unadmitted_dialer_gets_one_uniform_refusal_no_reason_no_menu() {
-    use nauthy::{FileDenylist, Identity};
+    use nauthy::{Denylist, Identity};
 
     let local = tokio::task::LocalSet::new();
     local
@@ -890,13 +890,14 @@ async fn an_unadmitted_dialer_gets_one_uniform_refusal_no_reason_no_menu() {
             let path =
                 std::env::temp_dir().join(format!("tb-uniform-refusal-{}", std::process::id()));
             let _ = std::fs::remove_file(&path);
-            let mut denylist = FileDenylist::load(path.clone())
-                .await
-                .expect("load denylist");
-            denylist
-                .revoke(&revoked_slip)
-                .await
+            let denylist = Denylist::load(path.clone()).expect("load denylist");
+            let held = denylist.lock().expect("lock the denylist");
+            revoked_slip
+                .link()
+                .expect("link")
+                .revoke(&denylist, &held)
                 .expect("revoke the slip");
+            drop(held);
 
             let exposer = Exposer {
                 services,

@@ -26,8 +26,8 @@ use std::sync::Arc;
 use bifrost::Node;
 use bifrost_iroh::Endpoint;
 use clap::{CommandFactory, Parser, Subcommand};
-use nauthy::{DisabledRoots, FileDenylist, Latch};
-use tightbeam::config::{disabled_roots_path, load_root, revoked_path};
+use nauthy::Denylist;
+use tightbeam::config::{load_root, revoked_path};
 use tightbeam::identity::{self, Secret};
 use tightbeam::peer::{Discovery, Peer, Role};
 
@@ -120,7 +120,7 @@ async fn run() -> eyre::Result<()> {
         Command::Tree(cmd) => cmd.run(&Cli::command()),
         Command::Attenuate(cmd) => cmd.run(),
         // `revoke` adds to the local revocation denylist; local, no node, no identity.
-        Command::Revoke(cmd) => cmd.run().await,
+        Command::Revoke(cmd) => cmd.run(),
         // `share` needs the signing identity but no bound node: minting is offline. It also reads the
         // root, because a link signed under a foreign one would be admitted nowhere.
         Command::Share(cmd) => {
@@ -133,14 +133,10 @@ async fn run() -> eyre::Result<()> {
         Command::Expose(cmd) => {
             let secret = identity::load(cli.key.as_deref()).await?;
             let root = load_root().await?;
-            // Load tightbeam's own denylist and disabled roots here in the adapter and pass them as one
-            // composed value; the core takes the loaded store, never a path (the same interface any richer
-            // consumer drives on its own store). Shared, because the gate and the live cut must read the
-            // one instance.
-            let revocations = Arc::new(Latch::new(
-                DisabledRoots::load(disabled_roots_path()?).await?,
-                FileDenylist::load(revoked_path()?).await?,
-            ));
+            // Load tightbeam's own denylist here in the adapter, revoked ids and keys in one store; the core
+            // takes the loaded store, never a path (the same interface any richer consumer drives on its own
+            // store). Shared, because the gate and the live cut must read the one instance.
+            let revocations = Arc::new(Denylist::load(revoked_path()?)?);
             let node =
                 bind_node(secret, cli.peer, cli.offline, cli.bind_addr, Role::Serving).await?;
             let outcome = run_until_signalled(cmd.run(&node, root, revocations)).await;

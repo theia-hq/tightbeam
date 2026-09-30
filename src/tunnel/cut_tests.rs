@@ -3,12 +3,12 @@
 //! with the cut wired still frees every closed session's slot.
 
 use core::time::Duration;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
-use nauthy::{DisabledRoots, FileDenylist, Gate, Identity, Latch};
+use nauthy::{Cap, Denylist, Gate, Identity, Revocation};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::super::exposer::MAX_SESSIONS;
@@ -54,23 +54,28 @@ fn hour() -> std::time::SystemTime {
     nauthy::Request::expires_in(Duration::from_secs(3600))
 }
 
-/// The one store both the gate and the cut read, as a product caller composes it.
-async fn store(tag: &str) -> (Arc<Latch<FileDenylist>>, PathBuf, PathBuf) {
-    let roots = scratch(&format!("{tag}-roots"));
+/// The one store both the gate and the cut read, as a product caller composes it, and the file behind it.
+fn store(tag: &str) -> (Arc<Denylist>, PathBuf) {
     let denylist = scratch(&format!("{tag}-deny"));
-    let store = Latch::new(
-        DisabledRoots::load(roots.clone())
-            .await
-            .expect("load roots"),
-        FileDenylist::load(denylist.clone())
-            .await
-            .expect("load denylist"),
-    );
-    (Arc::new(store), roots, denylist)
+    let store = Denylist::load(denylist.clone()).expect("load denylist");
+    (Arc::new(store), denylist)
+}
+
+/// Write `entries` to the denylist at `path` through a second instance under the file's own lock, as
+/// `tightbeam revoke` would from another process.
+fn revoke_elsewhere(path: &Path, entries: impl IntoIterator<Item = Revocation>) {
+    let writer = Denylist::for_repair(path.to_owned());
+    let held = writer.lock().expect("lock the denylist");
+    writer.revoke(&held, entries).expect("revoke");
+}
+
+/// The entry that recalls `cap` and everything attenuated from it: its narrowest block's id.
+fn recall(cap: &Cap) -> Revocation {
+    Revocation::Id(cap.revocation_ids().pop().expect("a chain has a block"))
 }
 
 /// A gated echo exposer over `store`, with the live cut wired to the same instance.
-fn gated_echo(store: &Arc<Latch<FileDenylist>>) -> Exposer {
+fn gated_echo(store: &Arc<Denylist>) -> Exposer {
     prove(
         services(&["demo=echo:"]),
         Gate::rooted(root().verifying_key(), Arc::clone(store)),
@@ -124,7 +129,7 @@ async fn a_session_is_cut_when_a_cap_it_was_admitted_on_is_revoked() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (store, _roots, denylist) = store("revoked").await;
+            let (store, denylist) = store("revoked");
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = root()
@@ -145,8 +150,7 @@ async fn a_session_is_cut_when_a_cap_it_was_admitted_on_is_revoked() {
             assert!(still_echoes(&mut stream).await, "served before the recall");
 
             // Revoked by another writer on the same file, as `revoke` would from another process.
-            let mut writer = FileDenylist::empty(denylist.clone());
-            writer.revoke(&badge).await.expect("revoke the badge");
+            revoke_elsewhere(&denylist, [recall(&badge)]);
 
             assert!(
                 host_ends(&mut stream.reader).await,
@@ -157,11 +161,11 @@ async fn a_session_is_cut_when_a_cap_it_was_admitted_on_is_revoked() {
 }
 
 #[tokio::test]
-async fn a_session_is_cut_when_the_root_it_was_admitted_under_is_disabled() {
+async fn a_session_is_cut_when_the_root_key_it_was_admitted_under_is_revoked() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (store, roots, _denylist) = store("disabled").await;
+            let (store, denylist) = store("root-key");
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = root()
@@ -179,30 +183,26 @@ async fn a_session_is_cut_when_the_root_it_was_admitted_under_is_disabled() {
             )
             .await
             .expect("the member is admitted");
-            assert!(still_echoes(&mut stream).await, "served before the disable");
+            assert!(still_echoes(&mut stream).await, "served before the revoke");
 
-            let mut writer = DisabledRoots::open_for_repair(roots.clone());
-            writer
-                .disable(root().verifying_key())
-                .await
-                .expect("disable the root");
+            revoke_elsewhere(&denylist, [Revocation::Key(root().verifying_key())]);
 
             assert!(
                 host_ends(&mut stream.reader).await,
-                "a session admitted under a root since disabled must end within a sweep"
+                "a session admitted under a root key since revoked must end within a sweep"
             );
         })
         .await;
 }
 
 #[tokio::test]
-async fn a_session_admitted_through_a_foreign_badge_is_cut_when_that_root_is_disabled() {
+async fn a_session_admitted_through_a_foreign_badge_is_cut_when_that_root_key_is_revoked() {
     // The two-token path: a slip this node issued, naming a foreign authority, and that authority's badge
-    // for the dialer. The gate refuses a disabled foreign root at admission, so the cut must too.
+    // for the dialer. The gate refuses a revoked foreign root key at admission, so the cut must too.
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (store, roots, _denylist) = store("foreign").await;
+            let (store, denylist) = store("foreign");
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let foreign = Identity::from_secret(&[11u8; 32]).expect("valid secret");
@@ -225,17 +225,13 @@ async fn a_session_admitted_through_a_foreign_badge_is_cut_when_that_root_is_dis
             )
             .await
             .expect("the foreign member is admitted");
-            assert!(still_echoes(&mut stream).await, "served before the disable");
+            assert!(still_echoes(&mut stream).await, "served before the revoke");
 
-            let mut writer = DisabledRoots::open_for_repair(roots.clone());
-            writer
-                .disable(foreign.verifying_key())
-                .await
-                .expect("disable the foreign root");
+            revoke_elsewhere(&denylist, [Revocation::Key(foreign.verifying_key())]);
 
             assert!(
                 host_ends(&mut stream.reader).await,
-                "a session admitted on a foreign badge must end once that badge's root is disabled"
+                "a session admitted on a foreign badge must end once that badge's root key is revoked"
             );
         })
         .await;
@@ -246,7 +242,7 @@ async fn a_session_nothing_recalled_keeps_running_across_sweeps() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (store, _roots, denylist) = store("survives").await;
+            let (store, denylist) = store("survives");
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = root()
@@ -266,11 +262,7 @@ async fn a_session_nothing_recalled_keeps_running_across_sweeps() {
 
             // Some OTHER grant is revoked: the cut is keyed on this session's chains, not on the file.
             let unrelated = root().mint(&svc("demo"), hour()).expect("mint slip");
-            let mut writer = FileDenylist::empty(denylist.clone());
-            writer
-                .revoke(&unrelated)
-                .await
-                .expect("revoke another grant");
+            revoke_elsewhere(&denylist, [recall(&unrelated)]);
 
             tokio::time::sleep(CUT_SWEEP * 2 + Duration::from_millis(300)).await;
             assert!(
@@ -286,7 +278,7 @@ async fn a_session_is_cut_once_the_grant_it_was_admitted_on_expires() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (store, _roots, _denylist) = store("expired").await;
+            let (store, _denylist) = store("expired");
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = root()
@@ -306,7 +298,7 @@ async fn a_session_is_cut_once_the_grant_it_was_admitted_on_expires() {
             .expect("the member is admitted");
             assert!(still_echoes(&mut stream).await, "served before the expiry");
 
-            // Nothing is revoked or disabled: only the clock moves.
+            // Nothing is revoked: only the clock moves.
             assert!(
                 host_ends(&mut stream.reader).await,
                 "a session must not outlive the only grant it was admitted on"
@@ -322,7 +314,7 @@ async fn a_session_is_cut_at_an_attenuated_expiry_not_the_issuers() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (store, _roots, _denylist) = store("attenuated").await;
+            let (store, _denylist) = store("attenuated");
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let attenuated = root()
@@ -392,7 +384,7 @@ async fn a_stream_on_a_cap_whose_expiry_cannot_be_read_is_refused() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (store, _roots, _denylist) = store("unreadable").await;
+            let (store, _denylist) = store("unreadable");
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = root()
@@ -443,7 +435,7 @@ async fn a_stream_on_a_clock_bound_past_the_clocks_range_is_refused_and_the_node
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (store, _roots, _denylist) = store("far-date").await;
+            let (store, _denylist) = store("far-date");
             let host = serve(gated_echo(&store));
             let hostile = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = root()
@@ -503,7 +495,7 @@ async fn a_session_ends_when_the_first_grant_it_was_admitted_on_runs_out() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (store, _roots, _denylist) = store("first-out").await;
+            let (store, _denylist) = store("first-out");
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let brief = root()
@@ -545,7 +537,7 @@ async fn a_session_ends_when_the_first_grant_it_was_admitted_on_runs_out() {
 }
 
 /// A gated exposer with two echo services, so one session can hold grants for different names.
-fn gated_pair(store: &Arc<Latch<FileDenylist>>) -> Exposer {
+fn gated_pair(store: &Arc<Denylist>) -> Exposer {
     prove(
         services(&["demo=echo:", "other=echo:"]),
         Gate::rooted(root().verifying_key(), Arc::clone(store)),
@@ -563,7 +555,7 @@ async fn a_short_grant_is_not_carried_past_its_expiry_by_a_later_grant_for_anoth
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (store, _roots, _denylist) = store("carried").await;
+            let (store, _denylist) = store("carried");
             let host = serve(gated_pair(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let short = root()
@@ -605,7 +597,7 @@ async fn a_stream_refused_after_the_gate_does_not_hold_a_session_open() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (store, _roots, _denylist) = store("refused-holds").await;
+            let (store, _denylist) = store("refused-holds");
             let host = serve(gated_pair(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let short = root()
@@ -652,7 +644,7 @@ async fn a_stream_refused_after_the_gate_leaves_the_session_lease_untouched() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (store, _roots, _denylist) = store("refused-untouched").await;
+            let (store, _denylist) = store("refused-untouched");
             let host = serve(gated_pair(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let lasting = root()
@@ -700,7 +692,7 @@ async fn a_raw_stream_whose_open_is_refused_leaves_the_session_lease_untouched()
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (store, _roots, _denylist) = store("open-refused").await;
+            let (store, _denylist) = store("open-refused");
             let directory = std::env::temp_dir();
             let host = serve(
                 prove(
@@ -857,7 +849,7 @@ async fn closed_sessions_free_their_slots_with_the_cut_wired() {
                 PublicUnsafeRequest::none(),
             )
             .expect("an open echo builds")
-            .with_live_cuts(FileDenylist::empty(scratch("wedge")));
+            .with_live_cuts(Denylist::for_repair(scratch("wedge")));
             let host = serve(exposer);
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             // The run's first sweep fires at once; let it, so every session below has one to see.
@@ -892,9 +884,9 @@ async fn closed_sessions_free_their_slots_with_the_cut_wired() {
         .await;
 }
 
-#[tokio::test]
-async fn the_latch_cuts_on_a_kept_root_or_a_kept_id_and_nothing_else() {
-    let (store, roots, denylist) = store("oracle").await;
+#[test]
+fn the_denylist_cuts_on_a_kept_root_key_or_a_kept_id_and_nothing_else() {
+    let (store, denylist) = store("oracle");
     let clean = root().mint(&svc("demo"), hour()).expect("mint");
     let revoked = root().mint(&svc("web"), hour()).expect("mint");
     let foreign = Identity::from_secret(&[12u8; 32]).expect("valid secret");
@@ -911,22 +903,26 @@ async fn the_latch_cuts_on_a_kept_root_or_a_kept_id_and_nothing_else() {
     );
     assert!(!store.cuts(&kept(&clean)), "a clean chain is not cut");
 
-    FileDenylist::empty(denylist.clone())
-        .revoke(&revoked)
-        .await
-        .expect("revoke");
-    DisabledRoots::open_for_repair(roots.clone())
-        .disable(foreign.verifying_key())
-        .await
-        .expect("disable");
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    revoke_elsewhere(
+        &denylist,
+        [recall(&revoked), Revocation::Key(foreign.verifying_key())],
+    );
+    std::thread::sleep(Duration::from_millis(150));
 
     assert!(store.cuts(&kept(&revoked)), "a kept revoked id is cut");
     assert!(
         store.cuts(&kept(&foreign_cap)),
-        "a kept disabled root is cut"
+        "a kept revoked root key is cut"
     );
     assert!(!store.cuts(&kept(&clean)), "the clean chain still is not");
+    assert!(
+        store.revoked_peer(&foreign.verifying_key()),
+        "a revoked key is refused as a peer"
+    );
+    assert!(
+        !store.revoked_peer(&root().verifying_key()),
+        "a key nobody revoked is not"
+    );
 }
 
 #[tokio::test]
@@ -936,7 +932,7 @@ async fn a_session_is_refused_streams_past_its_chain_ceiling() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (store, _roots, _denylist) = store("ceiling").await;
+            let (store, _denylist) = store("ceiling");
             let host = serve(gated_echo(&store));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let badge = root()
@@ -1062,7 +1058,7 @@ async fn a_cut_closes_the_session_rather_than_only_dropping_it() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (store, _roots, denylist) = store("close").await;
+            let (store, denylist) = store("close");
             let serving = Arc::new(super::super::exposer::Serving {
                 gate: Gate::rooted(root().verifying_key(), Arc::clone(&store)),
                 public: super::super::router::PublicServices::default(),
@@ -1116,10 +1112,7 @@ async fn a_cut_closes_the_session_rather_than_only_dropping_it() {
             )
             .await
             .expect("the member is admitted");
-            FileDenylist::empty(denylist.clone())
-                .revoke(&badge)
-                .await
-                .expect("revoke");
+            revoke_elsewhere(&denylist, [recall(&badge)]);
 
             tokio::time::timeout(WITHIN, session)
                 .await
@@ -1192,7 +1185,7 @@ async fn a_handshake_in_flight_across_a_sweep_is_still_accepted() {
                 PublicUnsafeRequest::none(),
             )
             .expect("an open echo builds")
-            .with_live_cuts(FileDenylist::empty(scratch("handshake")));
+            .with_live_cuts(Denylist::for_repair(scratch("handshake")));
             let node = Node::new(Handshaking(MemTransport::bind()), NoDiscovery);
             let host = node.node_id();
             tokio::task::spawn_local(async move {

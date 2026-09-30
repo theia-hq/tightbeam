@@ -397,7 +397,7 @@ async fn a_saturated_public_pool_never_starves_a_gated_member() {
     let root = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
     let gate = Gate::rooted(
         root.verifying_key(),
-        nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-public-starvation")),
+        nauthy::Denylist::for_repair(std::env::temp_dir().join("tb-public-starvation")),
     );
     // The badge is bound to the peer `drive_open_in` dials as, so the rooted gate admits it.
     let peer = bifrost::NodeId::from_ed25519_secret(&[9u8; 32]);
@@ -1105,7 +1105,7 @@ async fn a_disabled_service_is_refused_after_admission_not_before_the_gate() {
     let rooted = Arc::new(super::Serving {
         gate: Gate::rooted(
             root.verifying_key(),
-            nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-disabled-order")),
+            nauthy::Denylist::for_repair(std::env::temp_dir().join("tb-disabled-order")),
         ),
         public: PublicServices::default(),
         public_unsafe: PublicServices::default(),
@@ -1382,7 +1382,7 @@ fn an_anchored_base_refuses_an_unproven_peer() {
     let gate = Gate::anchored(
         Unpinned,
         own.verifying_key(),
-        nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-anchored-unproven")),
+        nauthy::Denylist::for_repair(std::env::temp_dir().join("tb-anchored-unproven")),
         EveryId,
     );
     let peer = bifrost::NodeId::from_ed25519_secret(&[5u8; 32]);
@@ -1580,7 +1580,7 @@ async fn a_member_only_route_serves_a_member_and_uniformly_refuses_a_slip_and_a_
             let root = nauthy::Identity::from_secret(&[7u8; 32]).expect("valid secret");
             let gate = Gate::rooted(
                 root.verifying_key(),
-                nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-member-floor")),
+                nauthy::Denylist::for_repair(std::env::temp_dir().join("tb-member-floor")),
             );
             let services = services(&["reflect=echo:"])
                 .with_handler("locked", GatedNoop)

@@ -2,6 +2,20 @@
 
 All notable changes to tightbeam, newest first.
 
+## Unreleased
+
+One denylist holds revoked caps and revoked keys, and a revoked key ends a live session.
+
+### Breaking
+- **`config::disabled_roots_path` is gone, and `~/.config/tightbeam/disabled_roots` is no longer read.**
+  `~/.config/tightbeam/revoked` holds revoked keys beside revoked caps.
+- **`LiveCuts` is implemented for nauthy's `Denylist`**, in place of `FileDenylist` and `Latch`.
+- **Built on unreleased nauthy (after 0.11.0)**, for its one `Denylist`.
+
+### Fixed
+- **A revoked key ends a live session at the next sweep**, whether its peer proved that key or it issued a
+  cap the session was admitted on.
+
 ## v0.18.0
 
 The key a node trusts is its root, in code, in its config file and in its environment.

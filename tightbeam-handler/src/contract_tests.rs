@@ -103,7 +103,7 @@ fn witness(rooted: bool) -> nauthy::Admitted {
             .expect("mint a member badge");
         let gate = Gate::rooted(
             root.verifying_key(),
-            nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-handler-witness-rooted")),
+            nauthy::Denylist::for_repair(std::env::temp_dir().join("tb-handler-witness-rooted")),
         );
         gate.admit_witnessed(ProvenPeer::from_handshake(peer), Some(&badge), &service)
             .expect("a member badge admits")
@@ -123,7 +123,7 @@ fn proven_witness() -> nauthy::Admitted {
         .verifying_key();
     let gate = Gate::rooted(
         root.verifying_key(),
-        nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-handler-witness-proven")),
+        nauthy::Denylist::for_repair(std::env::temp_dir().join("tb-handler-witness-proven")),
     );
     let witness = gate
         .proven(ProvenPeer::from_handshake(peer))

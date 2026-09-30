@@ -59,7 +59,7 @@ impl EnabledServices for AllEnabled {
 /// loaded set is behind a [`Mutex`] with the mtime it was read at, so a check can refresh it in place when the
 /// file changed underneath a running exposer.
 ///
-/// FAIL-CLOSED, matching [`FileDenylist`](nauthy::FileDenylist): a stat error, a read error, or the file
+/// FAIL-CLOSED, matching [`Denylist`](nauthy::Denylist): a stat error, a read error, or the file
 /// DISAPPEARING all keep the last-known disabled set, so a `rm` of the file (a botched cleanup, or a local
 /// attacker) never silently RE-ENABLES a service the operator turned off. A list that never had a file stays
 /// empty (nothing is disabled); a disable only ever grows the file, and a fresh file appearing is picked up.

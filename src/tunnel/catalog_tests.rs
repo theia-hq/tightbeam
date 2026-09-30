@@ -19,7 +19,7 @@ fn a_gated_catalog_reports_gated_and_round_trips() {
         .expect("`a` binds");
     let services = services.with_handler("b", OpenNoop).expect("`b` binds");
     let root = nauthy::Identity::from_secret(&[7u8; 32]).expect("valid secret");
-    let denylist = nauthy::FileDenylist::empty(std::env::temp_dir().join("tb-catalog-gated"));
+    let denylist = nauthy::Denylist::for_repair(std::env::temp_dir().join("tb-catalog-gated"));
     let gate = Gate::rooted(root.verifying_key(), denylist);
     let catalog = services.catalog(&gate, &PublicRequest::none(), &PublicUnsafeRequest::none());
 
