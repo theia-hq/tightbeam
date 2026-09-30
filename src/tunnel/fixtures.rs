@@ -139,6 +139,6 @@ pub(super) fn family_gate(tag: &str) -> Gate {
     let root = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
     Gate::rooted(
         root.verifying_key(),
-        nauthy::FileDenylist::empty(std::env::temp_dir().join(format!("tb-per-service-{tag}"))),
+        nauthy::Denylist::for_repair(std::env::temp_dir().join(format!("tb-per-service-{tag}"))),
     )
 }

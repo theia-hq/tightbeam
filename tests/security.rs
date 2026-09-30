@@ -20,7 +20,7 @@ use bifrost::{
     SecurityProfile, Session, Transport,
 };
 use bifrost_mem::MemTransport;
-use nauthy::{FileDenylist, Identity};
+use nauthy::{Denylist, Identity};
 use tightbeam::identity::AsVerifyKey as _;
 use tightbeam::protocol::RequestWriteError;
 use tightbeam::security::TransportInsecure;
@@ -183,7 +183,7 @@ async fn a_sealed_transport_carries_a_gated_dial_unchanged() {
             let exposer = Node::new(profiled::<Sealed>(MemTransport::bind()), NoDiscovery);
             let exposer_id = exposer.node_id();
             tokio::task::spawn_local(async move {
-                let gate = tunnel::resolve_gate(Some(root_id()), empty_denylist().await).unwrap();
+                let gate = tunnel::resolve_gate(Some(root_id()), empty_denylist()).unwrap();
                 Router::new(gate)
                     .forward("web".parse().unwrap(), &format!("tcp:{echo}"))
                     .unwrap()
@@ -226,7 +226,7 @@ async fn a_presenting_connector_dials_a_gated_service_over_a_proven_profile() {
             let exposer = Node::new(MemTransport::bind(), NoDiscovery);
             let exposer_id = exposer.node_id();
             tokio::task::spawn_local(async move {
-                let gate = tunnel::resolve_gate(Some(root_id()), empty_denylist().await).unwrap();
+                let gate = tunnel::resolve_gate(Some(root_id()), empty_denylist()).unwrap();
                 Router::new(gate)
                     .forward("web".parse().unwrap(), &format!("tcp:{echo}"))
                     .unwrap()
@@ -264,12 +264,11 @@ async fn a_presenting_connector_dials_a_gated_service_over_a_proven_profile() {
 async fn a_rooted_gate_over_an_announced_transport_refuses_to_arm() {
     let node = Node::new(profiled::<Announced>(MemTransport::bind()), NoDiscovery);
 
-    let rooted =
-        Router::new(tunnel::resolve_gate(Some(root_id()), empty_denylist().await).unwrap())
-            .forward("web".parse().unwrap(), "tcp:127.0.0.1:80")
-            .unwrap()
-            .expose()
-            .unwrap();
+    let rooted = Router::new(tunnel::resolve_gate(Some(root_id()), empty_denylist()).unwrap())
+        .forward("web".parse().unwrap(), "tcp:127.0.0.1:80")
+        .unwrap()
+        .expose()
+        .unwrap();
     let error = rooted
         .prove_security::<Profiled<MemTransport, Announced>>()
         .expect_err("a rooted gate must not arm over an announced transport");
@@ -367,7 +366,7 @@ async fn free_port() -> u16 {
 
 /// An empty revocation denylist: these tests exercise the profile rule, not revocation. The path is unique
 /// per call, so the tests that run concurrently cannot share (and race on) one file.
-async fn empty_denylist() -> FileDenylist {
+fn empty_denylist() -> Denylist {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
         "tightbeam-security-{}-{}",
@@ -375,5 +374,5 @@ async fn empty_denylist() -> FileDenylist {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = std::fs::remove_file(&path);
-    FileDenylist::load(path).await.unwrap()
+    Denylist::load(path).unwrap()
 }

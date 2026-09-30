@@ -14,7 +14,7 @@ use core::time::Duration;
 
 use bifrost::{NoDiscovery, Node, NodeId};
 use bifrost_mem::MemTransport;
-use nauthy::{FileDenylist, Identity, Link, Service};
+use nauthy::{Denylist, Identity, Link, Service};
 use tightbeam::tunnel::{self, CancellationToken, Connector, Router};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -36,7 +36,7 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
             // rooted at that key (badges or slips), which is what these cap tests present.
             let root = NodeId::from_ed25519_secret(&EXPOSER_SECRET);
             tokio::task::spawn_local(async move {
-                let gate = tunnel::resolve_gate(Some(root), empty_denylist().await).unwrap();
+                let gate = tunnel::resolve_gate(Some(root), empty_denylist()).unwrap();
                 Router::new(gate)
                     .parse(&[format!("ssh=tcp:{echo_addr}")])
                     .unwrap()
@@ -152,8 +152,8 @@ async fn free_port() -> u16 {
 
 /// An empty revocation denylist: these tests exercise the grant path, not revocation, so the gate loads
 /// from a path that does not exist (an absent file is an empty set).
-async fn empty_denylist() -> FileDenylist {
+fn empty_denylist() -> Denylist {
     let path = std::env::temp_dir().join(format!("tightbeam-cap-denylist-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    FileDenylist::load(path).await.unwrap()
+    Denylist::load(path).unwrap()
 }

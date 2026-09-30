@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
-use nauthy::{Cap, CapError, FileDenylist, Latch, RevocationId, Revocations, VerifyKey};
+use nauthy::{Cap, CapError, Denylist, RevocationId, VerifyKey};
 use tokio::sync::watch;
 use tokio::time::{Interval, MissedTickBehavior};
 
@@ -49,15 +49,15 @@ pub(super) const MAX_SESSION_CHAIN_IDS: usize = 1024;
 
 /// The rule a live session is re-checked against: whether the chains it was admitted on are still good.
 ///
-/// Synchronous and cheap, like the gate's own [`Revocations`] store, because every live session asks it on
-/// every sweep. It answers about one session's record at a time and is never handed a session, but
-/// [`revoked_peer`](Self::revoked_peer) is asked once per sweep for each live session admitted on a cap or
-/// on a proven-only route, with the key that session's peer proved: an impl that kept those keys could
-/// list and count who is connected. tightbeam's own impls keep nothing; wire only an oracle that is the
-/// node's own revocation store.
+/// Synchronous and cheap, like the gate's own [`Revocations`](nauthy::Revocations) store, because every
+/// live session asks it on every sweep. It answers about one session's record at a time and is never
+/// handed a session, but [`revoked_peer`](Self::revoked_peer) is asked once per sweep for each live session
+/// admitted on a cap or on a proven-only route, with the key that session's peer proved: an impl that kept
+/// those keys could list and count who is connected. tightbeam's own impl keeps nothing; wire only an
+/// oracle that is the node's own revocation store.
 ///
-/// Implemented for nauthy's stores, so a caller shares ONE instance between the gate and the cut and the
-/// two can never disagree about a file they each read at a different moment.
+/// Implemented for nauthy's [`Denylist`], so a caller shares ONE instance between the gate and the cut and
+/// the two can never disagree about a file they each read at a different moment.
 ///
 /// A wrapper that holds an oracle must forward [`trusts`](Self::trusts) and
 /// [`revoked_peer`](Self::revoked_peer) as well as [`cuts`](Self::cuts): a provided method a wrapper does
@@ -90,7 +90,7 @@ pub trait LiveCuts: Send + Sync {
 /// the anchors those streams were verified under, the peer key they were bound to, and how long those
 /// grants hold the session: the facts the cut re-checks, kept instead of the caps themselves.
 ///
-/// A parsed cap is the whole token; the ids and the root are all a revocation or a disabled root ever
+/// A parsed cap is the whole token; the ids and the root are all a revoked id or a revoked key ever
 /// matches. Held as a union per session: the cut is session-granular, so which stream carried which cap
 /// does not matter, and a cap presented again adds nothing.
 #[derive(Default)]
@@ -119,7 +119,7 @@ impl AdmittedChains {
     /// The root of each admitted stream's first cap: the one the gate verified at its own authority, so
     /// the root the session's standing hangs on. A badge presented second, on the two-token path, is never
     /// an anchor: it is rooted at the authority its slip names, which no change to the gate's trusted root
-    /// moves, and it stays in [`roots`](Self::roots), where a disabled root still cuts it.
+    /// moves, and it stays in [`roots`](Self::roots), where a revoked root key still cuts it.
     pub fn anchors(&self) -> impl Iterator<Item = VerifyKey> + '_ {
         self.anchors.iter().copied()
     }
@@ -278,7 +278,7 @@ fn sign_twin(key: VerifyKey) -> Option<VerifyKey> {
 /// Why the cut ended a session, for the node's own log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Cut {
-    /// A cap it was admitted on is revoked, or the root one was issued under is disabled.
+    /// A cap it was admitted on is revoked, or so is the root key one was issued under.
     Recalled,
     /// A root one of its streams was verified under is no longer trusted.
     Untrusted,
@@ -310,30 +310,16 @@ pub(super) enum Unrecorded {
     UnreadableExpiry(#[source] CapError),
 }
 
-impl LiveCuts for FileDenylist {
+/// The same questions the gate asks this same store at admission: an id in a chain, or a root key the
+/// denylist holds, recalls the session, and a held key ends a session its peer proved with it. `trusts`
+/// keeps the default: a denylist names what is refused and knows no pin.
+impl LiveCuts for Denylist {
     fn cuts(&self, chains: &AdmittedChains) -> bool {
-        self.is_revoked_any(chains.ids())
-    }
-}
-
-/// The disabled root first, then the inner store: the same order and the same questions the gate's own
-/// [`Latch`] answers at admission. Every method is written, since a provided one left out would answer
-/// the default rather than the inner store.
-impl<R: Revocations + LiveCuts> LiveCuts for Latch<R> {
-    fn cuts(&self, chains: &AdmittedChains) -> bool {
-        chains.roots().any(|root| self.disabled().is_disabled(root)) || self.inner().cuts(chains)
+        self.is_revoked_any(chains.ids()) || chains.roots().any(|root| self.is_revoked_key(&root))
     }
 
-    /// The disabled roots are authority keys, not anchors a pin moves between, so only the inner store is
-    /// asked.
-    fn trusts(&self, anchor: &VerifyKey) -> bool {
-        self.inner().trusts(anchor)
-    }
-
-    /// The question the gate asks this same latch at admission, then the inner store's own cut-side
-    /// answer: a store that revokes keys for the gate but keeps the [`LiveCuts`] default still cuts.
     fn revoked_peer(&self, peer: &VerifyKey) -> bool {
-        Revocations::is_revoked_peer(self, peer) || self.inner().revoked_peer(peer)
+        self.is_revoked_key(peer)
     }
 }
 

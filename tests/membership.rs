@@ -18,7 +18,7 @@ use core::time::Duration;
 
 use bifrost::{NoDiscovery, Node, NodeId};
 use bifrost_mem::MemTransport;
-use nauthy::{FileDenylist, Identity, Link, Service};
+use nauthy::{Denylist, Identity, Link, Service};
 use tightbeam::identity::AsVerifyKey as _;
 use tightbeam::tunnel::{self, CancellationToken, Connector, Router};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -42,7 +42,7 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
             // prove a membership badge is whole-node (any service), not a per-service slip.
             let root = NodeId::from_ed25519_secret(&ROOT_SECRET);
             tokio::task::spawn_local(async move {
-                let gate = tunnel::resolve_gate(Some(root), empty_denylist().await).unwrap();
+                let gate = tunnel::resolve_gate(Some(root), empty_denylist()).unwrap();
                 Router::new(gate)
                     .parse(&[format!("web=tcp:{echo_addr}")])
                     .unwrap()
@@ -115,7 +115,7 @@ async fn a_refused_forward_fails_at_preflight_with_the_reason() {
             // A family-gated node on the root: only a member is admitted.
             let root = NodeId::from_ed25519_secret(&ROOT_SECRET);
             tokio::task::spawn_local(async move {
-                let gate = tunnel::resolve_gate(Some(root), empty_denylist().await).unwrap();
+                let gate = tunnel::resolve_gate(Some(root), empty_denylist()).unwrap();
                 Router::new(gate)
                     .parse(&[format!("web=tcp:{echo_addr}")])
                     .unwrap()
@@ -228,8 +228,8 @@ async fn free_port() -> u16 {
 
 /// An empty revocation denylist: this test exercises membership admission, not revocation, so the gate
 /// loads from a path that does not exist (an absent file is an empty set).
-async fn empty_denylist() -> FileDenylist {
+fn empty_denylist() -> Denylist {
     let path = std::env::temp_dir().join(format!("tightbeam-mbr-denylist-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    FileDenylist::load(path).await.unwrap()
+    Denylist::load(path).unwrap()
 }

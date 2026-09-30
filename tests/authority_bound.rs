@@ -16,7 +16,7 @@ use core::time::Duration;
 
 use bifrost::{NoDiscovery, Node, NodeId};
 use bifrost_mem::MemTransport;
-use nauthy::{FileDenylist, Identity, Link, Service};
+use nauthy::{Denylist, Identity, Link, Service};
 use tightbeam::identity::AsVerifyKey as _;
 use tightbeam::tunnel::{self, CancellationToken, Connector, Router};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -45,7 +45,7 @@ async fn an_authority_bound_slip_admits_a_hire_device_that_proves_membership() {
             // second trusted root.
             let work_root = NodeId::from_ed25519_secret(&WORK_SECRET);
             tokio::task::spawn_local(async move {
-                let gate = tunnel::resolve_gate(Some(work_root), empty_denylist().await).unwrap();
+                let gate = tunnel::resolve_gate(Some(work_root), empty_denylist()).unwrap();
                 Router::new(gate)
                     .parse(&[format!("web=tcp:{echo_addr}")])
                     .unwrap()
@@ -205,11 +205,11 @@ async fn free_port() -> u16 {
 
 /// An empty revocation denylist (an absent file is an empty set); this test exercises admission, not
 /// revocation.
-async fn empty_denylist() -> FileDenylist {
+fn empty_denylist() -> Denylist {
     let path = std::env::temp_dir().join(format!(
         "tightbeam-authority-bound-denylist-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&path);
-    FileDenylist::load(path).await.unwrap()
+    Denylist::load(path).unwrap()
 }

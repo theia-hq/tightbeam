@@ -41,21 +41,13 @@ pub async fn write_root(root: NodeId) -> eyre::Result<()> {
 }
 
 /// The persisted revocation-denylist location, `~/.config/tightbeam/revoked`, overridable with
-/// `TIGHTBEAM_REVOKED`. Records the biscuit revocation ids of caps this node has revoked.
+/// `TIGHTBEAM_REVOKED`. Records the revocation ids of caps this node has revoked and the keys it refuses
+/// for good, as a peer and as the root of any cap.
 pub fn revoked_path() -> eyre::Result<PathBuf> {
     if let Some(path) = std::env::var_os("TIGHTBEAM_REVOKED") {
         return Ok(PathBuf::from(path));
     }
     Ok(config_dir()?.join("revoked"))
-}
-
-/// The disabled-roots latch location, `~/.config/tightbeam/disabled_roots`: the root keys this node no
-/// longer trusts, one per line, which the gate refuses every cap rooted at. A file of its own, never the
-/// denylist: the denylist names grants, this names the keys that sign them, and it only ever grows. Kept
-/// in the config directory, since that directory, not the file's mode, is what stands between the latch
-/// and a local user who would delete it.
-pub fn disabled_roots_path() -> eyre::Result<PathBuf> {
-    Ok(config_dir()?.join("disabled_roots"))
 }
 
 /// The tightbeam config directory, `~/.config/tightbeam`.
