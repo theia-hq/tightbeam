@@ -291,7 +291,9 @@ pub(super) enum Cut {
 impl core::fmt::Display for Cut {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
-            Self::Recalled => "a capability it was admitted on is revoked or its root disabled",
+            Self::Recalled => {
+                "a capability it was admitted on, or the key one was issued under, is revoked"
+            }
             Self::Untrusted => "a root it was admitted under is no longer trusted",
             Self::PeerRevoked => "its peer's key is revoked",
             Self::Expired => "a capability it was admitted on has expired",
