@@ -340,7 +340,7 @@ fn same_key_matches_the_same_bytes() {
 /// That half is checked by the compiler instead: `same_key` matches on the suite with no catch-all, so a
 /// second suite does not build until its arm is written.
 #[test]
-fn same_key_refuses_another_suite() {
+fn same_key_refuses_other_bytes() {
     let id = NodeId::from_ed25519_secret(&[7u8; 32]);
     assert!(!id.same_key(&verify_key_of(&[8u8; 32])));
 }
@@ -351,7 +351,7 @@ fn same_key_refuses_another_suite() {
 /// every suite with no catch-all, so a second suite does not build until it is given its expectation
 /// here: that its `NodeId` is refused.
 #[test]
-fn a_node_id_of_another_suite_is_not_a_verify_key() {
+fn an_ed25519_node_id_converts_to_its_own_verify_key() {
     let seed = [7u8; 32];
     let id = NodeId::from_ed25519_secret(&seed);
     match id.kind() {
