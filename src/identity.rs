@@ -39,15 +39,33 @@ use zeroize::{ZeroizeOnDrop, Zeroizing};
 /// point, so the conversion re-runs the other side's check and returns its refusal. Today the two checks
 /// are the same and a key one side holds always passes the other; the conversion still returns the
 /// refusal rather than assume that, so a key from the wire can never reach a panic here.
+///
+/// A [`NodeId`] carries its suite and a [`VerifyKey`] is ed25519 only, so both methods match on the
+/// suite with no catch-all arm: a second [`CryptoKind`] fails to compile here until its arm is written,
+/// and that arm refuses, since a key of another suite is never an ed25519 key whatever its bytes.
 pub trait AsVerifyKey {
     /// This identity as a nauthy [`VerifyKey`] (the type caps root at and gates admit), or nauthy's reason
     /// the bytes are not a usable key.
     fn verify_key(&self) -> Result<VerifyKey, nauthy::KeyError>;
+
+    /// Whether this identity and `key` name the same key: the suite is ed25519 and the 32 bytes match.
+    ///
+    /// Infallible, so a compare never has to decide what a failed conversion means. Both sides already
+    /// passed their own check to exist, so the bytes compare as they are, with no check re-run.
+    fn same_key(&self, key: &VerifyKey) -> bool;
 }
 
 impl AsVerifyKey for NodeId {
     fn verify_key(&self) -> Result<VerifyKey, nauthy::KeyError> {
-        VerifyKey::try_new(*self.key())
+        match self.kind() {
+            CryptoKind::Ed25519 => VerifyKey::try_new(*self.key()),
+        }
+    }
+
+    fn same_key(&self, key: &VerifyKey) -> bool {
+        match self.kind() {
+            CryptoKind::Ed25519 => self.key() == key.bytes(),
+        }
     }
 }
 

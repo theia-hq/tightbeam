@@ -1,11 +1,12 @@
-//! Unit tests for the persisted identity: fail-closed load, mint-on-absence, and a write that never
-//! replaces a different key.
+//! Unit tests for the persisted identity: fail-closed load, mint-on-absence, a write that never
+//! replaces a different key, and the bridge between a `NodeId` and a `VerifyKey`.
 
 use std::path::{Path, PathBuf};
 
+use bifrost::{CryptoKind, NodeId};
 use keystore::{Error, FormatError};
 
-use crate::identity::{IdentityError, load, write};
+use crate::identity::{AsVerifyKey as _, IdentityError, load, write};
 
 /// A unique directory under the system temp root, removed on drop even when an assertion fails.
 struct TempDir(PathBuf);
@@ -315,4 +316,45 @@ async fn a_fresh_key_directory_is_owner_only() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o700, "the key's directory is owner-only");
+}
+
+/// The public key of `seed`, named on nauthy's side from the secret itself, so the bridge is checked
+/// against a key it did not produce.
+fn verify_key_of(seed: &[u8; 32]) -> nauthy::VerifyKey {
+    nauthy::Identity::from_secret(seed)
+        .expect("a seed is a secret")
+        .verifying_key()
+}
+
+/// A `NodeId` and the `VerifyKey` of the same secret are the same key.
+#[test]
+fn same_key_matches_the_same_bytes() {
+    let seed = [7u8; 32];
+    let id = NodeId::from_ed25519_secret(&seed);
+    assert!(id.same_key(&verify_key_of(&seed)));
+}
+
+/// A `NodeId` is not the same key as a `VerifyKey` of other bytes.
+///
+/// `CryptoKind` has one suite, so a `NodeId` of another suite cannot be built to test the suite half.
+/// That half is checked by the compiler instead: `same_key` matches on the suite with no catch-all, so a
+/// second suite does not build until its arm is written.
+#[test]
+fn same_key_refuses_another_suite() {
+    let id = NodeId::from_ed25519_secret(&[7u8; 32]);
+    assert!(!id.same_key(&verify_key_of(&[8u8; 32])));
+}
+
+/// Only an ed25519 `NodeId` converts to a `VerifyKey`, and to the key of the same bytes.
+///
+/// `CryptoKind` has one suite, so a `NodeId` of another suite cannot be built. The match below names
+/// every suite with no catch-all, so a second suite does not build until it is given its expectation
+/// here: that its `NodeId` is refused.
+#[test]
+fn a_node_id_of_another_suite_is_not_a_verify_key() {
+    let seed = [7u8; 32];
+    let id = NodeId::from_ed25519_secret(&seed);
+    match id.kind() {
+        CryptoKind::Ed25519 => assert_eq!(id.verify_key(), Ok(verify_key_of(&seed))),
+    }
 }
