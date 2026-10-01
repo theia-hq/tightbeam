@@ -14,7 +14,8 @@ use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::{Connector, MAX_PIPES, PortForward};
+use super::{ConnectionLost, Connector, MAX_PIPES, PortForward};
+use crate::protocol::{Request, Response};
 use crate::tunnel::CancellationToken;
 use crate::tunnel::fixtures::{prove, services, svc};
 use crate::tunnel::router::{PublicRequest, PublicUnsafeRequest};
@@ -265,4 +266,38 @@ async fn connections_waiting_for_a_stream_stay_within_the_cap() {
             }
         })
         .await;
+}
+
+#[tokio::test]
+async fn a_forward_ends_with_an_error_when_the_host_ends_its_session() {
+    let host = Node::new(MemTransport::bind(), NoDiscovery);
+    let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+    // The host admits the forward's probe and holds the session open until the forward is ready.
+    let admits = async {
+        let session = host.accept().await.unwrap();
+        let (mut writer, mut reader) = session.accept_bi().await.unwrap();
+        Request::read(&mut reader).await.unwrap();
+        Response::Ok.write(&mut writer).await.unwrap();
+        session
+    };
+    let preflight = Connector::to_node(host.node_id(), svc("demo"), None).preflight(&consumer, 0);
+    let (session, forward) = tokio::join!(admits, preflight);
+    let forward = forward.expect("the host admits the forward");
+
+    // The host ends the session with no local connection in flight: the forward must end with it, not
+    // keep listening on a port whose every stream would fail to open.
+    session.close();
+    let error = tokio::time::timeout(WITHIN, forward.run())
+        .await
+        .expect("the forward ended when its session did")
+        .expect_err("a forward whose session ended is an error");
+    assert!(
+        error.downcast_ref::<ConnectionLost>().is_some(),
+        "the forward names the lost connection: {error:#}"
+    );
+    assert_eq!(
+        format!("{error:#}"),
+        "connection lost: transport closed",
+        "the transport's cause follows the line"
+    );
 }

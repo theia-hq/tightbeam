@@ -49,7 +49,11 @@ mod peer_tests;
 #[cfg(test)]
 mod protocol_tests;
 
+use std::io::Read as _;
+use std::sync::{Arc, Mutex, PoisonError};
+
 use tokio::io::{self, AsyncWriteExt as _};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 /// Copy bytes both ways between a local duplex stream and a bifrost stream until both sides close.
 ///
@@ -93,24 +97,28 @@ where
 }
 
 /// Pump this process's stdio against a peer service stream for a ProxyCommand-shaped bridge (piping the
-/// service to this process's stdout), finishing as soon as the PEER closes its write half.
+/// service to this process's stdout), finishing as soon as the stream from the PEER ends or errors.
 ///
-/// The asymmetry is the whole point, and the fix for the hang a stdio bridge otherwise takes when its local
-/// stdin never reaches EOF (a bridge whose stdin is an interactive terminal). A symmetric wait-for-both pump
-/// ([`splice_halves`]) would park forever after the remote command exits (the remote closes its write half,
-/// but local stdin stays open). A stdio bridge is done when the SERVICE is done: when the peer half-closes
-/// (its command exited, or an interactive session ended), copy any final bytes to stdout, then return,
-/// rather than waiting on a stdin that will never close. The local-to-peer copy runs concurrently and is
-/// dropped on return (its writer is shut down first, so the peer sees a clean close).
+/// The asymmetry is the whole point. A symmetric wait-for-both pump ([`splice_halves`]) would park forever
+/// after the remote command exits (the remote closes its write half, but local stdin, an interactive
+/// terminal, stays open). A stdio bridge is done when the SERVICE is done: when the peer half-closes (its
+/// command exited, an interactive session ended) or its session ends (the host closed it, or the network
+/// path to it failed), copy any final bytes to stdout, then return, whatever stdin is doing. stdin is read
+/// on its own thread (see [`stdin_chunks`]), so nothing waits on a read that only returns on the next
+/// keystroke.
 pub(crate) async fn pipe_stdio_bridge<W, R>(mut writer: W, mut reader: R) -> io::Result<()>
 where
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
-    let mut local_in = io::stdin();
+    // Held for the whole run: a concurrent bridge waits here for this one to end, and the chunks are never
+    // split between two.
+    let mut input = stdin_chunks()?.lock_owned().await;
     let mut local_out = io::stdout();
     let upstream = async {
-        io::copy(&mut local_in, &mut writer).await?;
+        while let Some(chunk) = input.recv().await {
+            writer.write_all(&chunk?).await?;
+        }
         writer.shutdown().await
     };
     let downstream = async {
@@ -118,16 +126,64 @@ where
         local_out.flush().await
     };
     tokio::select! {
-        // The peer closed (remote command exited / session ended): the service is done, so return without
-        // waiting on local stdin (which, at a terminal, never EOFs). This is what keeps a reached command
-        // from hanging the bridge open after it exits.
+        // The peer's half ended or failed: the service is done, so return. The stdin pump is dropped,
+        // never awaited; a chunk its thread reads from here on waits for the next bridge.
         result = downstream => result,
-        // Local stdin closed first (a piped, finite input): half-close toward the peer, then keep draining
-        // the peer's remaining output to stdout so nothing it still had to say is lost.
+        // Local stdin closed first (a piped, finite input), or the write toward the peer failed. A clean
+        // end half-closes toward the peer, then the peer's remaining output still drains to stdout so
+        // nothing it still had to say is lost.
         result = upstream => {
             result?;
             io::copy(&mut reader, &mut local_out).await?;
             local_out.flush().await
         }
     }
+}
+
+/// Chunks of this process's stdin, as [`stdin_chunks`] hands them out.
+type StdinChunks = Arc<AsyncMutex<mpsc::Receiver<io::Result<Vec<u8>>>>>;
+
+/// This process's stdin, read on one thread for the life of the process and handed over in chunks; the
+/// channel closes at the end of input or after a read error. The first call starts the thread; every
+/// bridge after it locks the same channel.
+///
+/// Not tokio's stdin: that reads on the runtime's blocking pool, and the runtime waits for every blocking
+/// read before it shuts down, so a process whose bridge has ended would hang until the next keystroke.
+/// The thread is never joined: a read it is parked in ends with the process.
+///
+/// One reader per process, never one per bridge: a thread left parked by an ended bridge holds stdin's
+/// lock, so a thread per bridge would read the next chunk for a bridge that is gone and drop it. With one,
+/// a chunk read after a bridge ends waits in the channel for the next one.
+fn stdin_chunks() -> io::Result<StdinChunks> {
+    static STDIN: Mutex<Option<StdinChunks>> = Mutex::new(None);
+    // Nothing under this lock panics, so a poisoned one still holds a sound value.
+    let mut stdin = STDIN.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(chunks) = &*stdin {
+        return Ok(Arc::clone(chunks));
+    }
+    // One chunk in flight: the reader waits for the stream to take a chunk before reading the next, so a
+    // slow peer holds back stdin rather than this process buffering it.
+    let (sender, receiver) = mpsc::channel(1);
+    std::thread::Builder::new()
+        .name("stdin".to_owned())
+        .spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut buffer = vec![0_u8; 16 * 1024];
+            loop {
+                let chunk = match stdin.read(&mut buffer) {
+                    Ok(0) => return,
+                    Ok(read) => Ok(buffer[..read].to_vec()),
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => Err(error),
+                };
+                let failed = chunk.is_err();
+                // The receiver lives in a static, so a send fails only as the process exits.
+                if sender.blocking_send(chunk).is_err() || failed {
+                    return;
+                }
+            }
+        })?;
+    let chunks = Arc::new(AsyncMutex::new(receiver));
+    *stdin = Some(Arc::clone(&chunks));
+    Ok(chunks)
 }

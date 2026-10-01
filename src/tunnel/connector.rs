@@ -9,8 +9,8 @@ use core::time::Duration;
 
 use bifrost::{ConnInfo, Discovery, Node, NodeId, PeerProven, Refusal, Session, Transport};
 use eyre::WrapErr as _;
-use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
+use futures::{FutureExt as _, StreamExt as _};
 use nauthy::{Link, Service};
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
@@ -147,6 +147,11 @@ impl Connector {
     /// Reach the service over one stream and pipe it against this process's stdin/stdout (a
     /// ProxyCommand-shaped bridge: the peer service is carried to this process's stdout while local stdin is
     /// pumped to the peer). The pump finishes when the peer closes, so a reached command exits when it does.
+    ///
+    /// The first call starts one reader on this process's stdin, and every later call shares it. A later
+    /// call gets every byte written after the earlier one ended; a call made while another runs waits for
+    /// it to end. After the first call, read stdin only through this method: a read through
+    /// `std::io::stdin` or tokio's stdin waits until stdin closes.
     pub async fn pipe_stdio<T: Transport, D: Discovery>(
         self,
         node: &Node<T, D>,
@@ -326,15 +331,25 @@ const MAX_PIPES: usize = 128;
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
 impl<S: Session> PortForward<S> {
-    /// Forward each accepted TCP connection over its own stream. Runs until cancelled; prints nothing.
+    /// Forward each accepted TCP connection over its own stream, until the session ends; prints nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectionLost`] once the session ends (the host closed it, or the network path to it failed); every
+    /// connection the forward carried has ended with it.
     pub async fn run(self) -> eyre::Result<()> {
         let mut pipes = FuturesUnordered::new();
+        let closed = self.session.wait_closed();
+        tokio::pin!(closed);
         // Set after a failed accept: accepting resumes once `retry` fires.
         let retry = tokio::time::sleep(Duration::ZERO);
         tokio::pin!(retry);
         let mut paused = false;
         loop {
             tokio::select! {
+                // The session is gone: no stream can open on it again, so the forward is over. Without
+                // this arm the listener would keep accepting connections that could only fail.
+                () = &mut closed => return Err(ConnectionLost::of(&self.session).into()),
                 () = &mut retry, if paused => paused = false,
                 // Accept only below the cap: a connection waiting for a stream holds a descriptor, so
                 // past the cap new connections stay in the kernel's backlog instead of piling up here.
@@ -366,6 +381,26 @@ impl<S: Session> PortForward<S> {
                 }
             }
         }
+    }
+}
+
+/// The session a [`PortForward`] runs on has ended: the host closed it, or the network path to it failed.
+///
+/// The source, when there is one, is the transport's own cause.
+#[derive(Debug, thiserror::Error)]
+#[error("connection lost")]
+pub struct ConnectionLost(#[source] Option<Box<dyn core::error::Error + Send + Sync>>);
+
+impl ConnectionLost {
+    /// Why `session` ended, in the transport's own words: an open on a closed session fails with the cause
+    /// the session closed with. Asked once and never awaited: the cause only adds detail, and a transport
+    /// whose open waits on a dead session must not hold the forward open after it.
+    fn of<S: Session>(session: &S) -> Self {
+        Self(match session.open_bi().now_or_never() {
+            Some(Err(bifrost::Error::Stream(cause))) => Some(cause),
+            Some(Err(other)) => Some(Box::new(other)),
+            Some(Ok(_)) | None => None,
+        })
     }
 }
 
