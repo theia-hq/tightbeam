@@ -148,9 +148,10 @@ impl Connector {
     /// ProxyCommand-shaped bridge: the peer service is carried to this process's stdout while local stdin is
     /// pumped to the peer). The pump finishes when the peer closes, so a reached command exits when it does.
     ///
-    /// The first call hands this process's stdin to the bridge for the life of the process: a later call
-    /// gets every byte written after the earlier one ended, and nothing else in the process should read
-    /// stdin after the first call.
+    /// The first call starts one reader on this process's stdin, and every later call shares it. A later
+    /// call gets every byte written after the earlier one ended; a call made while another runs waits for
+    /// it to end. After the first call, read stdin only through this method: a read through
+    /// `std::io::stdin` or tokio's stdin waits until stdin closes.
     pub async fn pipe_stdio<T: Transport, D: Discovery>(
         self,
         node: &Node<T, D>,
