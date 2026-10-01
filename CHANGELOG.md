@@ -7,6 +7,8 @@ All notable changes to tightbeam, newest first.
 One denylist holds revoked caps and revoked keys, and a revoked key ends a live session.
 
 ### Breaking
+- **`PortForward::run` returns `ConnectionLost` when the session ends**, instead of running until
+  cancelled. Every connection it carried has ended with it.
 - **`config::disabled_roots_path` is gone, and `~/.config/tightbeam/disabled_roots` is no longer read.**
   `~/.config/tightbeam/revoked` holds revoked keys beside revoked caps.
 - **`LiveCuts` is implemented for nauthy's `Denylist`**, in place of `FileDenylist` and `Latch`.
@@ -17,6 +19,8 @@ One denylist holds revoked caps and revoked keys, and a revoked key ends a live 
 ### Fixed
 - **A revoked key ends a live session at the next sweep**, whether its peer proved that key or it issued a
   cap the session was admitted on.
+- **`connect` exits when the host ends the session**, both as a port forward and with `--to -`, even
+  while stdin is an open terminal. It used to wait for the next keystroke.
 
 ## v0.18.0
 
