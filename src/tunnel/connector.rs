@@ -326,15 +326,25 @@ const MAX_PIPES: usize = 128;
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
 impl<S: Session> PortForward<S> {
-    /// Forward each accepted TCP connection over its own stream. Runs until cancelled; prints nothing.
+    /// Forward each accepted TCP connection over its own stream, until the session ends; prints nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectionLost`] once the session ends (the host closed it, or the path to it failed); every
+    /// connection the forward carried has ended with it.
     pub async fn run(self) -> eyre::Result<()> {
         let mut pipes = FuturesUnordered::new();
+        let closed = self.session.wait_closed();
+        tokio::pin!(closed);
         // Set after a failed accept: accepting resumes once `retry` fires.
         let retry = tokio::time::sleep(Duration::ZERO);
         tokio::pin!(retry);
         let mut paused = false;
         loop {
             tokio::select! {
+                // The session is gone: no stream can open on it again, so the forward is over. Without
+                // this arm the listener would keep accepting connections that could only fail.
+                () = &mut closed => return Err(ConnectionLost::of(&self.session).await.into()),
                 () = &mut retry, if paused => paused = false,
                 // Accept only below the cap: a connection waiting for a stream holds a descriptor, so
                 // past the cap new connections stay in the kernel's backlog instead of piling up here.
@@ -366,6 +376,25 @@ impl<S: Session> PortForward<S> {
                 }
             }
         }
+    }
+}
+
+/// The session a [`PortForward`] rode on has ended: the host closed it, or the path to it failed.
+///
+/// The source, when there is one, is the transport's own cause.
+#[derive(Debug, thiserror::Error)]
+#[error("connection lost")]
+pub struct ConnectionLost(#[source] Option<Box<dyn core::error::Error + Send + Sync>>);
+
+impl ConnectionLost {
+    /// Why `session` ended, in the transport's own words: an open on a closed session fails with the cause
+    /// the session closed with.
+    async fn of<S: Session>(session: &S) -> Self {
+        Self(match session.open_bi().await {
+            Err(bifrost::Error::Stream(cause)) => Some(cause),
+            Err(other) => Some(Box::new(other)),
+            Ok(_) => None,
+        })
     }
 }
 
