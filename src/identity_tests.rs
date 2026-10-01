@@ -1,12 +1,13 @@
 //! Unit tests for the persisted identity: fail-closed load, mint-on-absence, a write that never
-//! replaces a different key, and the bridge between a `NodeId` and a `VerifyKey`.
+//! replaces a different key, the bridge between a `NodeId` and a `VerifyKey`, and a locked file's key
+//! as a `NodeId`.
 
 use std::path::{Path, PathBuf};
 
 use bifrost::{CryptoKind, NodeId};
 use keystore::{Error, FormatError};
 
-use crate::identity::{AsVerifyKey as _, IdentityError, load, write};
+use crate::identity::{AsNodeId as _, AsVerifyKey as _, IdentityError, load, write};
 
 /// A unique directory under the system temp root, removed on drop even when an assertion fails.
 struct TempDir(PathBuf);
@@ -356,5 +357,52 @@ fn an_ed25519_node_id_converts_to_its_own_verify_key() {
     let id = NodeId::from_ed25519_secret(&seed);
     match id.kind() {
         CryptoKind::Ed25519 => assert_eq!(id.verify_key(), Ok(verify_key_of(&seed))),
+    }
+}
+
+/// A sealed file whose header claims a real key converts to the `NodeId` of the seed it seals.
+#[test]
+fn a_locked_files_key_converts_to_its_node_id() {
+    let dir = TempDir::new("locked-key");
+    let path = dir.key();
+    let seed = [7u8; 32];
+    seal_device_key(&path, &seed);
+
+    let claimed = locked_public_key(&path);
+    assert_eq!(claimed.node_id(), Ok(NodeId::from_ed25519_secret(&seed)));
+}
+
+/// A sealed file whose header claims bytes no ed25519 key can be is refused at the conversion, with
+/// bifrost's reason, rather than becoming a `NodeId`.
+#[test]
+fn a_locked_files_malformed_key_is_refused() {
+    let dir = TempDir::new("locked-malformed");
+    let path = dir.key();
+    seal_device_key(&path, &[7u8; 32]);
+    // The header's public key sits at bytes 10..42 of a sealed file (keystore's frozen layout:
+    // signature 8, version 1, kind 1). Nothing checks it before an unlock, so a forged claim loads.
+    let mut bytes = std::fs::read(&path).expect("read the sealed file");
+    bytes[10..42].copy_from_slice(&[2u8; 32]);
+    std::fs::write(&path, &bytes).expect("forge the header");
+
+    let claimed = locked_public_key(&path);
+    assert_eq!(claimed.node_id(), Err(bifrost::KeyError::NotOnCurve));
+}
+
+/// Seal `seed` as a device key at `path` under a throwaway passphrase.
+fn seal_device_key(path: &Path, seed: &[u8; 32]) {
+    let passphrase =
+        keystore::Passphrase::new(zeroize::Zeroizing::new(b"hunter2".to_vec())).expect("non-empty");
+    let secret = keystore::Secret::take(&mut { *seed });
+    keystore::KeyFile::device(path)
+        .write(&secret, keystore::Protection::Passphrase(&passphrase))
+        .expect("seal a key");
+}
+
+/// The public key the sealed device key file at `path` claims, read without unlocking.
+fn locked_public_key(path: &Path) -> keystore::PublicKey {
+    match keystore::KeyFile::device(path).load() {
+        Ok(Some(keystore::Stored::Locked(locked))) => locked.public_key(),
+        other => panic!("expected a locked key file, got {other:?}"),
     }
 }

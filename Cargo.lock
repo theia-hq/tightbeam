@@ -2004,12 +2004,12 @@ dependencies = [
 
 [[package]]
 name = "keystore"
-version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=a4eaaa7ad9bb7d50c8f7576965334f069dba52ce#a4eaaa7ad9bb7d50c8f7576965334f069dba52ce"
+version = "0.1.0"
+source = "git+https://github.com/theia-hq/keystore?tag=v0.1.0#70faffa51afbc6d9b219da173d43311a9cd3e8c4"
 dependencies = [
  "argon2",
- "bifrost-core",
  "chacha20poly1305",
+ "ed25519-dalek 2.2.0",
  "getrandom 0.4.3",
  "icu_normalizer",
  "libc",
