@@ -67,7 +67,8 @@ impl AsVerifyKey for NodeId {
     }
 }
 
-/// The other direction: a [`VerifyKey`] back to the bifrost [`NodeId`] a peer is dialed at.
+/// The other direction: a key named by another crate back to the bifrost [`NodeId`] a peer is dialed
+/// at.
 pub trait AsNodeId {
     /// This key as a bifrost [`NodeId`], tagged ed25519 (the only suite these keys carry), or bifrost's
     /// reason the bytes are not a usable identity.
@@ -75,6 +76,16 @@ pub trait AsNodeId {
 }
 
 impl AsNodeId for VerifyKey {
+    fn node_id(&self) -> Result<NodeId, bifrost::KeyError> {
+        NodeId::try_new(CryptoKind::Ed25519, *self.bytes())
+    }
+}
+
+// keystore's public key is bare bytes with no curve check, and the one that needs this conversion is
+// a sealed file's header claim, which anyone who can write the file can set to anything. So the
+// conversion runs bifrost's check and returns its refusal, never a `NodeId` the bytes cannot be. A key
+// computed from a seed in hand needs no such check and does not come through here.
+impl AsNodeId for keystore::PublicKey {
     fn node_id(&self) -> Result<NodeId, bifrost::KeyError> {
         NodeId::try_new(CryptoKind::Ed25519, *self.bytes())
     }
