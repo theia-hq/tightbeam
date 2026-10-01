@@ -46,12 +46,12 @@ pub trait AsVerifyKey {
 
     /// Whether this identity and `key` name the same key: the suite is ed25519 and the 32 bytes match.
     ///
-    /// Never fails: both sides were checked when built, so it compares bytes and re-runs no check.
+    /// Never fails: it compares bytes and runs no key check.
     fn same_key(&self, key: &VerifyKey) -> bool;
 }
 
-// A [`NodeId`] carries its suite and a [`VerifyKey`] is ed25519 only, so both methods match on the
-// suite with no catch-all arm: a second [`CryptoKind`] fails to compile here until its arm is written,
+// A `NodeId` carries its suite and a `VerifyKey` is ed25519 only, so both methods match on the
+// suite with no catch-all arm: a second `CryptoKind` fails to compile here until its arm is written,
 // and that arm refuses, since a key of another suite is never an ed25519 key whatever its bytes.
 impl AsVerifyKey for NodeId {
     fn verify_key(&self) -> Result<VerifyKey, nauthy::KeyError> {
