@@ -1048,6 +1048,10 @@ impl bifrost::Session for Closing {
             .store(true, core::sync::atomic::Ordering::SeqCst);
     }
 
+    fn conn_info(&self) -> bifrost::ConnInfo {
+        self.inner.conn_info()
+    }
+
     fn path_changes(&self) -> bifrost::PathChanges {
         self.inner.path_changes()
     }

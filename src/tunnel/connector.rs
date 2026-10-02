@@ -479,7 +479,8 @@ impl ConnectionLost {
 /// S::Read`), so the handshake writes/reads on those exact halves and hands them back untouched: zero
 /// boxing, and the wrapped protocol sees the same concrete stream types it would over a raw session.
 /// `peer`/`conn_info`/`path_changes`/`wait_closed` delegate to the inner session (so a caller still reads
-/// the settled path and hears it move); `accept_bi` is refused, because a service client never accepts peer-opened streams.
+/// the current path and each change to it); `accept_bi` is refused, because a service client never
+/// accepts peer-opened streams.
 pub struct ServiceSession<S> {
     session: S,
     /// The dial this session was reached for: every stream sends its request through
