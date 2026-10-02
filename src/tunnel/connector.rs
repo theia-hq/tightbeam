@@ -201,16 +201,16 @@ impl Connector {
     /// admitted on its own request. Every [`ServiceSession`] stream opens through this method, so it sends
     /// the same request as a stream opened here.
     ///
-    /// The host ends a session when any grant presented on it is recalled or expires, so streams that
-    /// share a session share that end.
+    /// A host can end the session, and every stream on it, when a grant one of its streams was admitted
+    /// on expires or is revoked.
     ///
     /// # Errors
     ///
     /// [`bifrost::Error::Stream`] carrying [`WrongPeer`] when `session` reaches a peer other than the one
     /// this connector dials; nothing is sent. [`bifrost::Error::Refused`] with the host's typed [`Refusal`]
-    /// when the host does not admit the stream. Any other failure (the stream would not open, a credential presented on a session that does
-    /// not prove the peer, a broken reply) is the session's own error or [`bifrost::Error::Stream`]
-    /// carrying the cause.
+    /// when the host does not admit the stream. Any other failure (the stream would not open, a credential
+    /// presented on a session that does not prove the peer, a broken reply) is the session's own error or
+    /// [`bifrost::Error::Stream`] carrying the cause.
     pub async fn open_on<S: Session>(
         &self,
         session: &S,
