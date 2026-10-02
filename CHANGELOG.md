@@ -13,6 +13,8 @@ One denylist holds revoked caps and revoked keys, and a revoked key ends a live 
   `~/.config/tightbeam/revoked` holds revoked keys beside revoked caps.
 - **`LiveCuts` is implemented for nauthy's `Denylist`**, in place of `FileDenylist` and `Latch`.
 - **Built on unreleased nauthy (after 0.11.0)**, for its one `Denylist`.
+- **Built on unreleased bifrost (da370ee)**, where `Session::path_changes` is required and `Path` and
+  `ConnInfo` are no longer `Copy`. `ServiceSession` forwards its session's `path_changes`.
 - **`AsVerifyKey` has a new required method, `same_key(&key)`**, true when the identity and `key` are the
   same key: both ed25519, same 32 bytes. An implementor outside tightbeam must add it.
 

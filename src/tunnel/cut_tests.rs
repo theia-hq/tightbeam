@@ -1047,6 +1047,10 @@ impl bifrost::Session for Closing {
         self.closed
             .store(true, core::sync::atomic::Ordering::SeqCst);
     }
+
+    fn path_changes(&self) -> bifrost::PathChanges {
+        self.inner.path_changes()
+    }
 }
 
 #[tokio::test]

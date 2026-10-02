@@ -245,7 +245,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "bifrost"
 version = "0.8.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=00570a3c4f310c00521ce6b3ba6a113d4ac12036#00570a3c4f310c00521ce6b3ba6a113d4ac12036"
+source = "git+https://github.com/theia-hq/bifrost?rev=da370eeff9722ffa32111813b8db91e4e1fd925c#da370eeff9722ffa32111813b8db91e4e1fd925c"
 dependencies = [
  "bifrost-core",
  "bifrost-transport",
@@ -255,21 +255,23 @@ dependencies = [
 [[package]]
 name = "bifrost-core"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=00570a3c4f310c00521ce6b3ba6a113d4ac12036#00570a3c4f310c00521ce6b3ba6a113d4ac12036"
+source = "git+https://github.com/theia-hq/bifrost?rev=da370eeff9722ffa32111813b8db91e4e1fd925c#da370eeff9722ffa32111813b8db91e4e1fd925c"
 dependencies = [
  "data-encoding",
  "ed25519-dalek 2.2.0",
  "futures-core",
  "thiserror 2.0.20",
+ "url",
 ]
 
 [[package]]
 name = "bifrost-iroh"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=00570a3c4f310c00521ce6b3ba6a113d4ac12036#00570a3c4f310c00521ce6b3ba6a113d4ac12036"
+source = "git+https://github.com/theia-hq/bifrost?rev=da370eeff9722ffa32111813b8db91e4e1fd925c#da370eeff9722ffa32111813b8db91e4e1fd925c"
 dependencies = [
  "bifrost-core",
  "bifrost-transport",
+ "futures-core",
  "iroh",
  "thiserror 2.0.20",
  "tokio",
@@ -280,7 +282,7 @@ dependencies = [
 [[package]]
 name = "bifrost-mdns"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=00570a3c4f310c00521ce6b3ba6a113d4ac12036#00570a3c4f310c00521ce6b3ba6a113d4ac12036"
+source = "git+https://github.com/theia-hq/bifrost?rev=da370eeff9722ffa32111813b8db91e4e1fd925c#da370eeff9722ffa32111813b8db91e4e1fd925c"
 dependencies = [
  "bifrost-core",
  "blake3",
@@ -298,7 +300,7 @@ dependencies = [
 [[package]]
 name = "bifrost-mem"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=00570a3c4f310c00521ce6b3ba6a113d4ac12036#00570a3c4f310c00521ce6b3ba6a113d4ac12036"
+source = "git+https://github.com/theia-hq/bifrost?rev=da370eeff9722ffa32111813b8db91e4e1fd925c#da370eeff9722ffa32111813b8db91e4e1fd925c"
 dependencies = [
  "bifrost-core",
  "bifrost-transport",
@@ -309,7 +311,7 @@ dependencies = [
 [[package]]
 name = "bifrost-transport"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=00570a3c4f310c00521ce6b3ba6a113d4ac12036#00570a3c4f310c00521ce6b3ba6a113d4ac12036"
+source = "git+https://github.com/theia-hq/bifrost?rev=da370eeff9722ffa32111813b8db91e4e1fd925c#da370eeff9722ffa32111813b8db91e4e1fd925c"
 dependencies = [
  "bifrost-core",
  "tokio",
@@ -318,7 +320,7 @@ dependencies = [
 [[package]]
 name = "bifrost-wire"
 version = "0.0.0"
-source = "git+https://github.com/theia-hq/bifrost?rev=00570a3c4f310c00521ce6b3ba6a113d4ac12036#00570a3c4f310c00521ce6b3ba6a113d4ac12036"
+source = "git+https://github.com/theia-hq/bifrost?rev=da370eeff9722ffa32111813b8db91e4e1fd925c#da370eeff9722ffa32111813b8db91e4e1fd925c"
 dependencies = [
  "blake3",
  "thiserror 2.0.20",
@@ -3817,6 +3819,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
  "zeroize",
 ]
 

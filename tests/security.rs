@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 
 use bifrost::{
-    Addr, Announced, ConnInfo, Error, NoDiscovery, Node, NodeId, PeerProof, Sealed,
+    Addr, Announced, ConnInfo, Error, NoDiscovery, Node, NodeId, PathChanges, PeerProof, Sealed,
     SecurityProfile, Session, Transport,
 };
 use bifrost_mem::MemTransport;
@@ -116,6 +116,10 @@ impl<S: Session, P: SecurityProfile> Session for ProfiledSession<S, P> {
 
     fn conn_info(&self) -> ConnInfo {
         self.inner.conn_info()
+    }
+
+    fn path_changes(&self) -> PathChanges {
+        self.inner.path_changes()
     }
 }
 

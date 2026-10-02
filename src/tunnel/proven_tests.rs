@@ -7,7 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use bifrost::{
-    Announced, ChannelProtection, NoDiscovery, Node, NodeId, PeerProof, Refusal, Security, Session,
+    Announced, ChannelProtection, NoDiscovery, Node, NodeId, Path, PathChanges, PeerProof, Refusal,
+    Security, Session,
 };
 use bifrost_mem::MemTransport;
 use nauthy::{Cap, Gate, Identity, Origin, ProvenPeer, Revocations, VerifyKey};
@@ -220,6 +221,11 @@ impl Session for AnnouncedSession {
     async fn wait_closed(&self) {}
 
     fn close(&self) {}
+
+    /// Matches `conn_info`'s default: a double has no path to report.
+    fn path_changes(&self) -> PathChanges {
+        PathChanges::fixed(Path::Unknown)
+    }
 }
 
 /// A peer that only announced its key never reaches a proven-only route, even one that knows the key it
