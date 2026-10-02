@@ -86,7 +86,8 @@ non-granting token, an unauthorized identity) surfaces as an error from that cal
 reason, not as a silently reset connection later. Two other shapes reach the same service differently:
 `pipe_stdio` streams it over this process's stdin and stdout instead of binding a port (the shape an ssh
 `ProxyCommand` wants), and `open_service` returns a `ServiceSession` whose every stream rides the gate, so
-any protocol generic over a bifrost session runs over the tunnel unchanged.
+any protocol generic over a bifrost session runs over the tunnel unchanged. `open_on` opens one such
+stream on a session you already hold, so one session can carry several services.
 
 ## Serve services behind a gate
 

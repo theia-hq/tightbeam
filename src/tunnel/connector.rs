@@ -185,15 +185,15 @@ impl Connector {
     /// Opens a stream on `session`, sends this connector's request, and returns the halves only when the
     /// host admits it. The session is borrowed, never dialed, stored or closed here: whoever holds it decides
     /// how long it lives, so one session to a peer can carry a stream to each of several services, each
-    /// admitted on its own request. This is the one client handshake; every [`ServiceSession`] stream runs
-    /// through it.
+    /// admitted on its own request. Every [`ServiceSession`] stream opens through this method, so it sends
+    /// the same request as a stream opened here.
     ///
     /// # Errors
     ///
     /// [`bifrost::Error::Refused`] with the host's typed [`Refusal`] when the host does not admit the
-    /// stream. Any other failure (the stream would not open, a credential over a session whose declared
-    /// profile does not prove the peer, a broken reply) is the session's own error or
-    /// [`bifrost::Error::Stream`] carrying the cause.
+    /// stream. Any other failure (the stream would not open, a credential presented on a session that does
+    /// not prove the peer, a broken reply) is the session's own error or [`bifrost::Error::Stream`]
+    /// carrying the cause.
     pub async fn open_on<S: Session>(
         &self,
         session: &S,
