@@ -7,14 +7,14 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 use std::sync::Arc;
 
-use bifrost::{ConnInfo, NoDiscovery, Node, NodeId, Session};
+use bifrost::{ConnInfo, NoDiscovery, Node, NodeId, Path, PathChanges, Relay, Session};
 use bifrost_mem::MemTransport;
 use nauthy::Gate;
 use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::{ConnectionLost, Connector, MAX_PIPES, PortForward};
+use super::{ConnectionLost, Connector, MAX_PIPES, PortForward, ServiceSession};
 use crate::protocol::{Request, Response};
 use crate::tunnel::CancellationToken;
 use crate::tunnel::fixtures::{prove, services, svc};
@@ -111,6 +111,10 @@ impl<S: Session> Session for Capped<S> {
 
     fn conn_info(&self) -> ConnInfo {
         self.session.conn_info()
+    }
+
+    fn path_changes(&self) -> PathChanges {
+        self.session.path_changes()
     }
 }
 
@@ -300,4 +304,57 @@ async fn a_forward_ends_with_an_error_when_the_host_ends_its_session() {
         "connection lost: transport closed",
         "the transport's cause follows the line"
     );
+}
+
+/// A session whose path moves from a relay to direct, the change a hole punch makes. It answers with two
+/// items, which no `PathChanges::fixed` can, so a wrapper that answers for itself is told apart from one
+/// that forwards. It carries no streams.
+struct Moving {
+    peer: NodeId,
+}
+
+impl Session for Moving {
+    type Security = bifrost::Announced;
+    type Write = Vec<u8>;
+    type Read = &'static [u8];
+
+    fn peer(&self) -> NodeId {
+        self.peer
+    }
+
+    async fn open_bi(&self) -> Result<(Self::Write, Self::Read), bifrost::Error> {
+        Err(bifrost::Error::Closed)
+    }
+
+    async fn accept_bi(&self) -> Result<(Self::Write, Self::Read), bifrost::Error> {
+        Err(bifrost::Error::Closed)
+    }
+
+    async fn wait_closed(&self) {}
+
+    /// A double that carries nothing has nothing to end.
+    fn close(&self) {}
+
+    fn path_changes(&self) -> PathChanges {
+        PathChanges::new(futures::stream::iter([relayed(), Path::Direct]))
+    }
+}
+
+/// A relayed path through a fixed relay.
+fn relayed() -> Path {
+    let url = url::Url::parse("https://relay.example/").expect("a valid url");
+    Path::Relayed(Relay::from(url))
+}
+
+#[tokio::test]
+async fn a_service_session_reports_its_sessions_path_changes() {
+    use futures::StreamExt as _;
+
+    let peer = NodeId::from_ed25519_secret(&[7u8; 32]);
+    let session = ServiceSession {
+        session: Moving { peer },
+        connector: Connector::to_node(peer, svc("demo"), None),
+    };
+    let heard: Vec<Path> = session.path_changes().collect().await;
+    assert_eq!(heard, [relayed(), Path::Direct]);
 }

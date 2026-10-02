@@ -1,8 +1,8 @@
 use core::marker::PhantomData;
 
 use bifrost::{
-    Announced, Error, InProcess, NodeId, PeerProof, Refusal, RefusalDetail, Sealed,
-    SecurityProfile, Session,
+    Announced, Error, InProcess, NodeId, Path, PathChanges, PeerProof, Refusal, RefusalDetail,
+    Sealed, SecurityProfile, Session,
 };
 
 use crate::protocol::{Request, RequestReadError, RequestWriteError, Response};
@@ -33,6 +33,11 @@ impl<P: SecurityProfile> Session for StubSession<P> {
 
     /// A double that carries nothing has nothing to end.
     fn close(&self) {}
+
+    /// Matches `conn_info`'s default: a double has no path to report.
+    fn path_changes(&self) -> PathChanges {
+        PathChanges::fixed(Path::Unknown)
+    }
 }
 
 /// A credential-bearing request: a capability link in slot 1.

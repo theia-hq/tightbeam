@@ -8,7 +8,9 @@
 
 use core::time::Duration;
 
-use bifrost::{ConnInfo, Discovery, Node, NodeId, PeerProven, Refusal, Session, Transport};
+use bifrost::{
+    ConnInfo, Discovery, Node, NodeId, PathChanges, PeerProven, Refusal, Session, Transport,
+};
 use eyre::WrapErr as _;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt as _, StreamExt as _};
@@ -259,7 +261,7 @@ impl Connector {
 ///
 /// ```compile_fail,E0277
 /// # use core::net::SocketAddr;
-/// # use bifrost::{Addr, Announced, Error, Node, NodeId, NoDiscovery, Session, Transport};
+/// # use bifrost::{Addr, Announced, Error, Node, NodeId, NoDiscovery, PathChanges, Session, Transport};
 /// # use nauthy::{Link, Service};
 /// # use tightbeam::tunnel::PresentingConnector;
 /// #
@@ -286,6 +288,7 @@ impl Connector {
 /// #     async fn accept_bi(&self) -> Result<(Self::Write, Self::Read), Error> { unimplemented!() }
 /// #     async fn wait_closed(&self) {}
 /// #     fn close(&self) {}
+/// #     fn path_changes(&self) -> PathChanges { unimplemented!() }
 /// # }
 /// #
 /// # fn dial(node: &Node<AnnouncedTransport, NoDiscovery>, link: &Link, service: Service) {
@@ -475,8 +478,9 @@ impl ConnectionLost {
 /// The associated stream halves are the inner session's own (`type Write = S::Write; type Read =
 /// S::Read`), so the handshake writes/reads on those exact halves and hands them back untouched: zero
 /// boxing, and the wrapped protocol sees the same concrete stream types it would over a raw session.
-/// `peer`/`conn_info`/`wait_closed` delegate to the inner session (so a caller still reads the settled
-/// path); `accept_bi` is refused, because a service client never accepts peer-opened streams.
+/// `peer`/`conn_info`/`path_changes`/`wait_closed` delegate to the inner session (so a caller still reads
+/// the current path and each change to it); `accept_bi` is refused, because a service client never
+/// accepts peer-opened streams.
 pub struct ServiceSession<S> {
     session: S,
     /// The dial this session was reached for: every stream sends its request through
@@ -518,6 +522,10 @@ impl<S: Session> Session for ServiceSession<S> {
 
     fn conn_info(&self) -> ConnInfo {
         self.session.conn_info()
+    }
+
+    fn path_changes(&self) -> PathChanges {
+        self.session.path_changes()
     }
 }
 
