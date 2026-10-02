@@ -16,6 +16,12 @@ One denylist holds revoked caps and revoked keys, and a revoked key ends a live 
 - **`AsVerifyKey` has a new required method, `same_key(&key)`**, true when the identity and `key` are the
   same key: both ed25519, same 32 bytes. An implementor outside tightbeam must add it.
 
+### Added
+- **`Connector::open_on(&session)` opens one admitted stream on a session you already hold**, so one
+  session to a peer can carry several services, each admitted on its own request. A refusal is
+  `bifrost::Error::Refused`, carrying the host's reason. It sends the same request a `ServiceSession`
+  stream does.
+
 ### Fixed
 - **A revoked key ends a live session at the next sweep**, whether its peer proved that key or it issued a
   cap the session was admitted on.

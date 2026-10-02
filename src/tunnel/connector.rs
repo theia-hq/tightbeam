@@ -2,8 +2,9 @@
 //!
 //! [`Connector`] resolves what to dial, what to ask for, and what credential to present, then drives it
 //! one of three ways: a preflighted [`PortForward`], a stdio bridge, or a [`ServiceSession`] whose every
-//! stream repeats the handshake. [`PresentingConnector`] is the same dial with the credential rule moved
-//! into the type system.
+//! stream repeats the handshake. [`Connector::open_on`] is that handshake on a session the caller already
+//! holds, so one session can carry many services. [`PresentingConnector`] is the same dial with the
+//! credential rule moved into the type system.
 
 use core::time::Duration;
 
@@ -29,6 +30,19 @@ pub struct DialRefused {
     /// The peer's classification. Not a `source`: this line is the whole story,
     /// and the refusal has no cause the dialer can see.
     pub refusal: Refusal,
+}
+
+/// A session handed to [`Connector::open_on`] reaches a peer other than the one the connector dials.
+///
+/// Refused before the stream opens, so the connector's request and its credentials never reach that
+/// peer. Travels as the source of [`bifrost::Error::Stream`].
+#[derive(Debug, thiserror::Error)]
+#[error("the session reaches {reached}, not {dial}")]
+pub struct WrongPeer {
+    /// The peer the connector dials.
+    pub dial: NodeId,
+    /// The peer the session reaches.
+    pub reached: NodeId,
 }
 
 /// A resolved connect: the node to dial, the service to ask for, and any token to present.
@@ -175,8 +189,57 @@ impl Connector {
         let session = node.connect(self.dial).await?;
         Ok(ServiceSession {
             session,
-            request: self.request(),
+            connector: self,
         })
+    }
+
+    /// Open one admitted stream to this connector's service on a session the caller already holds.
+    ///
+    /// Opens a stream on `session`, sends this connector's request, and returns the halves only when the
+    /// host admits it. The session is borrowed, never dialed, stored or closed here: whoever holds it decides
+    /// how long it lives, so one session to a peer can carry a stream to each of several services, each
+    /// admitted on its own request. Every [`ServiceSession`] stream opens through this method, so it sends
+    /// the same request as a stream opened here.
+    ///
+    /// A host can end the session, and every stream on it, when a grant one of its streams was admitted
+    /// on expires or is revoked.
+    ///
+    /// # Errors
+    ///
+    /// [`bifrost::Error::Stream`] carrying [`WrongPeer`] when `session` reaches a peer other than the one
+    /// this connector dials; nothing is sent. [`bifrost::Error::Refused`] with the host's typed [`Refusal`]
+    /// when the host does not admit the stream. Any other failure (the stream would not open, a credential
+    /// presented on a session that does not prove the peer, a broken reply) is the session's own error or
+    /// [`bifrost::Error::Stream`] carrying the cause.
+    pub async fn open_on<S: Session>(
+        &self,
+        session: &S,
+    ) -> Result<(S::Write, S::Read), bifrost::Error> {
+        // The request carries this connector's credentials, so it goes only to the peer they were meant
+        // for: a session to anyone else would hand that peer a grant it could replay.
+        let reached = session.peer();
+        if reached != self.dial {
+            return Err(bifrost::Error::Stream(Box::new(WrongPeer {
+                dial: self.dial,
+                reached,
+            })));
+        }
+        let (mut writer, mut reader) = session.open_bi().await?;
+        // The checked writer refuses a credential over a session whose declared profile does not prove
+        // the peer, before the request's first byte; the profile is the session's own.
+        self.request()
+            .write_checked::<S, _>(&mut writer)
+            .await
+            .map_err(|error| bifrost::Error::Stream(Box::new(error)))?;
+        match Response::read(&mut reader)
+            .await
+            .map_err(|error| bifrost::Error::Stream(Box::new(error)))?
+        {
+            Response::Ok => Ok((writer, reader)),
+            // The typed refusal travels as its own `Error` variant, so a caller MATCHES it instead of
+            // walking the source chain for a formatted reason.
+            Response::Refused(refusal) => Err(bifrost::Error::Refused(refusal)),
+        }
     }
 }
 
@@ -416,7 +479,9 @@ impl ConnectionLost {
 /// path); `accept_bi` is refused, because a service client never accepts peer-opened streams.
 pub struct ServiceSession<S> {
     session: S,
-    request: Request,
+    /// The dial this session was reached for: every stream sends its request through
+    /// [`Connector::open_on`], so the wrapper and a caller-held session share one handshake.
+    connector: Connector,
 }
 
 impl<S: Session> Session for ServiceSession<S> {
@@ -431,22 +496,7 @@ impl<S: Session> Session for ServiceSession<S> {
     }
 
     async fn open_bi(&self) -> Result<(Self::Write, Self::Read), bifrost::Error> {
-        let (mut writer, mut reader) = self.session.open_bi().await?;
-        // The checked writer refuses a credential over a session whose declared profile does not prove
-        // the peer, before the request's first byte; the inner profile is the transport's own.
-        self.request
-            .write_checked::<S, _>(&mut writer)
-            .await
-            .map_err(|error| bifrost::Error::Stream(Box::new(error)))?;
-        match Response::read(&mut reader)
-            .await
-            .map_err(|error| bifrost::Error::Stream(Box::new(error)))?
-        {
-            Response::Ok => Ok((writer, reader)),
-            // The typed refusal travels as its own `Error` variant, so a caller MATCHES it instead of
-            // walking the source chain for a formatted reason.
-            Response::Refused(refusal) => Err(bifrost::Error::Refused(refusal)),
-        }
+        self.connector.open_on(&self.session).await
     }
 
     async fn accept_bi(&self) -> Result<(Self::Write, Self::Read), bifrost::Error> {
