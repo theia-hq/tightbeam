@@ -8,12 +8,12 @@
 
 use core::time::Duration;
 
-use bifrost::{NoDiscovery, Node, Session as _};
+use bifrost::{NoDiscovery, Node, NodeId, Refusal, RefusalDetail, Session as _};
 use bifrost_mem::MemTransport;
 use nauthy::{Gate, Identity, Link, Service};
 use tightbeam::identity::AsVerifyKey as _;
 use tightbeam::protocol::{Request, Response};
-use tightbeam::tunnel::{CancellationToken, Connector, Router};
+use tightbeam::tunnel::{CancellationToken, Connector, Router, WrongPeer};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::mpsc;
 
@@ -53,11 +53,8 @@ async fn open_on_and_open_service_write_the_same_request() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let host = Node::new(MemTransport::bind(), NoDiscovery);
-            let host_id = host.node_id();
+            let (host_id, mut requests) = stub_host(|| Response::Ok);
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
-            let (heard, mut requests) = mpsc::unbounded_channel();
-            tokio::task::spawn_local(record_requests(host, heard));
 
             let link = member_link(&consumer);
             let dial = || {
@@ -81,21 +78,51 @@ async fn open_on_and_open_service_write_the_same_request() {
         .await;
 }
 
-/// A refusal on `open_on` is the typed `Refused` variant, never a stream error carrying a message.
+/// A refusal on `open_on` is the host's own `Refused` value, its class and detail intact, never a stream
+/// error carrying a message nor a refusal collapsed to the uniform class.
 #[tokio::test]
 async fn a_refusal_on_open_on_is_typed() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            // Two services, so an absent name is not resolved to the only one.
-            let host = echo_host(&["one", "two"]);
+            let (host, _requests) = stub_host(|| Response::Refused(busy()));
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             let session = consumer.connect(host).await.unwrap();
 
-            let refused = Connector::to_node(host, service("absent"), None)
-                .open_on(&session)
-                .await;
-            assert!(matches!(refused, Err(bifrost::Error::Refused(_))));
+            let dial = Connector::to_node(host, service("one"), None);
+            let Err(bifrost::Error::Refused(refusal)) = dial.open_on(&session).await else {
+                panic!("a refusal is the Refused variant");
+            };
+            assert_eq!(refusal, busy());
+        })
+        .await;
+}
+
+/// A session to another peer is refused before a byte is sent: the connector's request, and the
+/// credentials in it, never reach a peer it does not dial.
+#[tokio::test]
+async fn open_on_refuses_a_session_to_another_peer() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (other, mut requests) = stub_host(|| Response::Ok);
+            let intended = Node::new(MemTransport::bind(), NoDiscovery).node_id();
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let session = consumer.connect(other).await.unwrap();
+
+            let link = member_link(&consumer);
+            let dial = Connector::to_node(intended, service("one"), Some(link));
+            let Err(bifrost::Error::Stream(cause)) = dial.open_on(&session).await else {
+                panic!("a session to another peer is a stream error");
+            };
+            let wrong = cause.downcast_ref::<WrongPeer>().unwrap();
+            assert_eq!((wrong.dial, wrong.reached), (intended, other));
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                requests.try_recv().is_err(),
+                "the other peer heard a request"
+            );
         })
         .await;
 }
@@ -118,33 +145,43 @@ fn echo_host(names: &[&str]) -> bifrost::NodeId {
     id
 }
 
-/// Accept every session and stream, send back the raw bytes of each request, and admit it.
+/// A host that records the raw bytes of every request it reads and answers each with `answer()`.
 ///
 /// The dialer writes nothing after its request until it reads the reply, so every byte read before a
 /// request parses is that request's.
-async fn record_requests(
-    host: Node<MemTransport, NoDiscovery>,
-    heard: mpsc::UnboundedSender<Vec<u8>>,
-) {
-    while let Ok(session) = host.accept().await {
-        let heard = heard.clone();
-        tokio::task::spawn_local(async move {
-            while let Ok((mut writer, mut reader)) = session.accept_bi().await {
-                let mut bytes = Vec::new();
-                let mut chunk = [0u8; 4096];
-                while Request::read(&mut bytes.as_slice()).await.is_err() {
-                    let read =
-                        tokio::time::timeout(Duration::from_secs(5), reader.read(&mut chunk))
-                            .await
-                            .unwrap()
-                            .unwrap();
-                    assert_ne!(read, 0, "the stream closed before a whole request");
-                    bytes.extend_from_slice(&chunk[..read]);
+fn stub_host(answer: fn() -> Response) -> (NodeId, mpsc::UnboundedReceiver<Vec<u8>>) {
+    let host = Node::new(MemTransport::bind(), NoDiscovery);
+    let id = host.node_id();
+    let (heard, requests) = mpsc::unbounded_channel();
+    tokio::task::spawn_local(async move {
+        while let Ok(session) = host.accept().await {
+            let heard = heard.clone();
+            tokio::task::spawn_local(async move {
+                while let Ok((mut writer, mut reader)) = session.accept_bi().await {
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while Request::read(&mut bytes.as_slice()).await.is_err() {
+                        let read =
+                            tokio::time::timeout(Duration::from_secs(5), reader.read(&mut chunk))
+                                .await
+                                .unwrap()
+                                .unwrap();
+                        assert_ne!(read, 0, "the stream closed before a whole request");
+                        bytes.extend_from_slice(&chunk[..read]);
+                    }
+                    heard.send(bytes).unwrap();
+                    answer().write(&mut writer).await.unwrap();
                 }
-                heard.send(bytes).unwrap();
-                Response::Ok.write(&mut writer).await.unwrap();
-            }
-        });
+            });
+        }
+    });
+    (id, requests)
+}
+
+/// A refusal that is not the uniform class and carries the host's detail.
+fn busy() -> Refusal {
+    Refusal::Unavailable {
+        detail: RefusalDetail::bounded("busy"),
     }
 }
 

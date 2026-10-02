@@ -32,6 +32,19 @@ pub struct DialRefused {
     pub refusal: Refusal,
 }
 
+/// A session handed to [`Connector::open_on`] reaches a peer other than the one the connector dials.
+///
+/// Refused before the stream opens, so the connector's request and its credentials never reach that
+/// peer. Travels as the source of [`bifrost::Error::Stream`].
+#[derive(Debug, thiserror::Error)]
+#[error("the session reaches {reached}, not {dial}")]
+pub struct WrongPeer {
+    /// The peer the connector dials.
+    pub dial: NodeId,
+    /// The peer the session reaches.
+    pub reached: NodeId,
+}
+
 /// A resolved connect: the node to dial, the service to ask for, and any token to present.
 ///
 /// The domain half of a `connect`, with target parsing left to the caller. A caller builds one with
@@ -188,16 +201,29 @@ impl Connector {
     /// admitted on its own request. Every [`ServiceSession`] stream opens through this method, so it sends
     /// the same request as a stream opened here.
     ///
+    /// The host ends a session when any grant presented on it is recalled or expires, so streams that
+    /// share a session share that end.
+    ///
     /// # Errors
     ///
-    /// [`bifrost::Error::Refused`] with the host's typed [`Refusal`] when the host does not admit the
-    /// stream. Any other failure (the stream would not open, a credential presented on a session that does
+    /// [`bifrost::Error::Stream`] carrying [`WrongPeer`] when `session` reaches a peer other than the one
+    /// this connector dials; nothing is sent. [`bifrost::Error::Refused`] with the host's typed [`Refusal`]
+    /// when the host does not admit the stream. Any other failure (the stream would not open, a credential presented on a session that does
     /// not prove the peer, a broken reply) is the session's own error or [`bifrost::Error::Stream`]
     /// carrying the cause.
     pub async fn open_on<S: Session>(
         &self,
         session: &S,
     ) -> Result<(S::Write, S::Read), bifrost::Error> {
+        // The request carries this connector's credentials, so it goes only to the peer they were meant
+        // for: a session to anyone else would hand that peer a grant it could replay.
+        let reached = session.peer();
+        if reached != self.dial {
+            return Err(bifrost::Error::Stream(Box::new(WrongPeer {
+                dial: self.dial,
+                reached,
+            })));
+        }
         let (mut writer, mut reader) = session.open_bi().await?;
         // The checked writer refuses a credential over a session whose declared profile does not prove
         // the peer, before the request's first byte; the profile is the session's own.
