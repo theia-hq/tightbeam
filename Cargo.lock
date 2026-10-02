@@ -2004,7 +2004,7 @@ dependencies = [
 [[package]]
 name = "keystore"
 version = "0.1.0"
-source = "git+https://github.com/theia-hq/keystore?tag=v0.1.0#70faffa51afbc6d9b219da173d43311a9cd3e8c4"
+source = "git+https://github.com/theia-hq/keystore?rev=70faffa51afbc6d9b219da173d43311a9cd3e8c4#70faffa51afbc6d9b219da173d43311a9cd3e8c4"
 dependencies = [
  "argon2",
  "chacha20poly1305",
