@@ -1031,6 +1031,7 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
+ "hkdf",
  "pem-rfc7468 0.7.0",
  "pkcs8 0.10.2",
  "rand_core 0.6.4",
@@ -1403,6 +1404,15 @@ dependencies = [
  "tinyvec",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+dependencies = [
+ "hmac",
 ]
 
 [[package]]
@@ -2006,14 +2016,29 @@ dependencies = [
 [[package]]
 name = "keystore"
 version = "0.1.0"
-source = "git+https://github.com/theia-hq/keystore?rev=70faffa51afbc6d9b219da173d43311a9cd3e8c4#70faffa51afbc6d9b219da173d43311a9cd3e8c4"
+source = "git+https://github.com/theia-hq/keystore?rev=a1f149639572d3582d888f133dabd99293a0f911#a1f149639572d3582d888f133dabd99293a0f911"
 dependencies = [
  "argon2",
  "chacha20poly1305",
  "ed25519-dalek 2.2.0",
  "getrandom 0.4.3",
+ "hkdf",
  "icu_normalizer",
+ "keystore-enclave",
  "libc",
+ "p256",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "zeroize",
+]
+
+[[package]]
+name = "keystore-enclave"
+version = "0.1.0"
+source = "git+https://github.com/theia-hq/keystore?rev=a1f149639572d3582d888f133dabd99293a0f911#a1f149639572d3582d888f133dabd99293a0f911"
+dependencies = [
+ "core-foundation",
+ "security-framework-sys",
  "thiserror 2.0.20",
  "zeroize",
 ]
