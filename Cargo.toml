@@ -20,13 +20,13 @@ license = "MIT OR Apache-2.0"
 # `.cargo/config.toml` still [patch]es these by URL to sibling PATH checkouts, so a `rev` here does not
 # slow local builds (the patch wins locally regardless of the rev); CI resolves the rev from GitHub. All
 # bifrost-* crates live in one repo, so they share one rev. Bump deliberately each release.
-bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "da370eeff9722ffa32111813b8db91e4e1fd925c" }
-bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "da370eeff9722ffa32111813b8db91e4e1fd925c" }
-bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "da370eeff9722ffa32111813b8db91e4e1fd925c" }
+bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "5ae6634dd835cd57978dd6970fcb0545fc15955c" }
+bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "5ae6634dd835cd57978dd6970fcb0545fc15955c" }
+bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "5ae6634dd835cd57978dd6970fcb0545fc15955c" }
 # The key file store, in its own repo, pinned past v0.1.0 at the commit that adds the touch-id lock. Its
 # public key is 32 bytes with no check; the identity bridge checks a key read from a file as it becomes a
 # `NodeId`.
-keystore = { git = "https://github.com/theia-hq/keystore", rev = "a1f149639572d3582d888f133dabd99293a0f911" }
+keystore = { git = "https://github.com/theia-hq/keystore", rev = "a69da6bf268b2d98136032b6ec939100eb1b5072" }
 # Past v0.11.0: one grow-only `Denylist` holds revoked ids and keys alike, and a revoked key is refused as
 # a peer and as the root of any cap. v0.11.0 refuses a key that is not the canonical encoding of a
 # prime-order point, gives `VerifyKey` only `try_new`, and mints an authority-bound link with
@@ -58,7 +58,7 @@ libc = "0.2"
 # today only through feature unification via iroh, so a dependency bump could drop it and break the
 # test build. Every sibling repo using the paused clock declares it explicitly.
 tokio = { version = "1", features = ["test-util"] }
-bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "da370eeff9722ffa32111813b8db91e4e1fd925c" }
+bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "5ae6634dd835cd57978dd6970fcb0545fc15955c" }
 # A hostile holder appends raw datalog to a cap it was given; nauthy's API writes only its own shapes, so
 # the live cut's fail-closed read is tested with a token built the way that holder builds one. Both are
 # already in the tree through nauthy.
