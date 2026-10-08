@@ -91,6 +91,7 @@ codegen-units = 1
 # node hold gigabytes per connection with gapped stream frames (RUSTSEC-2026-0185 in quinn-proto,
 # which noq forks). n0-computer/noq#828 ports quinn's three fixes; this takes its head, pinned by full
 # hash, until n0 releases it. Drop this entry, and the matching `allow-git` line in deny.toml, the day
-# a noq-proto release carries #828.
+# a noq-proto release carries #828; scripts/fork-watch.sh fails if the patch goes before its row in
+# scripts/fork-watch.txt says ported.
 [patch.crates-io]
 noq-proto = { git = "https://github.com/n0-computer/noq", rev = "d7c3160a7e7b5cb36682eae04e364d3f50e28925" }
