@@ -20,9 +20,9 @@ license = "MIT OR Apache-2.0"
 # `.cargo/config.toml` still [patch]es these by URL to sibling PATH checkouts, so a `rev` here does not
 # slow local builds (the patch wins locally regardless of the rev); CI resolves the rev from GitHub. All
 # bifrost-* crates live in one repo, so they share one rev. Bump deliberately each release.
-bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "5ae6634dd835cd57978dd6970fcb0545fc15955c" }
-bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "5ae6634dd835cd57978dd6970fcb0545fc15955c" }
-bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "5ae6634dd835cd57978dd6970fcb0545fc15955c" }
+bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "3d1f79e84c7d8480896ef2d83120867de53a3726" }
+bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "3d1f79e84c7d8480896ef2d83120867de53a3726" }
+bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "3d1f79e84c7d8480896ef2d83120867de53a3726" }
 # The key file store, in its own repo, pinned past v0.1.0 at the commit that names the key kinds standard
 # and strict. Its public key is 32 bytes with no check; the identity bridge checks a key read from a file
 # as it becomes a `NodeId`.
@@ -58,7 +58,7 @@ libc = "0.2"
 # today only through feature unification via iroh, so a dependency bump could drop it and break the
 # test build. Every sibling repo using the paused clock declares it explicitly.
 tokio = { version = "1", features = ["test-util"] }
-bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "5ae6634dd835cd57978dd6970fcb0545fc15955c" }
+bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "3d1f79e84c7d8480896ef2d83120867de53a3726" }
 # A hostile holder appends raw datalog to a cap it was given; nauthy's API writes only its own shapes, so
 # the live cut's fail-closed read is tested with a token built the way that holder builds one. Both are
 # already in the tree through nauthy.
@@ -86,3 +86,11 @@ unused_must_use = "deny"
 strip = true
 lto = true
 codegen-units = 1
+
+# noq-proto 1.3.0 never bounds how many out-of-order chunks one stream buffers, so a peer can make a
+# node hold gigabytes per connection with gapped stream frames (RUSTSEC-2026-0185 in quinn-proto,
+# which noq forks). n0-computer/noq#828 ports quinn's three fixes; this takes its head, pinned by full
+# hash, until n0 releases it. Drop this entry, and the matching `allow-git` line in deny.toml, the day
+# a noq-proto release carries #828.
+[patch.crates-io]
+noq-proto = { git = "https://github.com/n0-computer/noq", rev = "d7c3160a7e7b5cb36682eae04e364d3f50e28925" }
