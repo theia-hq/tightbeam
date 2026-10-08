@@ -13,8 +13,9 @@ One denylist holds revoked caps and revoked keys, and a revoked key ends a live 
   `~/.config/tightbeam/revoked` holds revoked keys beside revoked caps.
 - **`LiveCuts` is implemented for nauthy's `Denylist`**, in place of `FileDenylist` and `Latch`.
 - **Built on unreleased nauthy (after 0.11.0)**, for its one `Denylist`.
-- **Built on unreleased bifrost (da370ee)**, where `Session::path_changes` is required. bifrost's
-  CHANGELOG lists the other changes.
+- **Built on unreleased bifrost (3d1f79e)**, where `Session::path_changes` is required and a peer
+  gets no unidirectional streams, no datagrams, and at most 16 MiB of unread stream data per
+  connection. bifrost's CHANGELOG lists the other changes.
 - **`AsVerifyKey` has a new required method, `same_key(&key)`**, true when the identity and `key` are the
   same key: both ed25519, same 32 bytes. An implementor outside tightbeam must add it.
 
@@ -31,6 +32,16 @@ One denylist holds revoked caps and revoked keys, and a revoked key ends a live 
   cap the session was admitted on.
 - **`connect` exits when the host ends the session**, both as a port forward and with `--to -`, even
   while stdin is an open terminal. It used to wait for the next keystroke.
+
+### Changed
+- **A workspace that depends on `tightbeam` must patch noq-proto**, the QUIC library iroh uses, until a
+  noq-proto release fixes a bug that lets a peer make an endpoint buffer out-of-order stream data
+  without limit (the bug RUSTSEC-2026-0185 names in quinn-proto, which noq forks). cargo reads `[patch]`
+  only in a workspace's root `Cargo.toml`, never from a dependency, so add this to yours:
+  ```toml
+  [patch.crates-io]
+  noq-proto = { git = "https://github.com/n0-computer/noq", rev = "d7c3160a7e7b5cb36682eae04e364d3f50e28925" }
+  ```
 
 ## v0.18.0
 
