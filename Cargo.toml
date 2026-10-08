@@ -23,10 +23,10 @@ license = "MIT OR Apache-2.0"
 bifrost = { git = "https://github.com/theia-hq/bifrost", rev = "5ae6634dd835cd57978dd6970fcb0545fc15955c" }
 bifrost-iroh = { git = "https://github.com/theia-hq/bifrost", rev = "5ae6634dd835cd57978dd6970fcb0545fc15955c" }
 bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "5ae6634dd835cd57978dd6970fcb0545fc15955c" }
-# The key file store, in its own repo, pinned past v0.1.0 at the commit that adds the touch-id lock. Its
-# public key is 32 bytes with no check; the identity bridge checks a key read from a file as it becomes a
-# `NodeId`.
-keystore = { git = "https://github.com/theia-hq/keystore", rev = "a69da6bf268b2d98136032b6ec939100eb1b5072" }
+# The key file store, in its own repo, pinned past v0.1.0 at the commit that names the key kinds standard
+# and strict. Its public key is 32 bytes with no check; the identity bridge checks a key read from a file
+# as it becomes a `NodeId`.
+keystore = { git = "https://github.com/theia-hq/keystore", rev = "783c87527663b6465bd735a85cbc84551583a87e" }
 # Past v0.11.0: one grow-only `Denylist` holds revoked ids and keys alike, and a revoked key is refused as
 # a peer and as the root of any cap. v0.11.0 refuses a key that is not the canonical encoding of a
 # prime-order point, gives `VerifyKey` only `try_new`, and mints an authority-bound link with

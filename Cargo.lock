@@ -2016,7 +2016,7 @@ dependencies = [
 [[package]]
 name = "keystore"
 version = "0.1.0"
-source = "git+https://github.com/theia-hq/keystore?rev=a69da6bf268b2d98136032b6ec939100eb1b5072#a69da6bf268b2d98136032b6ec939100eb1b5072"
+source = "git+https://github.com/theia-hq/keystore?rev=783c87527663b6465bd735a85cbc84551583a87e#783c87527663b6465bd735a85cbc84551583a87e"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -2035,7 +2035,7 @@ dependencies = [
 [[package]]
 name = "keystore-enclave"
 version = "0.1.0"
-source = "git+https://github.com/theia-hq/keystore?rev=a69da6bf268b2d98136032b6ec939100eb1b5072#a69da6bf268b2d98136032b6ec939100eb1b5072"
+source = "git+https://github.com/theia-hq/keystore?rev=783c87527663b6465bd735a85cbc84551583a87e#783c87527663b6465bd735a85cbc84551583a87e"
 dependencies = [
  "core-foundation",
  "security-framework-sys",

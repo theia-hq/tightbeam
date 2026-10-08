@@ -225,7 +225,7 @@ async fn a_sealed_key_is_refused_and_survives() {
     let passphrase =
         keystore::Passphrase::new(zeroize::Zeroizing::new(b"hunter2".to_vec())).expect("non-empty");
     let secret = keystore::Secret::take(&mut [3u8; 32]);
-    keystore::KeyFile::device(path.as_path())
+    keystore::KeyFile::new(path.as_path())
         .write(&secret, keystore::Protection::Passphrase(&passphrase))
         .expect("seal a key");
     let sealed = std::fs::read(&path).expect("read the sealed file");
@@ -242,27 +242,27 @@ async fn a_sealed_key_is_refused_and_survives() {
     );
 }
 
-/// A sealed root key at the identity path is refused as the wrong kind, by load and by write, and
-/// survives both: the identity is a device key, and a root key is never taken for one.
+/// A strict key at the identity path is refused as the wrong kind, by load and by write, and survives
+/// both: the identity is a standard key, and a strict key is never taken for one.
 #[tokio::test]
-async fn a_root_key_is_refused_by_its_kind_and_survives() {
-    let dir = TempDir::new("root-kind");
+async fn a_strict_key_is_refused_by_its_kind_and_survives() {
+    let dir = TempDir::new("strict-kind");
     let path = dir.key();
     let passphrase =
         keystore::Passphrase::new(zeroize::Zeroizing::new(b"hunter2".to_vec())).expect("non-empty");
     let secret = keystore::Secret::take(&mut [5u8; 32]);
-    keystore::KeyFile::root(path.as_path())
+    keystore::KeyFile::strict(path.as_path())
         .write(&secret, keystore::Protection::Passphrase(&passphrase))
-        .expect("seal a root key");
-    let sealed = std::fs::read(&path).expect("read the sealed root key");
+        .expect("seal a strict key");
+    let sealed = std::fs::read(&path).expect("read the strict key");
 
     let wrong_kind = |refused: &Result<_, IdentityError>| {
         matches!(
             refused,
             Err(IdentityError::Key(keystore::Error::Format {
                 source: keystore::FormatError::WrongKind {
-                    expected: keystore::Kind::Device,
-                    found: keystore::Kind::Root,
+                    expected: keystore::Kind::Standard,
+                    found: keystore::Kind::Strict,
                 },
                 ..
             }))
@@ -271,17 +271,17 @@ async fn a_root_key_is_refused_by_its_kind_and_survives() {
     let loaded = load(Some(&path)).await.map(drop);
     assert!(
         wrong_kind(&loaded),
-        "a root key is refused by its kind on load, got {loaded:?}"
+        "a strict key is refused by its kind on load, got {loaded:?}"
     );
     let written = write(&[5u8; 32], Some(&path)).await;
     assert!(
         wrong_kind(&written),
-        "a root key is refused by its kind on write, got {written:?}"
+        "a strict key is refused by its kind on write, got {written:?}"
     );
     assert_eq!(
         std::fs::read(&path).expect("read back"),
         sealed,
-        "the root key survives"
+        "the strict key survives"
     );
 }
 
@@ -366,7 +366,7 @@ fn a_locked_files_key_converts_to_its_node_id() {
     let dir = TempDir::new("locked-key");
     let path = dir.key();
     let seed = [7u8; 32];
-    seal_device_key(&path, &seed);
+    seal_standard_key(&path, &seed);
 
     let claimed = locked_public_key(&path);
     assert_eq!(claimed.node_id(), Ok(NodeId::from_ed25519_secret(&seed)));
@@ -378,7 +378,7 @@ fn a_locked_files_key_converts_to_its_node_id() {
 fn a_locked_files_malformed_key_is_refused() {
     let dir = TempDir::new("locked-malformed");
     let path = dir.key();
-    seal_device_key(&path, &[7u8; 32]);
+    seal_standard_key(&path, &[7u8; 32]);
     // The header's public key sits at bytes 10..42 of a sealed file (keystore's frozen layout:
     // signature 8, version 1, kind 1). Nothing checks it before an unlock, so a forged claim loads.
     let mut bytes = std::fs::read(&path).expect("read the sealed file");
@@ -389,19 +389,19 @@ fn a_locked_files_malformed_key_is_refused() {
     assert_eq!(claimed.node_id(), Err(bifrost::KeyError::NotOnCurve));
 }
 
-/// Seal `seed` as a device key at `path` under a throwaway passphrase.
-fn seal_device_key(path: &Path, seed: &[u8; 32]) {
+/// Seal `seed` as a standard key at `path` under a throwaway passphrase.
+fn seal_standard_key(path: &Path, seed: &[u8; 32]) {
     let passphrase =
         keystore::Passphrase::new(zeroize::Zeroizing::new(b"hunter2".to_vec())).expect("non-empty");
     let secret = keystore::Secret::take(&mut { *seed });
-    keystore::KeyFile::device(path)
+    keystore::KeyFile::new(path)
         .write(&secret, keystore::Protection::Passphrase(&passphrase))
         .expect("seal a key");
 }
 
-/// The public key the sealed device key file at `path` claims, read without unlocking.
+/// The public key the sealed standard key file at `path` claims, read without unlocking.
 fn locked_public_key(path: &Path) -> keystore::PublicKey {
-    match keystore::KeyFile::device(path).load() {
+    match keystore::KeyFile::new(path).load() {
         Ok(Some(keystore::Stored::Locked(locked))) => locked.public_key(),
         other => panic!("expected a locked key file, got {other:?}"),
     }
