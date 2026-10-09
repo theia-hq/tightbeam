@@ -21,10 +21,15 @@ jobs:
       - uses: actions/checkout@v4
       # Pinned, because the database now carries CVSS 4.0 scores and an older cargo-deny refuses to
       # load it: v2.1.1 runs cargo-deny 0.20.2, which reads them. Move the pin deliberately.
-      - name: cargo-deny (advisories)
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      # On the runner, not the cargo-deny action's container: the action builds from a Docker Hub image,
+      # and anonymous pulls from shared runners hit Docker Hub's rate limit. Pinned: 0.20.2 reads the
+      # advisory database's CVSS 4.0 scores. Move the pin deliberately.
+      - name: install cargo-deny
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2
         with:
-          command: check advisories
+          tool: cargo-deny@0.20.2
+      - name: cargo-deny (advisories)
+        run: cargo deny check advisories
       - name: fork watch
         run: sh scripts/fork-watch.sh .
       - name: fork watch fixture
