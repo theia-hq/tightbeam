@@ -23,10 +23,15 @@ jobs:
         run: cargo test --locked
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
-      - name: cargo-deny (sources)
-        uses: EmbarkStudios/cargo-deny-action@v2
+      # On the runner, not the cargo-deny action's container: the action builds from a Docker Hub image,
+      # and anonymous pulls from shared runners hit Docker Hub's rate limit. Pinned: 0.20.2 reads the
+      # advisory database's CVSS 4.0 scores. Move the pin deliberately.
+      - name: install cargo-deny
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2
         with:
-          command: check sources
+          tool: cargo-deny@0.20.2
+      - name: cargo-deny (sources)
+        run: cargo deny check sources
   # Check with the oldest toolchain the manifest claims (rust-version), so a dependency or a language
   # feature that needs a newer compiler fails here instead of in a user's build. The version is read from
   # Cargo.toml, so this job is the same in every repo.
