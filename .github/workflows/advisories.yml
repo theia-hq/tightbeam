@@ -29,7 +29,7 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
       - name: cargo-deny (advisories)
-        run: cargo deny check advisories
+        run: cargo deny --all-features check advisories
       - name: fork watch
         run: sh scripts/fork-watch.sh .
       - name: fork watch fixture

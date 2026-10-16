@@ -31,7 +31,7 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
       - name: cargo-deny (sources)
-        run: cargo deny check sources
+        run: cargo deny --all-features check sources
   # Check with the oldest toolchain the manifest claims (rust-version), so a dependency or a language
   # feature that needs a newer compiler fails here instead of in a user's build. The version is read from
   # Cargo.toml, so this job is the same in every repo.
