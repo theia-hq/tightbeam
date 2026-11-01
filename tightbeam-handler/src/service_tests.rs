@@ -172,9 +172,13 @@ impl Handler for RawSplice {
 /// The ceiling forwards as a TYPE, so it is frozen at build time rather than checked at run time.
 /// Flipping either association would let an uncapped service face an open gate, or gate one an operator
 /// may deliberately open.
-const _: () = assert!(<<Serve<OpenTyped> as Handler>::Exposure as PublicUse>::OPEN_SAFE);
+const _: () = assert_open_safe::<<Serve<OpenTyped> as Handler>::Exposure>();
 const _: () = assert!(!<<Serve<GatedTyped> as Handler>::Exposure as PublicUse>::OPEN_SAFE);
 const _: () = assert!(!<<RawSplice as Handler>::Exposure as PublicUse>::OPEN_SAFE);
+
+const fn assert_open_safe<P: PublicUse>() {
+    assert!(P::OPEN_SAFE);
+}
 
 /// The opt-in property: a typed service and a raw handler are stored in ONE erased route table and the
 /// dispatcher reads each one's ceiling and metering without naming either's traits. If the typed layer

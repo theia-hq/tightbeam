@@ -12,9 +12,13 @@ use crate::open_policy::{Never, OptIn, ProvenOnly, PublicUse};
 /// refuse an open gate over a `Never` or a `ProvenOnly` handler.
 const _: () = {
     assert!(!<Never as PublicUse>::OPEN_SAFE);
-    assert!(<OptIn as PublicUse>::OPEN_SAFE);
+    assert_open_safe::<OptIn>();
     assert!(!<ProvenOnly as PublicUse>::OPEN_SAFE);
 };
+
+const fn assert_open_safe<P: PublicUse>() {
+    assert!(P::OPEN_SAFE);
+}
 
 /// A generic reader projects `OPEN_SAFE` through the trait bound, the shape a later assembler uses to read
 /// the marker off a handler's associated type. This is the const monomorphized per marker, not a runtime read.

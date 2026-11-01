@@ -26,12 +26,12 @@ bifrost-mdns = { git = "https://github.com/theia-hq/bifrost", rev = "88d097439e4
 # The key file store, in its own repo, pinned past v0.1.0 at the commit that names the key kinds standard
 # and strict. Its public key is 32 bytes with no check; the identity bridge checks a key read from a file
 # as it becomes a `NodeId`.
-keystore = { git = "https://github.com/theia-hq/keystore", rev = "783c87527663b6465bd735a85cbc84551583a87e" }
+keystore = { git = "https://github.com/theia-hq/keystore", rev = "301c6535c344c21b4ef6694a55c6b9c628663cbb" }
 # Past v0.11.0: one grow-only `Denylist` holds revoked ids and keys alike, and a revoked key is refused as
 # a peer and as the root of any cap. v0.11.0 refuses a key that is not the canonical encoding of a
 # prime-order point, gives `VerifyKey` only `try_new`, and mints an authority-bound link with
 # `Link::mint_authority_bound`.
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "a7c82bf58db5d54795b4a3c544da8ca7d2e0a81c" }
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "82c377052bbea8f9b2970eba052a97db2a2f7206" }
 # The handler contract, in-tree beside its only dispatcher. A path dep (not a git self-dep): the workspace
 # member resolves within this checkout, and the package stays separately pinnable by a consumer.
 tightbeam-handler = { path = "tightbeam-handler" }
@@ -62,7 +62,7 @@ bifrost-mem = { git = "https://github.com/theia-hq/bifrost", rev = "88d097439e4b
 # A hostile holder appends raw datalog to a cap it was given; nauthy's API writes only its own shapes, so
 # the live cut's fail-closed read is tested with a token built the way that holder builds one. Both are
 # already in the tree through nauthy.
-biscuit-auth = "6"
+biscuit-auth = { git = "https://github.com/eclipse-biscuit/biscuit-rust", rev = "93832a82bf509ad81f05fdb6adaf69d03c56887b" }
 data-encoding = "2"
 # A relayed `bifrost::Path` names its relay by URL, so a test that builds one needs the type. Already in the
 # tree through bifrost.
