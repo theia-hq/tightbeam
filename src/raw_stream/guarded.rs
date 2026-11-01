@@ -258,7 +258,9 @@ struct NonblockingReader(AsyncFd<OwnedFd>);
 impl NonblockingReader {
     /// Register the nonblocking fd with the reactor. Fails only if the reactor cannot take the fd.
     fn new(fd: OwnedFd) -> io::Result<Self> {
-        Ok(Self(AsyncFd::new(fd)?))
+        // SAFETY: The OwnedFd stays valid, open, and stable inside this private reader and is never
+        // replaced or closed before AsyncFd deregisters it.
+        Ok(Self(unsafe { AsyncFd::register(fd) }?))
     }
 
     /// Await the fd becoming readable: for a FIFO this resolves when a WRITER connects or writes (so the peer
