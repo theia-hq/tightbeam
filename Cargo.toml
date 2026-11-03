@@ -31,7 +31,7 @@ keystore = { git = "https://github.com/theia-hq/keystore", rev = "301c6535c344c2
 # a peer and as the root of any cap. v0.11.0 refuses a key that is not the canonical encoding of a
 # prime-order point, gives `VerifyKey` only `try_new`, and mints an authority-bound link with
 # `Link::mint_authority_bound`.
-nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "82c377052bbea8f9b2970eba052a97db2a2f7206" }
+nauthy = { git = "https://github.com/theia-hq/nauthy", rev = "cb9e83728ac36ca43c73584f044c7347b5d01895" }
 # The handler contract, in-tree beside its only dispatcher. A path dep (not a git self-dep): the workspace
 # member resolves within this checkout, and the package stays separately pinnable by a consumer.
 tightbeam-handler = { path = "tightbeam-handler" }
