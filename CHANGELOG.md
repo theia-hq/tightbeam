@@ -28,6 +28,7 @@ One denylist holds revoked caps and revoked keys, and a revoked key ends a live 
   from a relay to direct.
 
 ### Fixed
+- **Capability expiry bounds include the full encoded expiry second**, rather than ending at its start.
 - **A revoked key ends a live session at the next sweep**, whether its peer proved that key or it issued a
   cap the session was admitted on.
 - **`connect` exits when the host ends the session**, both as a port forward and with `--to -`, even
