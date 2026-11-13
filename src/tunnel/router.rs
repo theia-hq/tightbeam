@@ -16,6 +16,9 @@ use tightbeam_handler::{Handler, Metering};
 
 use super::catalog::{Posture, ServiceCatalog, ServiceEntry};
 use super::exposer::Exposer;
+use super::target_spec::{
+    Delivery, Endpoint, Primitive, TargetError, TargetSpec, TargetSyntaxError,
+};
 use crate::raw_stream::RawStream;
 
 /// The one server-side route table: each served name binds to its handler or raw source in one call, and the
@@ -107,7 +110,7 @@ impl Router {
     /// [`service`](Self::service) with [`Forward`](crate::builtins::Forward). The addr is validated here, so
     /// a typo fails at bind with a teaching message rather than at dial time as an opaque reset.
     pub fn forward(self, name: Service, addr: &str) -> eyre::Result<Self> {
-        validate_forward(addr)?;
+        addr.parse::<Endpoint>()?;
         self.service(name, crate::builtins::Forward::new(addr))
     }
 
@@ -117,11 +120,23 @@ impl Router {
         self.bind(name, Target::RawStream(source), Access::Family)
     }
 
-    /// Absorb the `name=target` serve grammar, where every target carries a scheme: `tcp:<host>:<port>` /
-    /// `unix:<path>` a local forward, `file:<path>` / `fifo:<path>` / `stdin:` a raw-stream source, and
-    /// `echo:` the built-in reflector. The set is closed, so an unknown scheme is a teaching error naming
-    /// the legal ones: handlers are bound by value through [`service`](Self::service), so the scheme
-    /// namespace does not survive the merge.
+    /// Bind a syntax-checked primitive target. Check that the name is available before preparing the backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the name is already served or backend preparation fails.
+    pub fn target(mut self, name: Service, spec: TargetSpec) -> Result<Self, TargetError> {
+        self.services.insert_target(name, spec, Target::prepare)?;
+        Ok(self)
+    }
+
+    /// Parse `name=target` service definitions. Check every name, target, duplicate name, and collision
+    /// with an existing service before preparing any backend. See [`TargetSpec`] for target syntax.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid definition, an invalid name or target, a duplicate or
+    /// already-served name, or backend preparation failure.
     pub fn parse(mut self, entries: &[String]) -> eyre::Result<Self> {
         self.services.extend_parse(entries)?;
         Ok(self)
@@ -212,7 +227,7 @@ impl Router {
     /// bind verb shares.
     fn bind(mut self, name: Service, target: Target, access: Access) -> eyre::Result<Self> {
         if self.services.0.contains_key(name.as_str()) {
-            eyre::bail!("service `{name}` is already defined; a name may map to only one target");
+            return Err(TargetError::AlreadyDefined.into());
         }
         self.services
             .0
@@ -389,32 +404,65 @@ impl Services {
         Ok(services)
     }
 
-    /// Parse `name=target` entries INTO this table (the [`Router::parse`] path): the same grammar and the same
-    /// one duplicate policy as every other bind, refused with a teaching message.
     fn extend_parse(&mut self, entries: &[String]) -> eyre::Result<()> {
-        let Self(services) = self;
-        for entry in entries {
-            let Some((name, addr)) = entry.split_once('=') else {
-                eyre::bail!(
-                    "`{entry}` names no service. Every serve entry must be `name=target`, e.g. \
-                     `web=tcp:127.0.0.1:8080`, `logs=file:/var/log/app.log`"
-                );
-            };
-            // Validate the name through the same domain type the wire uses, so an exposed name and a
-            // requested name are compared as the same kind of thing.
-            name.parse::<Service>()?;
-            // A duplicate name is refused HERE, the same policy every bind verb applies: silently
-            // overwriting would drop the first target (and, after `member_only`, could silently move a
-            // declared floor off the route the operator thought they marked).
-            if services.contains_key(name) {
-                eyre::bail!(
-                    "service `{name}` is already defined; a name may map to only one target"
-                );
-            }
-            // Resolve (and validate) the addr into a Target: a bogus
-            // address fails HERE with a teaching message, not at dial time as an opaque reset.
-            services.insert(name.to_owned(), Route::family(parse_target(addr, entry)?));
+        self.extend_parse_with(entries, Target::prepare)
+    }
+
+    fn extend_parse_with(
+        &mut self,
+        entries: &[String],
+        mut prepare: impl FnMut(TargetSpec) -> Result<Target, TargetError>,
+    ) -> eyre::Result<()> {
+        // Finish the entire syntax/name pass before any constructor can inspect stdin or prepare a
+        // backend. The private callback exposes that ordering to tests without substituting grammar.
+        let definitions = self.definitions(entries)?;
+        for (name, spec) in definitions {
+            self.insert_target(name, spec, &mut prepare)?;
         }
+        Ok(())
+    }
+
+    fn definitions(
+        &self,
+        entries: &[String],
+    ) -> Result<Vec<(Service, TargetSpec)>, DefinitionError> {
+        let mut names = HashSet::with_capacity(entries.len());
+        entries
+            .iter()
+            .enumerate()
+            .map(|(offset, entry)| {
+                let index = offset + 1;
+                let fail = |cause| DefinitionError { index, cause };
+                let (name, target) = entry
+                    .split_once('=')
+                    .filter(|(name, target)| !name.is_empty() && !target.is_empty())
+                    .ok_or_else(|| fail(DefinitionCause::MissingDefinition))?;
+                // Discard the foreign parser error: it may retain the supplied name.
+                let name = name
+                    .parse::<Service>()
+                    .map_err(|_| fail(DefinitionCause::InvalidName))?;
+                if self.0.contains_key(name.as_str()) || !names.insert(name.to_string()) {
+                    return Err(fail(DefinitionCause::AlreadyDefined));
+                }
+                let spec = target
+                    .parse::<TargetSpec>()
+                    .map_err(|cause| fail(DefinitionCause::Target(cause)))?;
+                Ok((name, spec))
+            })
+            .collect()
+    }
+
+    fn insert_target(
+        &mut self,
+        name: Service,
+        spec: TargetSpec,
+        mut prepare: impl FnMut(TargetSpec) -> Result<Target, TargetError>,
+    ) -> Result<(), TargetError> {
+        if self.0.contains_key(name.as_str()) {
+            return Err(TargetError::AlreadyDefined);
+        }
+        let target = prepare(spec)?;
+        self.0.insert(name.to_string(), Route::family(target));
         Ok(())
     }
 
@@ -428,7 +476,7 @@ impl Services {
         let Self(services) = &mut self;
         name.parse::<Service>()?;
         if services.contains_key(name) {
-            eyre::bail!("service `{name}` is already defined; a name may map to only one target");
+            return Err(TargetError::AlreadyDefined.into());
         }
         services.insert(
             name.to_owned(),
@@ -807,8 +855,7 @@ impl PublicServices {
     }
 }
 
-/// Every target scheme tightbeam itself routes, rendered once so the two grammar refusals below (no
-/// scheme, unknown scheme) can never drift from each other or from what [`parse_target`] actually routes.
+/// Supported forms are `tcp:<host>:<port>`, `unix:<path>`, `file:<path>`, `fifo:<path>`, `stdin:`, and `echo:`.
 ///
 /// Public because a consumer that serves its OWN schemes on top of this grammar has to name both sets in
 /// one refusal, and the only alternative is retyping this list somewhere it can rot. It is prose for a
@@ -816,109 +863,49 @@ impl PublicServices {
 pub const TARGET_SCHEMES: &str = "`tcp:<host>:<port>`, `unix:<path>`, `file:<path>`, `fifo:<path>`, \
                               `stdin:`, `echo:`";
 
-/// Resolve an exposed service's address to a [`Target`]. Every target is `<scheme>:<rest>`, so the grammar
-/// is TOTAL and has no fall-through: `tcp:<host>:<port>` and `unix:<path>` are the two local stream
-/// endpoints the built-in forward dials; `file:<path>` / `fifo:<path>` / `stdin:` are the raw-stream sources
-/// (an OS object, or this process's fd 0, spliced toward the peer); `echo:` is the built-in loopback
-/// reflector. A scheme this does not know is refused by name, never guessed at.
-///
-/// Totality is the point. A hostname followed by a colon and a number is syntactically indistinguishable
-/// from a scheme carrying an argument, so as long as one target form was a bare `host:port` the two could
-/// only be told apart by an exact string match, and every near-miss silently became a forward to a host of
-/// that name. With a scheme on every form the ambiguity is gone: a zero-argument scheme refuses a tail
-/// instead of quietly turning into something else. All validated here so a typo fails at parse with a
-/// teaching message, not at dial time.
-fn parse_target(addr: &str, entry: &str) -> eyre::Result<Target> {
-    // A trailing `+lossy` is the operator's opt-in to raw-stream FAN-OUT: the
-    // source may be reached by MANY consumers at once, and a consumer that falls behind has its bytes DROPPED
-    // rather than stall the producer or the others. Strip it here, then route the scheme.
-    let (addr, lossy) = match addr.strip_suffix("+lossy") {
-        Some(base) => (base, true),
-        None => (addr, false),
-    };
-    let Some((scheme, rest)) = addr.split_once(':') else {
-        eyre::bail!(
-            "`{entry}` names no target scheme. Every target is `<scheme>:<rest>`: {TARGET_SCHEMES}"
-        );
-    };
-    // `+lossy` is a claim only the operator can make ("this stream tolerates loss"), and only a LIVE
-    // single-writer source can honor it: a `file:` is static bytes (already safe fan-out by re-open, so a
-    // drop would just be corruption) and a forward or the reflector is not a raw-stream source at all.
-    // Refused once, here, rather than in every other arm.
-    if lossy && !matches!(scheme, "stdin" | "fifo") {
-        eyre::bail!(
-            "`+lossy` (raw-stream fan-out) is only valid on a `stdin:`/`fifo:` source, not `{scheme}:` \
-             (`{entry}`); drop it, or point the service at a live single-writer source"
-        );
-    }
-    match scheme {
-        // The two local stream endpoints, siblings: a TCP socket and a Unix socket. The splice does not care
-        // which, so they share one arm and one validator; `validate_forward` proves the tail, so
-        // `web=tcp:nonsense` fails here rather than at dial time as an opaque reset.
-        "tcp" | "unix" => {
-            validate_forward(addr)?;
-            Ok(Target::Handler(Arc::new(crate::builtins::Forward::new(
-                addr,
-            ))))
-        }
-        // The path-carrying raw-stream sources: native targets, not handlers, because the direction (a
-        // read-only source toward the peer) is fixed here at parse time and each carries its own path
-        // guards. A bare `file:`/`fifo:` with no path fails loudly in the constructor.
-        "file" => Ok(Target::RawStream(RawStream::file(rest, entry)?)),
-        "fifo" => Ok(Target::RawStream(RawStream::fifo(rest, entry, lossy)?)),
-        // `stdin:` sources this process's own fd 0 and `echo:` reflects the caller's own bytes back: neither
-        // names a host resource, so neither takes an argument.
-        "stdin" => {
-            no_argument(scheme, rest, entry)?;
-            Ok(Target::RawStream(RawStream::stdin(lossy)?))
-        }
-        "echo" => {
-            no_argument(scheme, rest, entry)?;
-            Ok(Target::Handler(Arc::new(crate::builtins::Echo)))
-        }
-        // Where the bare `host:port` fall-through used to be. A scheme tightbeam does not serve is a
-        // refusal naming the legal set, so an address it cannot resolve is never dialed on a guess. A
-        // handler is not among the schemes because it is not spellable at all: it binds by VALUE through
-        // [`Router::service`], which the grammar's doc teaches once rather than every operator's typo.
-        unknown => eyre::bail!(
-            "`{entry}` names an unknown target scheme `{unknown}:`. Every target is `<scheme>:<rest>`: \
-             {TARGET_SCHEMES}"
-        ),
+impl Target {
+    fn prepare(spec: TargetSpec) -> Result<Self, TargetError> {
+        // Only validated specifications reach constructors. Keep the selected backend's own guards;
+        // the specification proves syntax, not resource availability or safe public exposure.
+        Ok(match spec.primitive() {
+            Primitive::Tcp(addr) => Self::Handler(Arc::new(crate::builtins::Forward::new(addr))),
+            Primitive::Unix(_) => {
+                Self::Handler(Arc::new(crate::builtins::Forward::new(spec.as_str())))
+            }
+            Primitive::File(path) => Self::RawStream(RawStream::file(path, spec.as_str())?),
+            Primitive::Fifo(path, delivery) => Self::RawStream(RawStream::fifo(
+                path,
+                spec.as_str(),
+                delivery == Delivery::Lossy,
+            )?),
+            Primitive::Stdin(delivery) => {
+                Self::RawStream(RawStream::stdin(delivery == Delivery::Lossy)?)
+            }
+            Primitive::Echo => Self::Handler(Arc::new(crate::builtins::Echo)),
+        })
     }
 }
 
-/// Refuse a tail on a scheme that takes no argument (`stdin:`, `echo:`), so a typo is a parse error rather
-/// than a silent reinterpretation. This is the guard the bare-`host:port` grammar could not have: with a
-/// scheme on every target, `<word>:<number>` is unambiguously that scheme carrying an argument, and a
-/// zero-argument scheme that tolerated one would be quietly serving something the operator never named.
-fn no_argument(scheme: &str, rest: &str, entry: &str) -> eyre::Result<()> {
-    if rest.is_empty() {
-        return Ok(());
-    }
-    eyre::bail!("`{scheme}:` takes no argument, but `{entry}` gives it `{rest}`")
+// Definition errors retain only an entry index and categorical causes. In particular, neither the
+// invalid entry nor the foreign service-name parser report may survive in any error chain.
+#[derive(thiserror::Error, Debug)]
+#[error("service entry {index}: {cause}")]
+struct DefinitionError {
+    index: usize,
+    #[source]
+    cause: DefinitionCause,
 }
 
-/// Prove a forward addr names a local stream endpoint, so a service pointed at a bogus one
-/// (`web=tcp:nonsense`) fails at parse with a teaching message instead of at dial time as an opaque reset.
-/// The two endpoints are `tcp:<host>:<port>` and `unix:<path>`; whichever this admits is what
-/// `dial_and_splice` dials, so the grammar and the dial cannot disagree.
-fn validate_forward(addr: &str) -> eyre::Result<()> {
-    let endpoint = match addr.split_once(':') {
-        // `tcp:<host>:<port>`: a non-empty host and a real `u16` port, the exact shape `TcpStream::connect`
-        // takes once the scheme is stripped. Split from the RIGHT, so a bracketed IPv6 host keeps its colons.
-        Some(("tcp", rest)) => rest
-            .rsplit_once(':')
-            .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok()),
-        // `unix:<path>`: any non-empty path. Whether it exists is the dial's business, not the grammar's.
-        Some(("unix", path)) => !path.is_empty(),
-        _ => false,
-    };
-    if endpoint {
-        return Ok(());
-    }
-    eyre::bail!(
-        "`{addr}` is not a local stream endpoint; expected `tcp:<host>:<port>` or `unix:<path>`"
-    )
+#[derive(thiserror::Error, Debug)]
+enum DefinitionCause {
+    #[error("service entry has no name or target")]
+    MissingDefinition,
+    #[error("service name is not valid")]
+    InvalidName,
+    #[error("service name is already defined")]
+    AlreadyDefined,
+    #[error(transparent)]
+    Target(TargetSyntaxError),
 }
 
 #[cfg(test)]
