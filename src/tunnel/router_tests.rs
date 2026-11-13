@@ -6,10 +6,240 @@ use std::sync::Arc;
 
 use nauthy::Gate;
 
-use super::{Access, PublicRequest, PublicUnsafeRequest, Router, Services, Target};
+use super::{
+    Access, DefinitionCause, DefinitionError, PublicRequest, PublicUnsafeRequest, Router, Services,
+    Target,
+};
 use crate::raw_stream::RawStream;
 use crate::tunnel::fixtures::{GatedNoop, OpenNoop, family_gate, services, svc};
-use crate::tunnel::{Posture, ServiceCatalog, TargetKind};
+use crate::tunnel::{Posture, ServiceCatalog, TargetError, TargetKind, TargetSpec};
+
+#[test]
+fn a_batch_finishes_all_syntax_and_name_checks_before_any_preparation() {
+    for invalid in [
+        "missing",
+        "=echo:",
+        "bad=",
+        "bad name=echo:",
+        "bad=unknown:",
+        "bad=tcp:host:no-port",
+        "bad=unix:",
+        "bad=file:",
+        "bad=fifo:+lossy",
+        "bad=stdin:tail",
+        "bad=echo:+lossy",
+    ] {
+        let mut table = Services(HashMap::new());
+        let mut preparations = 0;
+        let error = table
+            .extend_parse_with(
+                &["first=stdin:+lossy".to_owned(), invalid.to_owned()],
+                |_| {
+                    preparations += 1;
+                    Ok(Target::Handler(Arc::new(crate::builtins::Echo)))
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.downcast_ref::<DefinitionError>().unwrap().index, 2);
+        assert_eq!(preparations, 0, "{invalid}");
+        assert!(table.0.is_empty());
+    }
+    for entries in [
+        vec![],
+        vec!["one=echo:".to_owned()],
+        vec!["one=stdin:".to_owned(), "two=fifo:pipe+lossy".to_owned()],
+    ] {
+        let mut table = Services(HashMap::new());
+        let mut prepared = Vec::new();
+        table
+            .extend_parse_with(&entries, |spec| {
+                prepared.push(spec.as_str().to_owned());
+                Ok(Target::Handler(Arc::new(crate::builtins::Echo)))
+            })
+            .unwrap();
+        assert_eq!(prepared.len(), entries.len());
+        for (text, entry) in prepared.iter().zip(&entries) {
+            assert_eq!(entry.split_once('=').unwrap().1, text);
+        }
+        assert_eq!(table.0.len(), entries.len());
+    }
+}
+
+#[test]
+fn batch_and_typed_target_collisions_precede_preparation() {
+    for entries in [
+        vec!["first=stdin:".to_owned(), "first=echo:".to_owned()],
+        vec!["first=stdin:".to_owned(), "held=stdin:+lossy".to_owned()],
+    ] {
+        let mut table = Services(HashMap::new())
+            .with_handler("held", OpenNoop)
+            .unwrap();
+        let mut preparations = 0;
+        let error = table
+            .extend_parse_with(&entries, |_| {
+                preparations += 1;
+                Ok(Target::Handler(Arc::new(crate::builtins::Echo)))
+            })
+            .unwrap_err();
+        let error = error.downcast_ref::<DefinitionError>().unwrap();
+        assert_eq!(error.index, 2);
+        assert!(matches!(error.cause, DefinitionCause::AlreadyDefined));
+        assert_eq!(preparations, 0);
+        assert_eq!(table.0.len(), 1);
+    }
+    let mut table = Services(HashMap::new())
+        .with_handler("held", OpenNoop)
+        .unwrap();
+    let mut preparations = 0;
+    let error = table
+        .insert_target(svc("held"), "stdin:".parse().unwrap(), |_| {
+            preparations += 1;
+            Ok(Target::Handler(Arc::new(crate::builtins::Echo)))
+        })
+        .unwrap_err();
+    assert!(matches!(error, TargetError::AlreadyDefined));
+    assert_eq!(preparations, 0);
+    let error = Router::new(Gate::Open)
+        .echo(svc("held"))
+        .unwrap()
+        .target(svc("held"), "stdin:".parse().unwrap())
+        .err()
+        .unwrap();
+    assert!(matches!(error, TargetError::AlreadyDefined));
+}
+
+#[test]
+fn ordinary_callers_share_grammar_and_retain_selected_backend_guards() {
+    for text in [
+        "tcp:host:0",
+        "tcp:[::1]:80",
+        "unix:socket",
+        "file:bytes",
+        "fifo:pipe",
+        "fifo:pipe+lossy",
+        "echo:",
+    ] {
+        let from_spec = Router::new(family_gate("primitive-spec"))
+            .target(svc("chosen"), text.parse::<TargetSpec>().unwrap())
+            .unwrap()
+            .expose()
+            .unwrap();
+        let from_parse = Router::new(family_gate("primitive-parse"))
+            .parse(&[format!("chosen={text}")])
+            .unwrap()
+            .expose()
+            .unwrap();
+        assert_eq!(from_spec.manifest(), from_parse.manifest());
+    }
+    assert!(
+        Router::new(Gate::Open)
+            .forward(svc("chosen"), "unix:path+lossy")
+            .is_ok()
+    );
+    assert!(
+        Router::new(Gate::Open)
+            .parse(&["chosen=unix:path+lossy".to_owned()])
+            .is_err()
+    );
+    for text in [
+        "tcp:host:0",
+        "tcp:[::1]:80",
+        "unix:path",
+        "tcp:host:no-port",
+        "unix:",
+        "echo:",
+    ] {
+        assert_eq!(
+            Router::new(Gate::Open).forward(svc("chosen"), text).is_ok(),
+            text.parse::<super::Endpoint>().is_ok(),
+        );
+    }
+    for (text, lossy) in [("stdin:", false), ("stdin:+lossy", true)] {
+        let selected =
+            Router::new(family_gate("selected-stdin")).target(svc("chosen"), text.parse().unwrap());
+        assert_eq!(selected.is_err(), RawStream::stdin(lossy).is_err());
+        if let Ok(router) = selected {
+            assert!(matches!(
+                router.services.0["chosen"].target,
+                Target::RawStream(_)
+            ));
+            assert!(router.public([svc("chosen")]).expose().is_err());
+        }
+    }
+    #[cfg(unix)]
+    for text in ["file:/dev/null", "fifo:/dev/null", "file:/", "fifo:/"] {
+        assert!(
+            Router::new(Gate::Open)
+                .target(svc("chosen"), text.parse().unwrap())
+                .unwrap()
+                .expose()
+                .is_err()
+        );
+        assert!(
+            Router::new(family_gate("selected-path"))
+                .target(svc("chosen"), text.parse().unwrap())
+                .unwrap()
+                .public_unsafe([svc("chosen")])
+                .expose()
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn invalid_definitions_and_forward_errors_have_only_safe_error_chains() {
+    for invalid in [
+        "credential-secret",
+        "credential-secret=",
+        "bad credential-secret=echo:",
+        "bad=credential-secret:path",
+        "bad=stdin:credential-secret",
+        "bad=echo:credential-secret",
+        "bad=tcp:credential-secret:not-a-port",
+        "bad=file:credential-secret+lossy",
+    ] {
+        let error = Router::new(Gate::Open)
+            .parse(&["first=stdin:".to_owned(), invalid.to_owned()])
+            .err()
+            .unwrap();
+        assert!(error.to_string().starts_with("service entry 2: "));
+        assert!(!format!("{error:?}").contains("credential-secret"));
+        for cause in error.chain() {
+            assert!(!cause.to_string().contains("credential-secret"));
+            assert!(!format!("{cause:?}").contains("credential-secret"));
+        }
+    }
+    for entries in [
+        vec![
+            "credential-secret=echo:".to_owned(),
+            "credential-secret=stdin:".to_owned(),
+        ],
+        vec![
+            "first=stdin:".to_owned(),
+            "credential-secret=stdin:".to_owned(),
+        ],
+    ] {
+        let error = Router::new(Gate::Open)
+            .echo(svc("credential-secret"))
+            .unwrap()
+            .parse(&entries)
+            .err()
+            .unwrap();
+        assert!(!format!("{error:?}").contains("credential-secret"));
+        for cause in error.chain() {
+            assert!(!cause.to_string().contains("credential-secret"));
+            assert!(!format!("{cause:?}").contains("credential-secret"));
+        }
+    }
+    let error = Router::new(Gate::Open)
+        .forward(svc("chosen"), "tcp:credential-secret:no-port")
+        .err()
+        .unwrap();
+    for cause in error.chain() {
+        assert!(!cause.to_string().contains("credential-secret"));
+        assert!(!format!("{cause:?}").contains("credential-secret"));
+    }
+}
 
 #[test]
 fn a_bare_service_name_is_rejected_with_a_hint() {
@@ -18,7 +248,8 @@ fn a_bare_service_name_is_rejected_with_a_hint() {
         panic!("bare `web` should be rejected, not served");
     };
     assert!(
-        err.to_string().contains("name=target"),
+        err.to_string()
+            .contains("service entry has no name or target"),
         "the error should teach the grammar: {err}"
     );
 }
@@ -30,7 +261,8 @@ fn a_bare_scheme_without_a_name_is_rejected() {
         panic!("bare `echo:` should be rejected, not served");
     };
     assert!(
-        err.to_string().contains("name=target"),
+        err.to_string()
+            .contains("service entry has no name or target"),
         "the error should teach the grammar: {err}"
     );
 }
@@ -89,8 +321,8 @@ fn an_unknown_scheme_is_refused_and_names_the_legal_set() {
             "the refusal names the fault: {message}"
         );
         assert!(
-            message.contains("`tcp:<host>:<port>`") && message.contains("`echo:`"),
-            "the refusal names the legal set: {message}"
+            !message.contains(entry),
+            "invalid input must not be retained: {message}"
         );
     }
 }
@@ -101,18 +333,15 @@ fn an_unknown_scheme_is_refused_and_names_the_legal_set() {
 /// a tail instead of quietly becoming something else.
 #[test]
 fn a_zero_argument_scheme_refuses_a_tail() {
-    for (entry, scheme) in [("demo=echo:80", "echo"), ("cam=stdin:80", "stdin")] {
+    for entry in ["demo=echo:80", "cam=stdin:80"] {
         let Err(err) = Services::parse(&[entry.to_owned()]) else {
             panic!("`{entry}` gives a tail to a zero-argument scheme and must be refused");
         };
         let message = err.to_string();
+        assert!(message.contains("target takes no argument"), "{message}");
         assert!(
-            message.contains(&format!("`{scheme}:` takes no argument")),
-            "the refusal names the scheme and the rule: {message}"
-        );
-        assert!(
-            message.contains("`80`"),
-            "the refusal quotes the offending tail: {message}"
+            !message.contains("80"),
+            "the offending tail must not be retained: {message}"
         );
     }
 }
@@ -149,7 +378,7 @@ fn a_named_service_pointed_at_a_bogus_addr_is_rejected() {
         panic!("`web=nonsense` names no target scheme and must be refused");
     };
     assert!(
-        err.to_string().contains("names no target scheme"),
+        err.to_string().contains("target has no scheme"),
         "the refusal names the fault: {err}"
     );
     // The tail of a `tcp:` target is still proven: a scheme alone does not make an addr dialable.
@@ -222,7 +451,8 @@ fn lossy_is_accepted_only_on_stdin_and_fifo_and_rejected_elsewhere() {
             panic!("`+lossy` on {entry} must be rejected at parse");
         };
         assert!(
-            err.to_string().contains("`+lossy`"),
+            err.to_string()
+                .contains("lossy mode is not supported for this target"),
             "the refusal must name the modifier: {err}"
         );
     }
