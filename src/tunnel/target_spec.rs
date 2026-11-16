@@ -1,6 +1,8 @@
 use core::str::FromStr;
 use std::path::Path;
 
+use nauthy::Service;
+
 /// A syntax-checked primitive target. Parsing does not prepare a backend or access the filesystem.
 ///
 /// Supported forms are `tcp:<host>:<port>`, `unix:<path>`, `file:<path>`, `fifo:<path>`, `stdin:`, and
@@ -26,6 +28,9 @@ impl TargetSpec {
     /// preserved: `~`, `.` and `..` are not expanded or normalized. On Windows, drive-relative and
     /// root-relative paths cannot be anchored; use an absolute path or a relative path without a drive
     /// prefix or root.
+    ///
+    /// Anchoring resolves a relative path against `cwd`; it is not containment: `..` and absolute paths
+    /// are kept as written.
     ///
     /// # Errors
     ///
@@ -182,9 +187,9 @@ pub enum TargetSyntaxError {
 /// A target-binding error.
 #[derive(thiserror::Error, Debug)]
 pub enum TargetError {
-    /// service name is already defined
-    #[error("service name is already defined")]
-    AlreadyDefined,
+    /// The service name is already served. The name is validated, never raw input, so it is retained.
+    #[error("service `{0}` is already defined")]
+    AlreadyDefined(Service),
     /// Backend preparation failed.
     #[error(transparent)]
     Preparation(#[from] eyre::Report),

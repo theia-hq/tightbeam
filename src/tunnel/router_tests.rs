@@ -6,13 +6,13 @@ use std::sync::Arc;
 
 use nauthy::Gate;
 
-use super::{
-    Access, DefinitionCause, DefinitionError, PublicRequest, PublicUnsafeRequest, Router, Services,
-    Target,
-};
+use super::{Access, PublicRequest, PublicUnsafeRequest, Router, Services, Target};
 use crate::raw_stream::RawStream;
 use crate::tunnel::fixtures::{GatedNoop, OpenNoop, family_gate, services, svc};
-use crate::tunnel::{Posture, ServiceCatalog, TargetError, TargetKind, TargetSpec};
+use crate::tunnel::{
+    DefinitionCause, DefinitionError, Posture, ServiceCatalog, TargetError, TargetKind, TargetSpec,
+    TargetSyntaxError,
+};
 
 #[test]
 fn a_batch_finishes_all_syntax_and_name_checks_before_any_preparation() {
@@ -40,7 +40,7 @@ fn a_batch_finishes_all_syntax_and_name_checks_before_any_preparation() {
                 },
             )
             .unwrap_err();
-        assert_eq!(error.downcast_ref::<DefinitionError>().unwrap().index, 2);
+        assert_eq!(error.downcast_ref::<DefinitionError>().unwrap().index(), 2);
         assert_eq!(preparations, 0, "{invalid}");
         assert!(table.0.is_empty());
     }
@@ -82,8 +82,8 @@ fn batch_and_typed_target_collisions_precede_preparation() {
             })
             .unwrap_err();
         let error = error.downcast_ref::<DefinitionError>().unwrap();
-        assert_eq!(error.index, 2);
-        assert!(matches!(error.cause, DefinitionCause::AlreadyDefined));
+        assert_eq!(error.index(), 2);
+        assert_eq!(error.cause(), &DefinitionCause::AlreadyDefined);
         assert_eq!(preparations, 0);
         assert_eq!(table.0.len(), 1);
     }
@@ -97,7 +97,7 @@ fn batch_and_typed_target_collisions_precede_preparation() {
             Ok(Target::Handler(Arc::new(crate::builtins::Echo)))
         })
         .unwrap_err();
-    assert!(matches!(error, TargetError::AlreadyDefined));
+    assert!(matches!(error, TargetError::AlreadyDefined(name) if name == svc("held")));
     assert_eq!(preparations, 0);
     let error = Router::new(Gate::Open)
         .echo(svc("held"))
@@ -105,7 +105,71 @@ fn batch_and_typed_target_collisions_precede_preparation() {
         .target(svc("held"), "stdin:".parse().unwrap())
         .err()
         .unwrap();
-    assert!(matches!(error, TargetError::AlreadyDefined));
+    assert!(matches!(error, TargetError::AlreadyDefined(name) if name == svc("held")));
+}
+
+#[test]
+fn a_parse_failure_downcasts_to_the_entry_index_and_its_syntax_cause() {
+    let error = Router::new(Gate::Open)
+        .parse(&["first=echo:".to_owned(), "bad=unknown:".to_owned()])
+        .err()
+        .unwrap();
+    let definition = error.downcast_ref::<DefinitionError>().unwrap();
+    assert_eq!(definition.index(), 2);
+    assert_eq!(
+        definition.cause(),
+        &DefinitionCause::Target(TargetSyntaxError::UnknownScheme)
+    );
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.downcast_ref() == Some(&TargetSyntaxError::UnknownScheme)),
+        "the syntax error rides the source chain"
+    );
+}
+
+#[test]
+fn a_duplicate_name_is_typed_from_parse_and_named_from_bind() {
+    let error = Router::new(Gate::Open)
+        .parse(&["web=echo:".to_owned(), "web=stdin:".to_owned()])
+        .err()
+        .unwrap();
+    let definition = error.downcast_ref::<DefinitionError>().unwrap();
+    assert_eq!(definition.index(), 2);
+    assert_eq!(definition.cause(), &DefinitionCause::AlreadyDefined);
+    // A bound name is a validated service name, not rejected input, so the bind refusal names it.
+    let error = Router::new(Gate::Open)
+        .echo(svc("web"))
+        .unwrap()
+        .echo(svc("web"))
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error.downcast_ref(), Some(TargetError::AlreadyDefined(name)) if *name == svc("web"))
+    );
+    assert!(format!("{error:#}").contains("`web`"), "{error:#}");
+    let error = Services(HashMap::new())
+        .with_handler("web", OpenNoop)
+        .unwrap()
+        .with_handler("web", OpenNoop)
+        .err()
+        .unwrap();
+    assert!(format!("{error:#}").contains("`web`"), "{error:#}");
+}
+
+#[test]
+fn a_definition_error_prints_its_cause_once() {
+    let error = Router::new(Gate::Open)
+        .parse(&["first=echo:".to_owned(), "bad=unknown:".to_owned()])
+        .err()
+        .unwrap();
+    let message = format!("{error:#}");
+    assert!(message.starts_with("service entry 2: "), "{message}");
+    assert_eq!(
+        message.matches("unknown target scheme").count(),
+        1,
+        "{message}"
+    );
 }
 
 #[test]
@@ -202,7 +266,7 @@ fn invalid_definitions_and_forward_errors_have_only_safe_error_chains() {
             .parse(&["first=stdin:".to_owned(), invalid.to_owned()])
             .err()
             .unwrap();
-        assert!(error.to_string().starts_with("service entry 2: "));
+        assert!(format!("{error:#}").starts_with("service entry 2: "));
         assert!(!format!("{error:?}").contains("credential-secret"));
         for cause in error.chain() {
             assert!(!cause.to_string().contains("credential-secret"));
@@ -248,8 +312,7 @@ fn a_bare_service_name_is_rejected_with_a_hint() {
         panic!("bare `web` should be rejected, not served");
     };
     assert!(
-        err.to_string()
-            .contains("service entry has no name or target"),
+        format!("{err:#}").contains("service entry has no name or target"),
         "the error should teach the grammar: {err}"
     );
 }
@@ -261,8 +324,7 @@ fn a_bare_scheme_without_a_name_is_rejected() {
         panic!("bare `echo:` should be rejected, not served");
     };
     assert!(
-        err.to_string()
-            .contains("service entry has no name or target"),
+        format!("{err:#}").contains("service entry has no name or target"),
         "the error should teach the grammar: {err}"
     );
 }
@@ -278,7 +340,7 @@ fn a_duplicate_service_name_is_refused_by_parse() {
         panic!("a duplicate name must be refused, never silently overwritten");
     };
     assert!(
-        err.to_string().contains("already defined"),
+        format!("{err:#}").contains("already defined"),
         "the refusal names the duplicate: {err}"
     );
 }
@@ -299,12 +361,12 @@ fn real_targets_parse() {
     }
 }
 
-/// The grammar is TOTAL: there is no fall-through arm, so a scheme tightbeam does not serve is refused by
-/// name and told the legal set, whether it was once a registry handler (`handler:`, `control.status:`), a
-/// typo, or the bare `host:port` the `tcp:` scheme replaced. Handlers bind by value on the Router, so no
-/// scheme names one.
+/// The grammar is TOTAL: there is no fall-through arm, so a scheme tightbeam does not serve is refused as
+/// unknown, without retaining the entry, whether it was once a registry handler (`handler:`,
+/// `control.status:`), a typo, or the bare `host:port` the `tcp:` scheme replaced. Handlers bind by value
+/// on the Router, so no scheme names one.
 #[test]
-fn an_unknown_scheme_is_refused_and_names_the_legal_set() {
+fn an_unknown_scheme_is_refused_without_retaining_the_entry() {
     for entry in [
         "a=handler:",
         "status=control.status:",
@@ -315,7 +377,7 @@ fn an_unknown_scheme_is_refused_and_names_the_legal_set() {
         let Err(err) = Services::parse(&[entry.to_owned()]) else {
             panic!("`{entry}` names an unknown scheme and must be refused");
         };
-        let message = err.to_string();
+        let message = format!("{err:#}");
         assert!(
             message.contains("unknown target scheme"),
             "the refusal names the fault: {message}"
@@ -337,7 +399,7 @@ fn a_zero_argument_scheme_refuses_a_tail() {
         let Err(err) = Services::parse(&[entry.to_owned()]) else {
             panic!("`{entry}` gives a tail to a zero-argument scheme and must be refused");
         };
-        let message = err.to_string();
+        let message = format!("{err:#}");
         assert!(message.contains("target takes no argument"), "{message}");
         assert!(
             !message.contains("80"),
@@ -370,7 +432,7 @@ fn raw_stream_schemes_resolve_to_a_raw_stream_target_never_a_forward_or_handler(
     );
 }
 
-/// An addr with no colon carries no scheme at all, so it is not a target: refused with the legal set,
+/// An addr with no colon carries no scheme at all, so it is not a target: refused as having no scheme,
 /// never dialed on the guess that it might be a host.
 #[test]
 fn a_named_service_pointed_at_a_bogus_addr_is_rejected() {
@@ -378,7 +440,7 @@ fn a_named_service_pointed_at_a_bogus_addr_is_rejected() {
         panic!("`web=nonsense` names no target scheme and must be refused");
     };
     assert!(
-        err.to_string().contains("target has no scheme"),
+        format!("{err:#}").contains("target has no scheme"),
         "the refusal names the fault: {err}"
     );
     // The tail of a `tcp:` target is still proven: a scheme alone does not make an addr dialable.
@@ -451,8 +513,7 @@ fn lossy_is_accepted_only_on_stdin_and_fifo_and_rejected_elsewhere() {
             panic!("`+lossy` on {entry} must be rejected at parse");
         };
         assert!(
-            err.to_string()
-                .contains("lossy mode is not supported for this target"),
+            format!("{err:#}").contains("lossy mode is not supported for this target"),
             "the refusal must name the modifier: {err}"
         );
     }
@@ -538,7 +599,7 @@ fn a_router_refuses_a_duplicate_across_bind_verbs() {
         through_parse.is_err(),
         "the parse entry must refuse the duplicate too"
     );
-    // And within one `parse`, the duplicate is refused by the same message.
+    // And within one `parse`, the duplicate is refused too, by entry index rather than by name.
     let Err(error) = Router::new(Gate::Open).parse(&[
         "web=tcp:127.0.0.1:80".to_owned(),
         "web=tcp:127.0.0.1:81".to_owned(),
@@ -546,7 +607,7 @@ fn a_router_refuses_a_duplicate_across_bind_verbs() {
         panic!("a duplicate `name=target` entry must be refused");
     };
     assert!(
-        error.to_string().contains("already defined"),
+        format!("{error:#}").contains("already defined"),
         "the refusal names the duplicate: {error}"
     );
 }

@@ -41,7 +41,7 @@ pub use connector::{
 };
 pub use cut::{AdmittedChains, LiveCuts};
 pub use exposer::{CancellationToken, Exposer};
-pub use router::{ManifestEntry, RawSource, Router, TARGET_SCHEMES, TargetKind};
+pub use router::{DefinitionCause, DefinitionError, ManifestEntry, RawSource, Router, TargetKind};
 pub use target_spec::{TargetError, TargetSpec, TargetSyntaxError};
 
 /// How long to wait for a `fifo:` WRITER before dropping the stream. The FIFO open itself is NONBLOCKING

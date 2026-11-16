@@ -136,7 +136,8 @@ impl Router {
     /// # Errors
     ///
     /// Returns an error for an invalid definition, an invalid name or target, a duplicate or
-    /// already-served name, or backend preparation failure.
+    /// already-served name, or backend preparation failure. A refused definition is a
+    /// [`DefinitionError`], reachable by downcasting the returned report.
     pub fn parse(mut self, entries: &[String]) -> eyre::Result<Self> {
         self.services.extend_parse(entries)?;
         Ok(self)
@@ -227,7 +228,7 @@ impl Router {
     /// bind verb shares.
     fn bind(mut self, name: Service, target: Target, access: Access) -> eyre::Result<Self> {
         if self.services.0.contains_key(name.as_str()) {
-            return Err(TargetError::AlreadyDefined.into());
+            return Err(TargetError::AlreadyDefined(name).into());
         }
         self.services
             .0
@@ -459,7 +460,7 @@ impl Services {
         mut prepare: impl FnMut(TargetSpec) -> Result<Target, TargetError>,
     ) -> Result<(), TargetError> {
         if self.0.contains_key(name.as_str()) {
-            return Err(TargetError::AlreadyDefined);
+            return Err(TargetError::AlreadyDefined(name));
         }
         let target = prepare(spec)?;
         self.0.insert(name.to_string(), Route::family(target));
@@ -474,9 +475,9 @@ impl Services {
     #[cfg(test)]
     pub(super) fn with_handler(mut self, name: &str, handler: impl Handler) -> eyre::Result<Self> {
         let Self(services) = &mut self;
-        name.parse::<Service>()?;
+        let service = name.parse::<Service>()?;
         if services.contains_key(name) {
-            return Err(TargetError::AlreadyDefined.into());
+            return Err(TargetError::AlreadyDefined(service).into());
         }
         services.insert(
             name.to_owned(),
@@ -855,14 +856,6 @@ impl PublicServices {
     }
 }
 
-/// Supported forms are `tcp:<host>:<port>`, `unix:<path>`, `file:<path>`, `fifo:<path>`, `stdin:`, and `echo:`.
-///
-/// Public because a consumer that serves its OWN schemes on top of this grammar has to name both sets in
-/// one refusal, and the only alternative is retyping this list somewhere it can rot. It is prose for a
-/// message, not a parseable list: match on the scheme, not on this.
-pub const TARGET_SCHEMES: &str = "`tcp:<host>:<port>`, `unix:<path>`, `file:<path>`, `fifo:<path>`, \
-                              `stdin:`, `echo:`";
-
 impl Target {
     fn prepare(spec: TargetSpec) -> Result<Self, TargetError> {
         // Only validated specifications reach constructors. Keep the selected backend's own guards;
@@ -886,24 +879,64 @@ impl Target {
     }
 }
 
-// Definition errors retain only an entry index and categorical causes. In particular, neither the
-// invalid entry nor the foreign service-name parser report may survive in any error chain.
-#[derive(thiserror::Error, Debug)]
-#[error("service entry {index}: {cause}")]
-struct DefinitionError {
+/// A `name=target` definition refused by [`Router::parse`], before any target was prepared.
+///
+/// Reach it by downcasting the returned report. It retains only the entry's index and a categorical
+/// cause, never the entry's text.
+// The fields stay private so the index is one-based by construction, not by a caller's promise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefinitionError {
     index: usize,
-    #[source]
     cause: DefinitionCause,
 }
 
-#[derive(thiserror::Error, Debug)]
-enum DefinitionCause {
+impl DefinitionError {
+    /// The one-based position of the refused entry in the parsed batch.
+    #[must_use]
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Why the entry was refused.
+    #[must_use]
+    pub fn cause(&self) -> &DefinitionCause {
+        &self.cause
+    }
+}
+
+// The message names only the entry; the cause rides `source()`, so a `{:#}` chain prints it once.
+impl core::fmt::Display for DefinitionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "service entry {}", self.index)
+    }
+}
+
+// Hand-written because the syntax case must expose the public `TargetSyntaxError` itself as the source.
+// A `#[source]` field would make the cause wrapper the chain element, so a downcast to the syntax error
+// misses; the wrapper's transparent variant forwards to the syntax error's own (empty) source instead.
+impl core::error::Error for DefinitionError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match &self.cause {
+            DefinitionCause::Target(syntax) => Some(syntax),
+            cause => Some(cause),
+        }
+    }
+}
+
+/// The cause of a [`DefinitionError`]. Every cause is categorical; none retains the refused entry,
+/// including the foreign service-name parser's report.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefinitionCause {
+    /// The entry is not `name=target` with both sides nonempty.
     #[error("service entry has no name or target")]
     MissingDefinition,
+    /// The name is not a valid service name.
     #[error("service name is not valid")]
     InvalidName,
+    /// The name repeats an earlier entry or an already-served name.
     #[error("service name is already defined")]
     AlreadyDefined,
+    /// The target is not valid target syntax.
     #[error(transparent)]
     Target(TargetSyntaxError),
 }
