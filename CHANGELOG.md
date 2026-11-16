@@ -35,13 +35,18 @@ One denylist holds revoked caps and revoked keys, and a revoked key ends a live 
   while stdin is an open terminal. It used to wait for the next keystroke.
 
 ### Changed
-- **A workspace that depends on `tightbeam` must patch noq-proto**, the QUIC library iroh uses, until a
-  noq-proto release fixes a bug that lets a peer make an endpoint buffer out-of-order stream data
-  without limit (the bug RUSTSEC-2026-0185 names in quinn-proto, which noq forks). cargo reads `[patch]`
-  only in a workspace's root `Cargo.toml`, never from a dependency, so add this to yours:
+- **A workspace that depends on `tightbeam` must patch noq-proto and noq-udp**, the QUIC and UDP
+  libraries iroh uses, until noq releases fix them. noq-proto lets a peer make an endpoint buffer
+  out-of-order stream data without limit (the bug RUSTSEC-2026-0185 names in quinn-proto, which noq
+  forks). The source below also fixes RUSTSEC-2026-0339 to 0343, 0523 (a `MAX_STREAM_DATA` frame could
+  open streams beyond the limit) and 0524 (a long Retry or address-validation token could panic or
+  exhaust memory in a client) in noq-proto, and 0538 (the receive loop could spin after a truncated
+  datagram on Apple and some BSD targets) in noq-udp. cargo reads `[patch]` only in a workspace's root
+  `Cargo.toml`, never from a dependency, so add this to yours:
   ```toml
   [patch.crates-io]
-  noq-proto = { git = "https://github.com/n0-computer/noq", rev = "d7c3160a7e7b5cb36682eae04e364d3f50e28925" }
+  noq-proto = { git = "https://github.com/theia-hq/noq", rev = "e97ac991b23287afe8756f64942ebc01e0a3d5a2" }
+  noq-udp = { git = "https://github.com/theia-hq/noq", rev = "e97ac991b23287afe8756f64942ebc01e0a3d5a2" }
   ```
 
 ## v0.18.0
