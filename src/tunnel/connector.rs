@@ -3,14 +3,11 @@
 //! [`Connector`] resolves what to dial, what to ask for, and what credential to present, then drives it
 //! one of three ways: a preflighted [`PortForward`], a stdio bridge, or a [`ServiceSession`] whose every
 //! stream repeats the handshake. [`Connector::open_on`] is that handshake on a session the caller already
-//! holds, so one session can carry many services. [`PresentingConnector`] is the same dial with the
-//! credential rule moved into the type system.
+//! holds, so one session can carry many services.
 
 use core::time::Duration;
 
-use bifrost::{
-    ConnInfo, Discovery, Node, NodeId, PathChanges, PeerProven, Refusal, Session, Transport,
-};
+use bifrost::{ConnInfo, Discovery, Node, NodeId, PathChanges, Refusal, Session, Transport};
 use eyre::WrapErr as _;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt as _, StreamExt as _};
@@ -53,10 +50,6 @@ pub struct WrongPeer {
 /// [`Connector::to_node`] (a raw node id, optionally presenting a [`Link`]) or [`Connector::from_link`]
 /// (a link that supplies both the node and the token), then drives it with
 /// [`Connector::preflight`] (then [`PortForward::run`]) or [`Connector::pipe_stdio`].
-///
-/// This type is the path for a transport selected at run time, where no compile-time bound is possible;
-/// a caller whose transport type is fixed should prefer [`PresentingConnector`], which enforces the
-/// credential rule at compile time.
 pub struct Connector {
     dial: NodeId,
     service: Service,
@@ -140,9 +133,7 @@ impl Connector {
         // (the host tears its serving half down); every later per-connection stream presents the same
         // request to the same gate, so this one admission faithfully predicts theirs.
         let (mut writer, mut reader) = session.open_bi().await?;
-        // The checked writer: a request presenting a credential refuses here, before any byte, when the
-        // session's declared profile does not prove the peer.
-        request.write_checked::<T::Session, _>(&mut writer).await?;
+        request.write(&mut writer).await?;
         if let Response::Refused(refusal) = Response::read(&mut reader).await? {
             return Err(DialRefused {
                 dial: self.dial,
@@ -174,7 +165,7 @@ impl Connector {
     ) -> eyre::Result<()> {
         let session = node.connect(self.dial).await?;
         let (writer, reader) = session.open_bi().await?;
-        request_stdio::<T::Session, _, _>(self.request(), writer, reader).await
+        request_stdio(self.request(), writer, reader).await
     }
 
     /// Reach the peer and return a [`ServiceSession`]: a [`Session`] whose every `open_bi` first speaks
@@ -206,13 +197,15 @@ impl Connector {
     /// A host can end the session, and every stream on it, when a grant one of its streams was admitted
     /// on expires or is revoked.
     ///
+    /// The session's transport must prove the peer holds the key it is reached under, as bifrost's
+    /// `Transport` checklist requires; the credential goes to whoever answers.
+    ///
     /// # Errors
     ///
     /// [`bifrost::Error::Stream`] carrying [`WrongPeer`] when `session` reaches a peer other than the one
     /// this connector dials; nothing is sent. [`bifrost::Error::Refused`] with the host's typed [`Refusal`]
-    /// when the host does not admit the stream. Any other failure (the stream would not open, a credential
-    /// presented on a session that does not prove the peer, a broken reply) is the session's own error or
-    /// [`bifrost::Error::Stream`] carrying the cause.
+    /// when the host does not admit the stream. Any other failure (the stream would not open, a broken
+    /// reply) is the session's own error or [`bifrost::Error::Stream`] carrying the cause.
     pub async fn open_on<S: Session>(
         &self,
         session: &S,
@@ -227,10 +220,8 @@ impl Connector {
             })));
         }
         let (mut writer, mut reader) = session.open_bi().await?;
-        // The checked writer refuses a credential over a session whose declared profile does not prove
-        // the peer, before the request's first byte; the profile is the session's own.
         self.request()
-            .write_checked::<S, _>(&mut writer)
+            .write(&mut writer)
             .await
             .map_err(|error| bifrost::Error::Stream(Box::new(error)))?;
         match Response::read(&mut reader)
@@ -242,136 +233,6 @@ impl Connector {
             // walking the source chain for a formatted reason.
             Response::Refused(refusal) => Err(bifrost::Error::Refused(refusal)),
         }
-    }
-}
-
-/// A dial that presents a credential, in its compile-time-checked form.
-///
-/// Constructed with the credential it always presents: a [`Link`] in slot 1
-/// ([`to_node`](Self::to_node) or [`from_link`](Self::from_link)), optionally with a membership badge
-/// in slot 2 ([`with_membership`](Self::with_membership)). Every dial method requires the transport's
-/// declared profile to prove the peer (`T::Security: PeerProven`), so a credential over a
-/// self-announced transport is a compile error, never a runtime hope. The unbounded [`Connector`]
-/// carries the same rule at run time, for a transport chosen dynamically.
-///
-/// Prefer this type when the transport type is fixed; a transport selected at run time stays on
-/// [`Connector`], where the checked writer enforces the same rule.
-///
-/// The announced profile is rejected where a proven peer is required:
-///
-/// ```compile_fail,E0277
-/// # use core::net::SocketAddr;
-/// # use bifrost::{Addr, Announced, Error, Node, NodeId, NoDiscovery, PathChanges, Session, Transport};
-/// # use nauthy::{Link, Service};
-/// # use tightbeam::tunnel::PresentingConnector;
-/// #
-/// # struct AnnouncedTransport;
-/// # struct AnnouncedSession;
-/// #
-/// # impl Transport for AnnouncedTransport {
-/// #     type Security = Announced;
-/// #     type Session = AnnouncedSession;
-/// #     fn node_id(&self) -> NodeId { unimplemented!() }
-/// #     fn local_addr(&self) -> Addr { unimplemented!() }
-/// #     fn bound_sockets(&self) -> Vec<SocketAddr> { unimplemented!() }
-/// #     async fn connect(&self, _: Addr) -> Result<Self::Session, Error> { unimplemented!() }
-/// #     async fn accept(&self) -> Result<Self::Session, Error> { unimplemented!() }
-/// #     async fn close(&self) {}
-/// # }
-/// #
-/// # impl Session for AnnouncedSession {
-/// #     type Security = Announced;
-/// #     type Write = Vec<u8>;
-/// #     type Read = &'static [u8];
-/// #     fn peer(&self) -> NodeId { unimplemented!() }
-/// #     async fn open_bi(&self) -> Result<(Self::Write, Self::Read), Error> { unimplemented!() }
-/// #     async fn accept_bi(&self) -> Result<(Self::Write, Self::Read), Error> { unimplemented!() }
-/// #     async fn wait_closed(&self) {}
-/// #     fn close(&self) {}
-/// #     fn path_changes(&self) -> PathChanges { unimplemented!() }
-/// # }
-/// #
-/// # fn dial(node: &Node<AnnouncedTransport, NoDiscovery>, link: &Link, service: Service) {
-/// // `Announced` does not implement `PeerProven`, so this does not compile:
-/// let _ = PresentingConnector::from_link(link, service).map(|dial| dial.preflight(node, 0));
-/// # }
-/// ```
-pub struct PresentingConnector {
-    /// The credential-bearing dial this type vouches for; its slots are fixed at construction, so the
-    /// type cannot exist without a credential.
-    connector: Connector,
-}
-
-impl PresentingConnector {
-    /// Dial a raw node id, presenting `present` (slot 1). The compile-time twin of
-    /// [`Connector::to_node`] with a `Link` in `present`.
-    pub fn to_node(dial: NodeId, service: Service, present: Link) -> Self {
-        Self {
-            connector: Connector::to_node(dial, service, Some(present)),
-        }
-    }
-
-    /// Dial the node a link names, presenting the link (slot 1). The compile-time twin of
-    /// [`Connector::from_link`].
-    ///
-    /// # Errors
-    ///
-    /// As [`Connector::from_link`].
-    pub fn from_link(link: &Link, service: Service) -> Result<Self, bifrost::KeyError> {
-        Ok(Self {
-            connector: Connector::from_link(link, service)?,
-        })
-    }
-
-    /// Also present `badge` in slot 2 (the authority-bound AND); see
-    /// [`Connector::with_membership`].
-    #[must_use]
-    pub fn with_membership(mut self, badge: Link) -> Self {
-        self.connector = self.connector.with_membership(badge);
-        self
-    }
-
-    /// The node this connector dials.
-    pub fn dial(&self) -> NodeId {
-        self.connector.dial()
-    }
-
-    /// The service this connector requests.
-    pub fn service(&self) -> &Service {
-        self.connector.service()
-    }
-
-    /// Reach the peer, confirm the gate admits this connector, and bind the local port; see
-    /// [`Connector::preflight`].
-    pub async fn preflight<T: Transport, D: Discovery>(
-        self,
-        node: &Node<T, D>,
-        port: u16,
-    ) -> eyre::Result<PortForward<T::Session>>
-    where
-        T::Security: PeerProven,
-    {
-        self.connector.preflight(node, port).await
-    }
-
-    /// Reach the service over one stream and pipe it against this process's stdin/stdout; see
-    /// [`Connector::pipe_stdio`].
-    pub async fn pipe_stdio<T: Transport, D: Discovery>(self, node: &Node<T, D>) -> eyre::Result<()>
-    where
-        T::Security: PeerProven,
-    {
-        self.connector.pipe_stdio(node).await
-    }
-
-    /// Reach the peer and return a [`ServiceSession`]; see [`Connector::open_service`].
-    pub async fn open_service<T: Transport, D: Discovery>(
-        self,
-        node: &Node<T, D>,
-    ) -> eyre::Result<ServiceSession<T::Session>>
-    where
-        T::Security: PeerProven,
-    {
-        self.connector.open_service(node).await
     }
 }
 
@@ -489,9 +350,6 @@ pub struct ServiceSession<S> {
 }
 
 impl<S: Session> Session for ServiceSession<S> {
-    // The wrapper carries the wrapped transport's declaration, so the security fact survives the
-    // wrapping: a caller holding a `ServiceSession` still knows what proved the peer.
-    type Security = S::Security;
     type Write = S::Write;
     type Read = S::Read;
 
@@ -535,25 +393,21 @@ async fn forward<S: Session>(session: &S, request: Request, tcp: TcpStream) -> e
         .open_bi()
         .await
         .wrap_err("opening a stream to the peer")?;
-    request_service::<S, _, _>(request, tcp, writer, reader).await
+    request_service(request, tcp, writer, reader).await
 }
 
 /// Open a stream to a service: send the request, and if the host accepts, pipe the connection.
-///
-/// Generic over the session so the checked writer can read the session's declared security profile; the
-/// caller names it, since the profile travels in the type and not in the stream halves.
-async fn request_service<S, W, R>(
+async fn request_service<W, R>(
     request: Request,
     tcp: TcpStream,
     mut writer: W,
     mut reader: R,
 ) -> eyre::Result<()>
 where
-    S: Session,
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
-    request.write_checked::<S, _>(&mut writer).await?;
+    request.write(&mut writer).await?;
     match Response::read(&mut reader).await? {
         Response::Ok => splice(tcp, writer, reader).await?,
         Response::Refused(refusal) => return Err(bifrost::Error::Refused(refusal).into()),
@@ -566,13 +420,12 @@ where
 /// [`request_service`], but the local ends are the process's own std streams, and the pump
 /// ([`pipe_stdio_bridge`]) returns when the PEER closes rather than waiting on a stdin that (at a terminal)
 /// never EOFs, so a reached command exits when the command does.
-async fn request_stdio<S, W, R>(request: Request, mut writer: W, mut reader: R) -> eyre::Result<()>
+async fn request_stdio<W, R>(request: Request, mut writer: W, mut reader: R) -> eyre::Result<()>
 where
-    S: Session,
     W: io::AsyncWrite + Unpin,
     R: io::AsyncRead + Unpin,
 {
-    request.write_checked::<S, _>(&mut writer).await?;
+    request.write(&mut writer).await?;
     match Response::read(&mut reader).await? {
         Response::Ok => pipe_stdio_bridge(writer, reader).await?,
         Response::Refused(refusal) => return Err(bifrost::Error::Refused(refusal).into()),

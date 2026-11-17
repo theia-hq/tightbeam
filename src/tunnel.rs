@@ -36,8 +36,7 @@ mod fixtures;
 pub use admit::resolve_gate;
 pub use catalog::{CatalogTooLarge, MAX_CATALOG_BLOB, Posture, ServiceCatalog, ServiceEntry};
 pub use connector::{
-    ConnectionLost, Connector, DialRefused, PortForward, PresentingConnector, ServiceSession,
-    WrongPeer,
+    ConnectionLost, Connector, DialRefused, PortForward, ServiceSession, WrongPeer,
 };
 pub use cut::{AdmittedChains, LiveCuts};
 pub use exposer::{CancellationToken, Exposer};

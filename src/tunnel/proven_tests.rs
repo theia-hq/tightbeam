@@ -6,10 +6,7 @@ use core::time::Duration;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use bifrost::{
-    Announced, ChannelProtection, NoDiscovery, Node, NodeId, Path, PathChanges, PeerProof, Refusal,
-    Security, Session,
-};
+use bifrost::{NoDiscovery, Node, NodeId, Refusal, Session};
 use bifrost_mem::MemTransport;
 use nauthy::{Cap, Gate, Identity, Origin, ProvenPeer, Revocations, VerifyKey};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -21,8 +18,7 @@ use crate::identity::AsVerifyKey as _;
 use crate::open_policy::ProvenOnly;
 use crate::tunnel::cut::{AdmittedChains, Cut, Cuts, LiveCuts};
 use crate::tunnel::exposer::{
-    PROVEN_STREAM_DEADLINE, PROVEN_STREAM_PERMITS, PublicPool, PublicSession, Serving, SessionPeer,
-    serve_session,
+    PROVEN_STREAM_DEADLINE, PROVEN_STREAM_PERMITS, PublicPool, PublicSession, Serving,
 };
 use crate::tunnel::fixtures::{GatedNoop, ServiceStream, svc};
 use crate::tunnel::router::{Access, PublicServices, Route, Services, Target};
@@ -127,10 +123,7 @@ fn serve(exposer: Exposer) -> NodeId {
     let node = Node::new(MemTransport::bind(), NoDiscovery);
     let id = node.node_id();
     tokio::task::spawn_local(async move {
-        exposer
-            .run(&node, CancellationToken::new())
-            .await
-            .expect("exposer runs");
+        exposer.run(&node, CancellationToken::new()).await;
     });
     id
 }
@@ -186,120 +179,6 @@ fn serving_state(
     }
 }
 
-/// An announced session that hands `serve_session` one pre-built stream: the peer merely claims its key.
-struct AnnouncedSession {
-    peer: NodeId,
-    stream: tokio::sync::Mutex<
-        Option<(
-            tokio::io::WriteHalf<tokio::io::DuplexStream>,
-            tokio::io::ReadHalf<tokio::io::DuplexStream>,
-        )>,
-    >,
-}
-
-impl Session for AnnouncedSession {
-    type Security = Announced;
-    type Write = tokio::io::WriteHalf<tokio::io::DuplexStream>;
-    type Read = tokio::io::ReadHalf<tokio::io::DuplexStream>;
-
-    fn peer(&self) -> NodeId {
-        self.peer
-    }
-
-    async fn open_bi(&self) -> Result<(Self::Write, Self::Read), bifrost::Error> {
-        Err(bifrost::Error::Closed)
-    }
-
-    async fn accept_bi(&self) -> Result<(Self::Write, Self::Read), bifrost::Error> {
-        self.stream
-            .lock()
-            .await
-            .take()
-            .ok_or(bifrost::Error::Closed)
-    }
-
-    async fn wait_closed(&self) {}
-
-    fn close(&self) {}
-
-    /// Matches `conn_info`'s default: a double has no path to report.
-    fn path_changes(&self) -> PathChanges {
-        PathChanges::fixed(Path::Unknown)
-    }
-}
-
-/// A peer that only announced its key never reaches a proven-only route, even one that knows the key it
-/// announced: the witness would say the transport proved a key it did not. The check runs whatever the
-/// base gate is, not only when the gate wants a token.
-#[tokio::test]
-async fn proven_only_route_refuses_an_announced_peer() {
-    use crate::protocol::{Request, Response};
-
-    let peer = NodeId::from_ed25519_secret(&[43u8; 32]);
-    let keys = Arc::new(Keys::default());
-    let serving = Arc::new(serving_state(&keys, |_| true));
-
-    let (client, server) = tokio::io::duplex(1024);
-    let (server_read, server_write) = tokio::io::split(server);
-    let (mut client_read, mut client_write) = tokio::io::split(client);
-    let session = AnnouncedSession {
-        peer,
-        stream: tokio::sync::Mutex::new(Some((server_write, server_read))),
-    };
-    let (response, served) = tokio::join!(
-        async {
-            Request {
-                service: PICKUP.to_owned(),
-                capability: None,
-                membership: None,
-            }
-            .write(&mut client_write)
-            .await
-            .expect("write request");
-            Response::read(&mut client_read)
-                .await
-                .expect("read response")
-        },
-        serve_session(session, Arc::clone(&serving))
-    );
-    served.expect("the session drains after the refused stream");
-    assert_eq!(
-        response,
-        Response::Refused(Refusal::NotAdmitted),
-        "an announced key never reaches a proven-only route"
-    );
-
-    // The same ruling, read at the core: the transport's claim is what refused it.
-    let announced = SessionPeer {
-        node: peer,
-        security: Security {
-            peer: PeerProof::Announced,
-            channel: ChannelProtection::Aead,
-        },
-    };
-    let ruled = admit(
-        Admission {
-            gate: &serving.gate,
-            public: &serving.public,
-            public_unsafe: &serving.public_unsafe,
-            pool: &serving.public_pool,
-            proven: Proven {
-                routes: &serving.services,
-                pool: &serving.proven_pool,
-            },
-        },
-        &PublicSession::default(),
-        announced,
-        None,
-        None,
-        &svc(PICKUP),
-    );
-    assert!(
-        matches!(ruled, Err(HostRefusal::PeerNotProven { .. })),
-        "refused because the transport did not prove the key: {ruled:?}"
-    );
-}
-
 /// A proven witness is minted for a proven-only route and nowhere else: a peer with no token that such a
 /// route knows reaches it, and the same peer is refused on a family route and on a member route with the
 /// uniform answer a stranger gets.
@@ -307,13 +186,7 @@ async fn proven_only_route_refuses_an_announced_peer() {
 async fn a_proven_witness_reaches_no_family_or_member_route() {
     let keys = Arc::new(Keys::default());
     let serving = serving_state(&keys, |_| true);
-    let peer = SessionPeer {
-        node: NodeId::from_ed25519_secret(&[44u8; 32]),
-        security: Security {
-            peer: PeerProof::Proven,
-            channel: ChannelProtection::Aead,
-        },
-    };
+    let peer = NodeId::from_ed25519_secret(&[44u8; 32]);
     let admission = Admission {
         gate: &serving.gate,
         public: &serving.public,
@@ -661,13 +534,7 @@ fn a_proven_key_is_checked_before_a_slot_is_taken() {
         },
     );
     serving.proven_pool = Arc::clone(&pool);
-    let peer = SessionPeer {
-        node: NodeId::from_ed25519_secret(&[46u8; 32]),
-        security: Security {
-            peer: PeerProof::Proven,
-            channel: ChannelProtection::Aead,
-        },
-    };
+    let peer = NodeId::from_ed25519_secret(&[46u8; 32]);
     let admitted = admit(
         Admission {
             gate: &serving.gate,
@@ -745,13 +612,7 @@ async fn a_refusal_nobody_reads_frees_its_proven_slot_by_the_deadline() {
     let mut serving = serving_state(&keys, |_| true);
     serving.enabled = Box::new(NoneEnabled);
     let serving = Arc::new(serving);
-    let peer = SessionPeer {
-        node: NodeId::from_ed25519_secret(&[47u8; 32]),
-        security: Security {
-            peer: PeerProof::Proven,
-            channel: ChannelProtection::Aead,
-        },
-    };
+    let peer = NodeId::from_ed25519_secret(&[47u8; 32]);
     let (mut client, server) = tokio::io::duplex(1024);
     Request {
         service: PICKUP.to_owned(),

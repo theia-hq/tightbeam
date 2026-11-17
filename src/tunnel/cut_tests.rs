@@ -91,20 +91,20 @@ fn serve(exposer: Exposer) -> bifrost::NodeId {
     let node = Node::new(MemTransport::bind(), NoDiscovery);
     let id = node.node_id();
     tokio::task::spawn_local(async move {
-        exposer
-            .run(&node, CancellationToken::new())
-            .await
-            .expect("exposer runs");
+        exposer.run(&node, CancellationToken::new()).await;
     });
     id
 }
 
-/// Whether a stream left open, and never half-closed by us, is ended by the host within [`WITHIN`].
+/// Whether the host closes the session under a stream left open, and never half-closed by us, within
+/// [`WITHIN`]: the read fails with `ConnectionAborted`, the mem transport's mark of a closed session. A
+/// clean end does not count, since a host that only drops the stream's writer ends it cleanly, and that
+/// is not a cut.
 async fn host_ends<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> bool {
     let mut byte = [0u8; 1];
     matches!(
         tokio::time::timeout(WITHIN, reader.read(&mut byte)).await,
-        Ok(Ok(0) | Err(_))
+        Ok(Err(error)) if error.kind() == tokio::io::ErrorKind::ConnectionAborted
     )
 }
 
@@ -1023,7 +1023,6 @@ struct Closing {
 }
 
 impl bifrost::Session for Closing {
-    type Security = <bifrost_mem::MemSession as bifrost::Session>::Security;
     type Write = <bifrost_mem::MemSession as bifrost::Session>::Write;
     type Read = <bifrost_mem::MemSession as bifrost::Session>::Read;
 
@@ -1149,7 +1148,6 @@ impl Handshaking {
 const _: () = assert!(Handshaking::TAKES.as_millis() > CUT_SWEEP.as_millis());
 
 impl bifrost::Transport for Handshaking {
-    type Security = <MemTransport as bifrost::Transport>::Security;
     type Session = <MemTransport as bifrost::Transport>::Session;
 
     fn node_id(&self) -> bifrost::NodeId {
@@ -1197,10 +1195,7 @@ async fn a_handshake_in_flight_across_a_sweep_is_still_accepted() {
             let node = Node::new(Handshaking(MemTransport::bind()), NoDiscovery);
             let host = node.node_id();
             tokio::task::spawn_local(async move {
-                exposer
-                    .run(&node, CancellationToken::new())
-                    .await
-                    .expect("exposer runs");
+                exposer.run(&node, CancellationToken::new()).await;
             });
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
 

@@ -139,8 +139,7 @@ fn echo_host(names: &[&str]) -> bifrost::NodeId {
             .expose()
             .unwrap()
             .run(&host, CancellationToken::new())
-            .await
-            .unwrap();
+            .await;
     });
     id
 }

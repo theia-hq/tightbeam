@@ -17,7 +17,7 @@ let node = Router::new(gate)                        // one gate in front of ever
     .echo("demo".parse()?)?                         // a built-in
     .public(["demo".parse()?])                      // opened to anyone, by name
     .expose()?;                                     // proves every route before it serves
-node.run(&bifrost_node, cancel).await?;
+node.run(&bifrost_node, cancel).await;
 ```
 
 It prints nothing and ships only its own built-ins (`echo:`, forwards, raw streams): the program that
@@ -58,15 +58,12 @@ This page describes the default branch; the released docs are at the newest tag.
 ## Reach a service, get a stream
 
 A `Connector` reaches one exposed service on a peer and hands back a bidirectional stream. Build it from a
-node id (optionally presenting a capability token) or from a link that carries both the node to
-dial and the token. A dial that presents a credential has a compile-time-checked form,
-`PresentingConnector`: it requires the transport to prove the peer, so a credential over a transport that
-only announces the peer does not compile. The unbounded `Connector` carries the same rule at run time, for
-a transport chosen dynamically.
+node id (optionally presenting a capability token) or from a link that carries both the node to dial and
+the token.
 
 ```rust
 use nauthy::Link;
-use tightbeam::tunnel::{Connector, PresentingConnector};
+use tightbeam::tunnel::Connector;
 
 // Reach `web` on a peer, bind it to local port 8080, forward every connection.
 let forward = Connector::to_node(peer_id, "web".parse()?, None)
@@ -76,7 +73,7 @@ forward.run().await?;
 
 // Or reach it via a capability link, which supplies the node and the token together.
 let link: Link = "<key>.<token>".parse()?;
-let forward = PresentingConnector::from_link(&link, "web".parse()?)
+let forward = Connector::from_link(&link, "web".parse()?)?
     .preflight(&node, 8080)
     .await?;
 ```
@@ -106,7 +103,7 @@ let exposer = Router::new(gate)
     .echo("demo".parse()?)?
     .forward("web".parse()?, "tcp:127.0.0.1:8080")?
     .expose()?;
-exposer.run(&node, CancellationToken::new()).await?;   // runs until cancelled; prints nothing
+exposer.run(&node, CancellationToken::new()).await;   // runs until cancelled; prints nothing
 ```
 
 `Router::new(gate)` is a fully-gated node: every route faces the family gate. Opening a legitimate service
@@ -117,10 +114,6 @@ redirected to the distinct, louder `.public_unsafe(names)` opt-in. `.parse(&["we
 absorbs the `name=target` grammar, where every target carries a scheme and the set is closed: an unknown
 scheme is an error naming the legal set, since handlers bind by value. The `CancellationToken` is the
 node's teardown handle: a caller may hold a clone and fire it to stop the accept loop.
-
-The exposer proves the transport as well: `Exposer::run` refuses to arm a rooted gate over a transport
-that does not prove the peer, and `Exposer::prove_security::<T>()` exposes the same check to a caller that
-announces readiness before `run`.
 
 ## Inject a named service
 

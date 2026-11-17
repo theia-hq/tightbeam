@@ -574,10 +574,7 @@ async fn a_stdin_source_is_served_to_the_peer_and_after_its_end_the_next_is_refu
                 cuts: None,
             };
             tokio::task::spawn_local(async move {
-                exposer
-                    .run(&exposer_node, CancellationToken::new())
-                    .await
-                    .expect("exposer runs");
+                exposer.run(&exposer_node, CancellationToken::new()).await;
             });
 
             // First consumer: opens a service stream, gets Ok, and reads the source's exact bytes.
@@ -656,10 +653,7 @@ async fn a_peer_that_reads_nothing_and_leaves_does_not_burn_stdin() {
             )
             .expect("a raw stream opened unsafe builds under an open gate");
             tokio::task::spawn_local(async move {
-                exposer
-                    .run(&exposer_node, CancellationToken::new())
-                    .await
-                    .expect("exposer runs");
+                exposer.run(&exposer_node, CancellationToken::new()).await;
             });
 
             // The first peer is admitted and leaves without reading a byte. The producer keeps writing,
@@ -715,10 +709,7 @@ async fn an_echo_service_reflects_the_clients_own_bytes() {
             )
             .expect("echo builds under an open gate with no unsafe opt-in (it is safe public)");
             tokio::task::spawn_local(async move {
-                exposer
-                    .run(&exposer_node, CancellationToken::new())
-                    .await
-                    .expect("exposer runs");
+                exposer.run(&exposer_node, CancellationToken::new()).await;
             });
 
             let session = consumer.connect(exposer_id).await.expect("connect");
@@ -748,7 +739,7 @@ async fn an_echo_service_reflects_the_clients_own_bytes() {
 
 /// The cancel path: `Exposer::run` returns gracefully when its cancel token fires, so any
 /// holder of a CLONE of this token can stop the node. Here the token is cancelled from OUTSIDE the run
-/// (the shape any such holder uses); the run must finish with `Ok(())` rather than accept forever. Uses
+/// (the shape any such holder uses); the run must return rather than accept forever. Uses
 /// the mem transport so no real socket is bound.
 #[tokio::test]
 async fn run_returns_gracefully_when_its_cancel_token_fires() {
@@ -764,21 +755,17 @@ async fn run_returns_gracefully_when_its_cancel_token_fires() {
     let cancel = CancellationToken::new();
 
     // Run the exposer, then cancel it: the run is idle (no peer connects), so its accept loop is parked
-    // on `accept`. Cancelling must wake it and return `Ok(())`, bounded so a regression (a run that
+    // on `accept`. Cancelling must wake it and return, bounded so a regression (a run that
     // ignores the token and accepts forever) fails as a timeout rather than hanging the suite.
     let handle = tokio::spawn({
         let cancel = cancel.clone();
         async move { exposer.run(&node, cancel).await }
     });
     cancel.cancel();
-    let ended = tokio::time::timeout(core::time::Duration::from_secs(5), handle)
+    tokio::time::timeout(core::time::Duration::from_secs(5), handle)
         .await
         .expect("a cancelled run must return promptly, not accept forever")
         .expect("the run task joins");
-    assert!(
-        ended.is_ok(),
-        "a cancelled run returns Ok(()), not an error: {ended:?}"
-    );
 }
 
 /// FAN-OUT: a `+lossy` source served to N consumers over the in-process transport,
@@ -814,10 +801,7 @@ async fn a_lossy_source_fans_out_to_many_consumers() {
                 cuts: None,
             };
             tokio::task::spawn_local(async move {
-                exposer
-                    .run(&exposer_node, CancellationToken::new())
-                    .await
-                    .expect("exposer runs");
+                exposer.run(&exposer_node, CancellationToken::new()).await;
             });
 
             // Attach N consumers: each opens a stream and is admitted (Response::Ok), the first lazy-opening
@@ -912,10 +896,7 @@ async fn an_unadmitted_dialer_gets_one_uniform_refusal_no_reason_no_menu() {
             let exposer_id = exposer_node.node_id();
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             tokio::task::spawn_local(async move {
-                exposer
-                    .run(&exposer_node, CancellationToken::new())
-                    .await
-                    .expect("exposer runs");
+                exposer.run(&exposer_node, CancellationToken::new()).await;
             });
 
             // Every dial opens a fresh session/stream (each stream is gated on its own merits).
@@ -1010,7 +991,7 @@ async fn an_unknown_service_probe_never_gets_the_menu_even_when_admitted() {
             let exposer_id = exposer_node.node_id();
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             tokio::task::spawn_local(async move {
-                exposer.run(&exposer_node, CancellationToken::new()).await.expect("exposer runs");
+                exposer.run(&exposer_node, CancellationToken::new()).await;
             });
 
             let session = consumer.connect(exposer_id).await.expect("connect");

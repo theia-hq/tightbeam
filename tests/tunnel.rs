@@ -49,8 +49,7 @@ async fn tunnels_tcp_over_bifrost() {
                     .expose()
                     .unwrap()
                     .run(&exposer, CancellationToken::new())
-                    .await
-                    .unwrap();
+                    .await;
             });
             tokio::task::spawn_local(async move {
                 Connector::to_node(exposer_id, "default".parse().unwrap(), None)

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::io::IoSlice;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use bifrost::{NodeId, PeerProof, Refusal, RefusalDetail};
+use bifrost::{NodeId, Refusal, RefusalDetail};
 use nauthy::{Admitted, Cap, Gate, ProvenPeer, Revocations, Service, VerifyKey};
 use tightbeam_handler::bridge::Prepared;
 use tokio::io;
@@ -21,12 +21,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use super::cut::AdmittedChains;
-use super::exposer::{PROVEN_STREAM_DEADLINE, PublicPool, PublicSession, Serving, SessionPeer};
+use super::exposer::{PROVEN_STREAM_DEADLINE, PublicPool, PublicSession, Serving};
 use super::router::{Access, PublicServices, Route, Services, Target};
 use crate::identity::AsVerifyKey as _;
 use crate::protocol::{Request, Response};
 use crate::raw_stream::Opened;
-use crate::security::{peer_proven, proof_label};
 use crate::splice_halves;
 
 /// Resolve the exposer's node BASE gate, in ONE place so every embedder applies the SAME policy: a family
@@ -101,7 +100,7 @@ pub(super) const FIRST_TRAFFIC_TIMEOUT: Duration = Duration::from_secs(10);
 /// `chains` is this session's live-cut record, `None` when no cut is wired: an admitted stream keeps the
 /// chains it was admitted on there, so the session can end itself if one is recalled later.
 pub(super) async fn serve_request<W, R>(
-    peer: SessionPeer,
+    peer: NodeId,
     mut writer: W,
     mut reader: R,
     serving: Arc<Serving>,
@@ -288,7 +287,7 @@ where
                 // held only across the open (the splice below holds none) and dropped when `_permit` leaves scope.
                 // See `RAW_STREAM_OPEN_PERMITS`.
                 let opened = match raw_stream_opens.try_acquire() {
-                    Ok(_permit) => stream.open(peer.node).await,
+                    Ok(_permit) => stream.open(peer).await,
                     Err(_at_cap) => {
                         tracing::warn!(%peer, service = %service, "raw-stream open cap reached; refusing");
                         Err(eyre::eyre!(
@@ -361,7 +360,7 @@ where
             }
         }
 
-        serve_ready(ready, &peer, &service, writer, reader).await
+        serve_ready(ready, peer, &service, writer, reader).await
     };
     match deadline {
         None => served.await,
@@ -383,7 +382,7 @@ where
 /// Serve a stream whose every refusal is behind it: write the success and run the target.
 async fn serve_ready<W, R>(
     ready: Ready<'_>,
-    peer: &SessionPeer,
+    peer: NodeId,
     service: &Service,
     mut writer: W,
     reader: R,
@@ -472,16 +471,6 @@ enum HostRefusal {
     /// the wire still says only "not admitted".
     #[error("malformed capability")]
     MalformedCapability(#[source] nauthy::CapError),
-    /// The transport does not prove the peer, so a rooted gate cannot rule on the presented token: its
-    /// device binding would rest on a key the peer merely announced.
-    #[error(
-        "the transport does not prove the peer (declared: {}); a rooted gate cannot admit",
-        proof_label(.declared)
-    )]
-    PeerNotProven {
-        /// The peer-identity claim the session's transport declared.
-        declared: PeerProof,
-    },
     /// The gate ruled: nauthy's typed cause.
     #[error(transparent)]
     Gate(nauthy::Refusal),
@@ -531,7 +520,6 @@ enum HostRefusal {
 fn wire_refusal(refusal: &HostRefusal) -> Refusal {
     match refusal {
         HostRefusal::MalformedCapability(_)
-        | HostRefusal::PeerNotProven { .. }
         | HostRefusal::PeerKey(_)
         | HostRefusal::PublicAtCapacity { .. }
         | HostRefusal::UnknownKey
@@ -667,7 +655,7 @@ struct Proven<'a> {
 fn admit(
     admission: Admission<'_>,
     session: &PublicSession,
-    peer: SessionPeer,
+    peer: NodeId,
     capability: Option<&str>,
     membership: Option<&str>,
     service: &Service,
@@ -681,7 +669,7 @@ fn admit(
     } = admission;
     // The transport checked this key under bifrost's rules; nauthy checks it again under its own, and a
     // key it refuses is refused here, before any route is ruled on.
-    let peer_key = peer.node.verify_key().map_err(HostRefusal::PeerKey)?;
+    let peer_key = peer.verify_key().map_err(HostRefusal::PeerKey)?;
     // Admission branches on the service NAME in two places only: this open-set membership test and the
     // proven-only test below, and both run BEFORE any dispatch (the `services.get` in `serve_request` is reached only past this admit). A HIT on
     // EITHER overlay is the sole fast/open path: the service was proven open at `with_public` (safe) or at
@@ -693,10 +681,8 @@ fn admit(
     // the identical family path below.
     if public.contains(service.as_str()) || public_unsafe.contains(service.as_str()) {
         // An open service needs no badge, so the authority-bound membership slot is irrelevant on this path.
-        // The witness is `Origin::Open` with `Admission::Slip`: no token is ruled on and nothing about the
-        // peer is verified, so the `ProvenPeer` minted here records the key the peer announced and carries
-        // no authority. That is what lets an announced transport keep serving a service the operator opened
-        // to anyone, while every gated route (below) refuses.
+        // The witness is `Origin::Open` with `Admission::Slip`: no token is ruled on, so the `ProvenPeer`
+        // minted here carries no authority.
         let witness = Gate::Open
             .admit_witnessed(ProvenPeer::from_handshake(peer_key), None, service)
             .map_err(HostRefusal::from)?;
@@ -728,13 +714,6 @@ fn admit(
     // whatever the peer presented. The pool is touched only once every check has passed, so a stranger
     // never holds a slot.
     if let Some(knows) = proven.routes.proven(service.as_str()) {
-        // Unconditionally, whatever the base gate: the witness below says the transport proved this key,
-        // and over an announced session it did not.
-        if !peer_proven(peer.security) {
-            return Err(HostRefusal::PeerNotProven {
-                declared: peer.security.peer,
-            });
-        }
         // The base gate's store refuses a revoked key and its sign twin; an open base refuses outright.
         let witness = base.proven(ProvenPeer::from_handshake(peer_key))?;
         let key = witness.revocable_peer().ok_or(HostRefusal::Unrevocable)?;
@@ -753,17 +732,6 @@ fn admit(
                 deadline: Instant::now() + PROVEN_STREAM_DEADLINE,
             }),
             _stream_permit: Some(permit),
-        });
-    }
-    // A rooted gate rules on a token BOUND to the dialer's proven key, so it may only run when the
-    // transport's declared profile proves the peer: over an announced session a harvested badge is
-    // replayable and the binding would vouch for the impersonator. Refuse before minting a `ProvenPeer`
-    // or parsing the token. The wire gets the same uniform `NotAdmitted` a gate miss gives; only the
-    // node's own log names the declared profile. A genuinely open service was already admitted above,
-    // so public traffic over an announced transport is untouched.
-    if base.wants_capability() && !peer_proven(peer.security) {
-        return Err(HostRefusal::PeerNotProven {
-            declared: peer.security.peer,
         });
     }
     // A MISS is EITHER a gated-present name OR a name the node does not serve at all: both take this
@@ -790,9 +758,7 @@ fn admit(
         },
         _ => None,
     };
-    // Mint the peer the transport attested: the declared profile (a completed handshake for `Proven`,
-    // exact-by-construction for `InProcess`) is the transport's CLAIM, not a proof this seam re-derives.
-    // A rooted gate reaches here only past the predicate above; an open gate needs no peer proof at all.
+    // Mint the peer the transport's handshake proved (`Session::peer`).
     let peer = ProvenPeer::from_handshake(peer_key);
     // Route the two-cap authority-bound path (a foreign slip AND the membership badge that vouches for the
     // dialer under the slip's foreign authority) through `admit_foreign_witnessed`; every other shape (a

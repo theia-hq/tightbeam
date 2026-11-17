@@ -74,10 +74,7 @@ async fn run() -> eyre::Result<()> {
     let shout: Service = "shout".parse()?;
     let serving = Router::new(Gate::Open).service(shout, Shout)?.expose()?;
     tokio::task::spawn_local(async move {
-        if let Err(e) = serving.run(&exposer, CancellationToken::new()).await {
-            eprintln!("exposer stopped: {e}");
-        }
-        Ok::<_, eyre::Error>(())
+        serving.run(&exposer, CancellationToken::new()).await;
     });
 
     // 2. Reach the `shout` service BY NAME from the other node, bound to a local port.

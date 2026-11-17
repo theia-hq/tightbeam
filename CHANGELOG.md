@@ -7,6 +7,11 @@ All notable changes to tightbeam, newest first.
 One denylist holds revoked caps and revoked keys, and a revoked key ends a live session.
 
 ### Breaking
+- **The `security` module is gone, with `TransportInsecure`.** Every bifrost transport but the test-only `mem` proves the peer.
+- **`Request::write_checked` and `RequestWriteError` are gone.** `Request::write` is the one writer, and it is public.
+- **`PresentingConnector` is gone.** Use `Connector`.
+- **`Exposer::prove_security` is gone.**
+- **`Exposer::run` returns `()`**, not a `Result`.
 - **`PortForward::run` returns `ConnectionLost` when the session ends**, instead of running until
   cancelled. Every connection it carried has ended with it.
 - **`config::disabled_roots_path` is gone, and `~/.config/tightbeam/disabled_roots` is no longer read.**

@@ -7,7 +7,7 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 use std::sync::Arc;
 
-use bifrost::{ConnInfo, NoDiscovery, Node, NodeId, Path, PathChanges, Relay, Session};
+use bifrost::{Abort, ConnInfo, NoDiscovery, Node, NodeId, Path, PathChanges, Relay, Session};
 use bifrost_mem::MemTransport;
 use nauthy::Gate;
 use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
@@ -77,8 +77,14 @@ impl<W: io::AsyncWrite + Unpin> io::AsyncWrite for SlotWrite<W> {
     }
 }
 
+/// Aborts the stream it wraps: holding a slot changes nothing about how the stream ends.
+impl<W: Abort> Abort for SlotWrite<W> {
+    fn abort(&mut self) {
+        self.inner.abort();
+    }
+}
+
 impl<S: Session> Session for Capped<S> {
-    type Security = S::Security;
     type Write = SlotWrite<S::Write>;
     type Read = S::Read;
 
@@ -144,10 +150,7 @@ async fn capped_forward(max_pipes: usize) -> (u16, Arc<AtomicUsize>) {
     )
     .expect("an open echo builds");
     tokio::task::spawn_local(async move {
-        exposer
-            .run(&host, CancellationToken::new())
-            .await
-            .expect("exposer runs");
+        exposer.run(&host, CancellationToken::new()).await;
     });
 
     let consumer = Node::new(MemTransport::bind(), NoDiscovery);
@@ -306,6 +309,29 @@ async fn a_forward_ends_with_an_error_when_the_host_ends_its_session() {
     );
 }
 
+/// The write half of a session that opens no stream: uninhabited, since no stream ever exists to write to.
+enum NoStream {}
+
+impl io::AsyncWrite for NoStream {
+    fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, _: &[u8]) -> Poll<io::Result<usize>> {
+        match *self.get_mut() {}
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match *self.get_mut() {}
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match *self.get_mut() {}
+    }
+}
+
+impl Abort for NoStream {
+    fn abort(&mut self) {
+        match *self {}
+    }
+}
+
 /// A session whose path moves from a relay to direct, the change a hole punch makes. It answers with two
 /// items, which no `PathChanges::fixed` can, so a wrapper that answers for itself is told apart from one
 /// that forwards. It carries no streams.
@@ -314,8 +340,7 @@ struct Moving {
 }
 
 impl Session for Moving {
-    type Security = bifrost::Announced;
-    type Write = Vec<u8>;
+    type Write = NoStream;
     type Read = &'static [u8];
 
     fn peer(&self) -> NodeId {

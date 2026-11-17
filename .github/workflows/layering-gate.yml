@@ -5,6 +5,8 @@
 # sh + grep, no toolchain. The fixture runs the gate's pass and fail paths on throwaway trees so
 # its fail path cannot rot.
 # The check lives in scripts/layering-gate.sh; see notes/reviews/layering-leak-audit.md.
+# The same job runs scripts/test-backend-gate.sh, which fails any manifest that takes a test-only
+# bifrost backend (bifrost-mem) as more than a dev-dependency, plus its pass/fail fixture.
 name: layering-gate
 on:
   push:
@@ -22,3 +24,7 @@ jobs:
         run: sh scripts/tests/layering-gate.sh
       - name: process leaks
         run: sh scripts/prose-gate.sh .
+      - name: test backend gate
+        run: sh scripts/test-backend-gate.sh .
+      - name: test backend gate fixture
+        run: sh scripts/tests/test-backend-gate.sh

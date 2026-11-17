@@ -52,8 +52,7 @@ async fn an_authority_bound_slip_admits_a_hire_device_that_proves_membership() {
                     .expose()
                     .unwrap()
                     .run(&exposer, CancellationToken::new())
-                    .await
-                    .unwrap();
+                    .await;
             });
 
             let work = Identity::from_secret(&WORK_SECRET).unwrap();
