@@ -57,10 +57,8 @@ Four rules bind this wire to the layer under it:
    one stream's admission and apply it to another stream of the same session, even for an identical
    request. Admission is bound to the stream it was decided for, so revocation and disablement take
    effect on the next stream rather than the next session.
-3. A dialer `MUST NOT` present a credential (either slot of the request) over a session whose transport
-   does not prove the peer holds the private key for the identity it is reached under. An announced,
-   unproven identity is whoever answered the dial, and a presented token is bearer material. Over such a
-   session a credential-bearing dialer `MUST` abandon the request without writing an octet.
+3. Over a session whose transport does not prove the peer holds the key it is reached under, a dialer
+   `MUST NOT` send a credential and a host `MUST NOT` admit on the key or on a credential bound to it.
 4. After a successful response, every remaining octet in both directions belongs to the service. TB04
    defines no trailer, no keepalive, no close frame, and no escape sequence. The stream ends when the
    session's stream ends.
@@ -207,8 +205,7 @@ Both sides are strictly sequential; there is no pipelining and no interleaving.
 
 | state | event | action | next |
 | ----- | ----- | ------ | ---- |
-| `Opened` | credential present and the session does not prove the peer | write nothing, fail locally | `Closed` |
-| `Opened` | otherwise | write the request frame | `AwaitingResponse` |
+| `Opened` | dial begins | write the request frame | `AwaitingResponse` |
 | `AwaitingResponse` | tag `00` | begin the pipe | `Piping` |
 | `AwaitingResponse` | tag `01` and a known code | surface the typed refusal | `Closed` |
 | `AwaitingResponse` | tag `01` and an unknown code | fail the stream as unreadable | `Closed` |
@@ -295,7 +292,6 @@ one of these:
 - a credential was presented and does not grant this service,
 - a credential was presented and has been revoked,
 - a credential was presented and did not parse,
-- the session does not prove the peer, so a rooted gate cannot rule on a presented token,
 - the host's public-path capacity is saturated,
 - the route's handler refuses an unrooted admission.
 

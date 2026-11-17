@@ -10,7 +10,7 @@ use core::time::Duration;
 use std::sync::{Arc, PoisonError};
 use std::time::SystemTime;
 
-use bifrost::{Discovery, Node, NodeId, Security, SecurityProfile, Session, Transport};
+use bifrost::{Discovery, Node, Session, Transport};
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
 use nauthy::Gate;
@@ -26,7 +26,6 @@ use super::router::{
     ManifestEntry, PublicRequest, PublicServices, PublicUnsafeRequest, Services, Target,
 };
 use crate::enabled::{AllEnabled, EnabledServices};
-use crate::security::{peer_proven, proof_label};
 
 /// The maximum number of peer sessions served concurrently. Past this, `accept` stops being polled so new
 /// connections queue at the transport (backpressure), bounding the memory a flood of peers can pin.
@@ -340,29 +339,6 @@ impl Exposer {
         entries
     }
 
-    /// Refuse to arm this exposer over a transport that cannot prove the peer when its gate is rooted.
-    ///
-    /// The construction half of the transport-security rule: a rooted gate decides on a token BOUND to the
-    /// dialer's proven key, so a transport that does not prove the peer (an
-    /// [`Announced`](bifrost::Announced) profile) can never root-admit. `T` must be the transport the
-    /// exposer will serve: [`run`](Self::run) re-checks with its own `T`, so a mismatch still fails closed,
-    /// but at the arming point rather than here. A caller that announces readiness (a banner, a bound
-    /// socket) before [`run`](Self::run) should call this at the same point it proves its routes, so the
-    /// refusal precedes the announcement. [`run`](Self::run) calls it too, so the invariant holds however
-    /// the exposer is driven.
-    pub fn prove_security<T: Transport>(&self) -> eyre::Result<()> {
-        let security = <T::Security as SecurityProfile>::SECURITY;
-        if self.gate.wants_capability() && !peer_proven(security) {
-            eyre::bail!(
-                "this node gates on a root, but the bound transport declares {} peer proof, so a gated \
-                 dial could never be admitted; bind a transport that proves the peer (the default iroh \
-                 transport does), or serve with an open gate (`Gate::Open`), which needs no peer proof",
-                proof_label(&security.peer)
-            );
-        }
-        Ok(())
-    }
-
     /// Accept overlay sessions from permitted peers and forward each inbound stream to its service. Runs
     /// until `cancel` fires, then stops accepting and returns gracefully; prints nothing (the caller printed
     /// its own readiness banner before calling).
@@ -373,18 +349,14 @@ impl Exposer {
     /// down itself. So "who may stop the node" stays a property of who holds a token clone, while "how the
     /// node stops" lives here, in one place. What may hold a clone, and why, is the caller's policy, not the
     /// tunnel's concern.
-    pub async fn run<T: Transport, D: Discovery>(
-        self,
-        node: &Node<T, D>,
-        cancel: CancellationToken,
-    ) -> eyre::Result<()>
+    ///
+    /// The transport must prove the peer holds the key it connects under, as bifrost's `Transport`
+    /// checklist requires; admission rules on that key.
+    pub async fn run<T: Transport, D: Discovery>(self, node: &Node<T, D>, cancel: CancellationToken)
     where
         <T::Session as Session>::Write: Send + 'static,
         <T::Session as Session>::Read: Send + 'static,
     {
-        // Construction refusal, repeated at the arming point so it holds however the exposer is driven;
-        // a caller that announces readiness first should have called `prove_security` already.
-        self.prove_security::<T>()?;
         let Self {
             services,
             gate,
@@ -426,7 +398,7 @@ impl Exposer {
                 // return gracefully. The in-flight sessions in
                 // `sessions` are dropped with this future; the caller closes the node next (`node.close()`),
                 // which tears their transport down. One owner of teardown, here.
-                () = cancel.cancelled() => return Ok(()),
+                () = cancel.cancelled() => return,
                 // Cap concurrent sessions: past the cap, stop polling `accept` so new connections queue at
                 // the transport (backpressure) rather than each pinning a task set, bounding a peer flood.
                 // At the cap the future is kept but not polled: a handshake it holds resumes, rather than
@@ -533,39 +505,13 @@ impl PublicSession {
     }
 }
 
-/// The peer a session attests: the `NodeId` the transport reports, with the security that transport
-/// declared for it.
-///
-/// The two travel together from [`serve_session`] (where both are read off the session) to admission
-/// (which rules on them), so a caller can never pair one session's key with another session's declared
-/// proof. A rooted gate may only act on this when `security` proves the key; the announced profile
-/// reports a key the peer chose, which is exactly why it cannot root-admit.
-#[derive(Clone, Copy)]
-pub(super) struct SessionPeer {
-    pub(super) node: NodeId,
-    pub(super) security: Security,
-}
-
-impl core::fmt::Display for SessionPeer {
-    /// The peer's identity, for the per-stream log lines: the declared security is a transport-wide
-    /// fact, named in the admission refusal's own cause when it decides one.
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.node)
-    }
-}
-
 /// Serve one accepted session: handle each inbound stream's service request under the gate.
 pub(super) async fn serve_session<S: Session>(session: S, serving: Arc<Serving>) -> eyre::Result<()>
 where
     S::Write: Send + 'static,
     S::Read: Send + 'static,
 {
-    // Read the peer and its declared security ONCE off the session, and carry both to every stream's
-    // admission: a rooted gate may only rule on a peer the transport proves.
-    let peer = SessionPeer {
-        node: session.peer(),
-        security: <S::Security as SecurityProfile>::SECURITY,
-    };
+    let peer = session.peer();
     // The per-session half of the public cap: created empty, classified by the first stream
     // that reaches an opened service, and dropped with the session (which releases its permit, if any).
     let public_session = Arc::new(PublicSession::default());

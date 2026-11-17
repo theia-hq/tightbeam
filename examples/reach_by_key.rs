@@ -12,7 +12,7 @@
 //! ```
 //!
 //! It uses bifrost's in-process transport so the two nodes talk without touching the network. Swap
-//! `MemTransport` for a real transport (iroh, or our own quirk) and the exact same code reaches a peer
+//! `MemTransport` for a real transport (iroh) and the exact same code reaches a peer
 //! across NAT, anywhere, addressed by the same key.
 
 use core::time::Duration;
@@ -65,7 +65,8 @@ async fn run() -> eyre::Result<()> {
                 .forward("echo".parse()?, &format!("tcp:{echo_addr}"))?
                 .expose()?
                 .run(&exposer, CancellationToken::new())
-                .await
+                .await;
+            Ok::<_, eyre::Error>(())
         }
         .await
         {

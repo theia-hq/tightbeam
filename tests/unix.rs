@@ -49,8 +49,7 @@ async fn tunnels_to_a_unix_socket() {
                     .expose()
                     .unwrap()
                     .run(&exposer, CancellationToken::new())
-                    .await
-                    .unwrap();
+                    .await;
             });
             tokio::task::spawn_local(async move {
                 Connector::to_node(exposer_id, "default".parse().unwrap(), None)

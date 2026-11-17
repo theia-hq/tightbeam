@@ -43,8 +43,7 @@ async fn cap_gate_admits_a_valid_cap_and_refuses_others() {
                     .expose()
                     .unwrap()
                     .run(&exposer, CancellationToken::new())
-                    .await
-                    .unwrap();
+                    .await;
             });
 
             // A cap for ssh, valid for an hour, minted by the exposer's identity.

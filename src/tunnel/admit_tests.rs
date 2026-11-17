@@ -5,10 +5,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bifrost::{
-    Announced, ChannelProtection, NoDiscovery, Node, NodeId, Path, PathChanges, PeerProof, Refusal,
-    Security, Session,
-};
+use bifrost::{NoDiscovery, Node, NodeId, Refusal};
 use bifrost_mem::MemTransport;
 use nauthy::{Gate, Service};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -19,7 +16,7 @@ use crate::enabled::AllEnabled;
 use crate::open_policy::OptIn;
 use crate::tunnel::exposer::{
     PROVEN_STREAM_PERMITS, PUBLIC_STREAM_PERMITS, PublicPool, PublicSession,
-    RAW_STREAM_OPEN_PERMITS, SessionPeer, serve_session,
+    RAW_STREAM_OPEN_PERMITS,
 };
 use crate::tunnel::fixtures::{
     GatedNoop, OpenNoop, ServiceStream, family_gate, prove, services, svc,
@@ -86,13 +83,6 @@ fn open_serving(services: Services, permits: Semaphore) -> std::sync::Arc<super:
     })
 }
 
-/// The declared security the admission-core tests present by default: proven and sealed, what a real
-/// handshake-backed transport declares. The announced-refusal test passes its own.
-const PROVEN: Security = Security {
-    peer: PeerProof::Proven,
-    channel: ChannelProtection::Aead,
-};
-
 /// Drive one `serve_request` for `service` against the shared `serving` context, with a fresh public
 /// session and no token: the common shape, for tests that do not need to hold the session open or
 /// present a capability. See [`drive_open_in`] for that.
@@ -131,10 +121,7 @@ fn drive_open_in(
     let (client_read, mut client_write) = tokio::io::split(client);
     let service = service.to_owned();
     // The peer id is only for the host's log line here; any valid NodeId does.
-    let peer = SessionPeer {
-        node: bifrost::NodeId::from_ed25519_secret(&[9u8; 32]),
-        security: PROVEN,
-    };
+    let peer = bifrost::NodeId::from_ed25519_secret(&[9u8; 32]);
     let serve = async move {
         crate::protocol::Request {
             service: service.clone(),
@@ -166,10 +153,7 @@ fn drive_frame(
     let (client, server) = tokio::io::duplex(1024);
     let (server_read, server_write) = tokio::io::split(server);
     let (client_read, mut client_write) = tokio::io::split(client);
-    let peer = SessionPeer {
-        node: bifrost::NodeId::from_ed25519_secret(&[9u8; 32]),
-        security: PROVEN,
-    };
+    let peer = bifrost::NodeId::from_ed25519_secret(&[9u8; 32]);
     let serve = async move {
         tokio::io::AsyncWriteExt::write_all(&mut client_write, &frame)
             .await
@@ -277,7 +261,7 @@ fn admit(
     gate: &Gate,
     public: &PublicServices,
     public_unsafe: &PublicServices,
-    peer: SessionPeer,
+    peer: NodeId,
     capability: Option<&str>,
     membership: Option<&str>,
     service: &Service,
@@ -299,51 +283,6 @@ fn admit(
         membership,
         service,
     )
-}
-
-/// An announced session that hands `serve_session` one pre-built stream: the session-level fixture
-/// for the admission predicate, so the test drives the production path that reads the profile off
-/// the session type, not the predicate in isolation.
-struct AnnouncedSession {
-    peer: NodeId,
-    stream: tokio::sync::Mutex<
-        Option<(
-            tokio::io::WriteHalf<tokio::io::DuplexStream>,
-            tokio::io::ReadHalf<tokio::io::DuplexStream>,
-        )>,
-    >,
-}
-
-impl Session for AnnouncedSession {
-    type Security = Announced;
-    type Write = tokio::io::WriteHalf<tokio::io::DuplexStream>;
-    type Read = tokio::io::ReadHalf<tokio::io::DuplexStream>;
-
-    fn peer(&self) -> NodeId {
-        self.peer
-    }
-
-    async fn open_bi(&self) -> Result<(Self::Write, Self::Read), bifrost::Error> {
-        Err(bifrost::Error::Closed)
-    }
-
-    async fn accept_bi(&self) -> Result<(Self::Write, Self::Read), bifrost::Error> {
-        self.stream
-            .lock()
-            .await
-            .take()
-            .ok_or(bifrost::Error::Closed)
-    }
-
-    async fn wait_closed(&self) {}
-
-    /// A double that carries nothing has nothing to end.
-    fn close(&self) {}
-
-    /// Matches `conn_info`'s default: a double has no path to report.
-    fn path_changes(&self) -> PathChanges {
-        PathChanges::fixed(Path::Unknown)
-    }
 }
 
 #[test]
@@ -1192,10 +1131,7 @@ fn a_public_member_admits_a_stranger_and_every_miss_takes_the_family_path() {
         &gate,
         &public,
         &public_unsafe,
-        SessionPeer {
-            node: stranger,
-            security: PROVEN,
-        },
+        stranger,
         None,
         None,
         &svc("speed"),
@@ -1212,10 +1148,7 @@ fn a_public_member_admits_a_stranger_and_every_miss_takes_the_family_path() {
         &gate,
         &public,
         &public_unsafe,
-        SessionPeer {
-            node: stranger,
-            security: PROVEN,
-        },
+        stranger,
         None,
         None,
         &svc("logs"),
@@ -1233,10 +1166,7 @@ fn a_public_member_admits_a_stranger_and_every_miss_takes_the_family_path() {
             &gate,
             &public,
             &public_unsafe,
-            SessionPeer {
-                node: stranger,
-                security: PROVEN,
-            },
+            stranger,
             None,
             None,
             &svc("control.stop")
@@ -1249,10 +1179,7 @@ fn a_public_member_admits_a_stranger_and_every_miss_takes_the_family_path() {
             &gate,
             &public,
             &public_unsafe,
-            SessionPeer {
-                node: stranger,
-                security: PROVEN,
-            },
+            stranger,
             None,
             None,
             &svc("nope")
@@ -1286,10 +1213,7 @@ fn a_member_dial_ignores_a_second_slot_when_slot_one_is_not_authority_bound() {
         &gate,
         &public,
         &super::PublicServices::default(),
-        SessionPeer {
-            node: peer,
-            security: PROVEN,
-        },
+        peer,
         Some(badge.as_str()),
         Some("not a link"),
         &svc("web"),
@@ -1298,207 +1222,6 @@ fn a_member_dial_ignores_a_second_slot_when_slot_one_is_not_authority_bound() {
     assert!(
         admitted.witness.is_member(),
         "a whole-node member badge admits as Member regardless of slot 2"
-    );
-}
-
-/// The peer-proof predicate at the admission seam: an announced session cannot root-admit, even
-/// with a genuine member badge bound to the announced key. The badge verifies (it is the root's
-/// own signature); that is exactly the replay an announced transport enables, so the predicate
-/// refuses before the ruling and the node's own log names the declared profile.
-#[test]
-fn an_announced_session_cannot_root_admit_a_valid_badge() {
-    use crate::identity::AsVerifyKey as _;
-
-    let announced = Security {
-        peer: PeerProof::Announced,
-        channel: ChannelProtection::Plain,
-    };
-    let root = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
-    let gate = family_gate("announced");
-    let peer = bifrost::NodeId::from_ed25519_secret(&[5u8; 32]);
-    let badge = root
-        .mint_member(
-            peer.verify_key().expect("a checked key"),
-            nauthy::Request::expires_in(core::time::Duration::from_secs(3600)),
-        )
-        .expect("mint member badge")
-        .link()
-        .expect("link");
-
-    // The same badge over a proven session IS admitted (the control): the refusal below is the
-    // profile, not the token.
-    assert!(
-        admit(
-            &gate,
-            &super::PublicServices::default(),
-            &super::PublicServices::default(),
-            SessionPeer {
-                node: peer,
-                security: PROVEN,
-            },
-            Some(badge.as_str()),
-            None,
-            &svc("web"),
-        )
-        .is_ok(),
-        "a valid member badge is admitted over a proven session"
-    );
-    let refused = admit(
-        &gate,
-        &super::PublicServices::default(),
-        &super::PublicServices::default(),
-        SessionPeer {
-            node: peer,
-            security: announced,
-        },
-        Some(badge.as_str()),
-        None,
-        &svc("web"),
-    )
-    .expect_err("an announced session cannot root-admit, even with a valid badge");
-    assert!(
-        matches!(
-            refused,
-            super::HostRefusal::PeerNotProven {
-                declared: PeerProof::Announced
-            }
-        ),
-        "the local cause names the declared profile: {refused:?}"
-    );
-}
-
-/// An anchored base wants a capability exactly as a rooted one does, so an announced session is refused
-/// before the ruling, even with a slip the gate's own key issued and recorded.
-#[test]
-fn an_anchored_base_refuses_an_unproven_peer() {
-    struct Unpinned;
-    impl nauthy::PinSource for Unpinned {
-        fn current(&self) -> Option<nauthy::VerifyKey> {
-            None
-        }
-    }
-    struct EveryId;
-    impl nauthy::IssuedIds for EveryId {
-        fn is_issued(&self, _id: &nauthy::RevocationId) -> bool {
-            true
-        }
-    }
-
-    let own = nauthy::Identity::from_secret(&[23u8; 32]).expect("valid secret");
-    let gate = Gate::anchored(
-        Unpinned,
-        own.verifying_key(),
-        nauthy::Denylist::for_repair(std::env::temp_dir().join("tb-anchored-unproven")),
-        EveryId,
-    );
-    let peer = bifrost::NodeId::from_ed25519_secret(&[5u8; 32]);
-    let slip = own
-        .mint(
-            &svc("web"),
-            nauthy::Request::expires_in(core::time::Duration::from_secs(3600)),
-        )
-        .expect("mint slip")
-        .link()
-        .expect("link");
-    let admit_as = |security| {
-        admit(
-            &gate,
-            &super::PublicServices::default(),
-            &super::PublicServices::default(),
-            SessionPeer {
-                node: peer,
-                security,
-            },
-            Some(slip.as_str()),
-            None,
-            &svc("web"),
-        )
-    };
-
-    let admitted = admit_as(PROVEN).expect("the slip is admitted over a proven session");
-    assert_eq!(
-        admitted.ruled.first().map(nauthy::Cap::root),
-        Some(own.verifying_key()),
-        "and the slip is kept for the live cut"
-    );
-    let refused = admit_as(Security {
-        peer: PeerProof::Announced,
-        channel: ChannelProtection::Plain,
-    })
-    .expect_err("an announced session cannot be admitted by an anchored gate");
-    assert!(
-        matches!(
-            refused,
-            super::HostRefusal::PeerNotProven {
-                declared: PeerProof::Announced
-            }
-        ),
-        "the local cause names the declared profile: {refused:?}"
-    );
-}
-
-/// The admission seam refuses an announced session even when the presented badge is genuine and
-/// bound to the announced key: `serve_session` reads the session's declared profile, the predicate
-/// refuses before any `ProvenPeer` is minted, and the wire gets the uniform `NotAdmitted` a gate
-/// miss gives. The client writes the request with the RAW `Request::write` on purpose (a hostile or
-/// legacy client bypasses the checked writer).
-#[tokio::test]
-async fn an_announced_session_is_refused_at_admission_with_the_uniform_answer() {
-    use crate::identity::AsVerifyKey as _;
-    use crate::protocol::{Request, Response};
-
-    let root = nauthy::Identity::from_secret(&[3u8; 32]).expect("valid secret");
-    let peer = bifrost::NodeId::from_ed25519_secret(&[5u8; 32]);
-    let badge = root
-        .mint_member(
-            peer.verify_key().expect("a checked key"),
-            nauthy::Request::expires_in(core::time::Duration::from_secs(3600)),
-        )
-        .expect("mint member badge")
-        .link()
-        .expect("link");
-    let serving = std::sync::Arc::new(super::Serving {
-        gate: family_gate("announced-seam"),
-        public: PublicServices::default(),
-        public_unsafe: PublicServices::default(),
-        services: services(&["web=tcp:127.0.0.1:80"]),
-        raw_stream_opens: Semaphore::new(RAW_STREAM_OPEN_PERMITS),
-        public_pool: PublicPool::new(),
-        proven_pool: Arc::new(Semaphore::new(PROVEN_STREAM_PERMITS)),
-        enabled: Box::new(AllEnabled),
-        cuts: None,
-    });
-
-    let (client, server) = tokio::io::duplex(1024);
-    let (server_read, server_write) = tokio::io::split(server);
-    let (mut client_read, mut client_write) = tokio::io::split(client);
-    let session = AnnouncedSession {
-        peer,
-        stream: tokio::sync::Mutex::new(Some((server_write, server_read))),
-    };
-
-    let serve = serve_session(session, std::sync::Arc::clone(&serving));
-    let (response, served) = tokio::join!(
-        async {
-            Request {
-                service: "web".to_owned(),
-                capability: Some(badge.to_string()),
-                membership: None,
-            }
-            .write(&mut client_write)
-            .await
-            .expect("write request");
-            Response::read(&mut client_read)
-                .await
-                .expect("read response")
-        },
-        serve
-    );
-    served.expect("the session drains after the refused stream");
-    assert_eq!(
-        response,
-        Response::Refused(bifrost::Refusal::NotAdmitted),
-        "an announced session gets the same payload-free refusal a gate miss gives"
     );
 }
 
@@ -1532,10 +1255,7 @@ async fn a_stranger_is_admitted_to_an_opened_service_and_uniformly_refused_for_t
             let exposer_id = exposer_node.node_id();
             let consumer = Node::new(MemTransport::bind(), NoDiscovery);
             tokio::task::spawn_local(async move {
-                exposer
-                    .run(&exposer_node, CancellationToken::new())
-                    .await
-                    .expect("runs");
+                exposer.run(&exposer_node, CancellationToken::new()).await;
             });
 
             // A stranger (no token) is ADMITTED to the opened service and reads it to a clean EOF.
@@ -1607,10 +1327,7 @@ async fn a_member_only_route_serves_a_member_and_uniformly_refuses_a_slip_and_a_
             let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
             let exposer_id = exposer_node.node_id();
             tokio::task::spawn_local(async move {
-                exposer
-                    .run(&exposer_node, CancellationToken::new())
-                    .await
-                    .expect("runs");
+                exposer.run(&exposer_node, CancellationToken::new()).await;
             });
 
             // A whole-node member: a badge the root signed, bound to the member's proven mem id.
@@ -1812,10 +1529,7 @@ async fn dial_and_hold(
     .write(&mut peer_end)
     .await
     .expect("write request");
-    let peer = SessionPeer {
-        node: bifrost::NodeId::from_ed25519_secret(&[9u8; 32]),
-        security: PROVEN,
-    };
+    let peer = bifrost::NodeId::from_ed25519_secret(&[9u8; 32]);
     let serve = serve_request(
         peer,
         host_write,
@@ -2069,10 +1783,7 @@ async fn a_stdin_holder_that_never_takes_its_ok_is_displaced_by_a_contender() {
     .write(&mut request)
     .await
     .expect("write request");
-    let holder = SessionPeer {
-        node: bifrost::NodeId::from_ed25519_secret(&[8u8; 32]),
-        security: PROVEN,
-    };
+    let holder = bifrost::NodeId::from_ed25519_secret(&[8u8; 32]);
     // The holder's upstream half: its request, then silence, held open for the whole test.
     let (mut holder_upstream, server_read) = tokio::io::duplex(1024);
     holder_upstream

@@ -86,8 +86,7 @@ async fn a_forward_out_of_descriptors_backs_off() {
                     .expose()
                     .unwrap()
                     .run(&exposer, CancellationToken::new())
-                    .await
-                    .unwrap();
+                    .await;
             });
             let forward = Connector::to_node(exposer_id, "default".parse().unwrap(), None)
                 .preflight(&consumer, port)

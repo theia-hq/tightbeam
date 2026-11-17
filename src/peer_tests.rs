@@ -4,7 +4,7 @@
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
-use bifrost::{Addr, Error, InProcess, NodeId, Transport};
+use bifrost::{Addr, Error, NodeId, Transport};
 use bifrost_mdns::{Advertising, MdnsDiscovery, MdnsError};
 use bifrost_mem::{MemSession, MemTransport};
 
@@ -35,7 +35,6 @@ struct Recording {
 }
 
 impl Transport for Recording {
-    type Security = InProcess;
     type Session = MemSession;
 
     fn node_id(&self) -> NodeId {

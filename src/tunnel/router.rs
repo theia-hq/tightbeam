@@ -73,8 +73,8 @@ impl Router {
     /// key the transport proved, and which `knows` recognizes, reaches it with no token at all.
     ///
     /// The route never reaches the family gate, and no token presented on it is read. A stream for it is
-    /// admitted only when the transport proves the peer, the base gate's revocation store does not revoke
-    /// the key (nor its sign twin), and `knows` answers `true` for the key, in that order, and only then
+    /// admitted only when the base gate's revocation store does not revoke the key (nor its sign twin), and
+    /// `knows` answers `true` for the key, in that order, and only then
     /// does it take one of the node's eight proven slots, which every proven-only route shares. A stream is
     /// dropped, and its slot freed, five seconds after it was admitted. Every miss, a full pool included,
     /// is the uniform refusal.

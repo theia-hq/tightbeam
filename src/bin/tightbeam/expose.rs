@@ -110,11 +110,6 @@ impl ExposeCmd {
         // or rooted at a key since revoked, ends itself. Under `--public` nothing is ruled on, so
         // nothing is ever cut.
         let exposer = router.expose()?.with_live_cuts(revocations);
-        // Prove the transport can carry this gate BEFORE any ready output: a
-        // rooted gate over a transport that does not prove the peer refuses here, never after a banner
-        // the node cannot honor. The library's `run` re-checks, so the invariant holds however the
-        // exposer is driven.
-        exposer.prove_security::<T>()?;
         if !self.quiet {
             expose_banner(
                 node.node_id(),
@@ -130,7 +125,8 @@ impl ExposeCmd {
         // authority to hand out: it runs until the process is signalled (SIGINT), passing a token that is
         // never cancelled. A richer consumer is where the same token is wired to a teardown surface (a local
         // timer and a gated stop handler); here it is inert.
-        exposer.run(node, CancellationToken::new()).await
+        exposer.run(node, CancellationToken::new()).await;
+        Ok(())
     }
 }
 

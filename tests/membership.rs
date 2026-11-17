@@ -11,7 +11,7 @@
 //! transport proved as a `bound_device` fact, and a bound badge grants only when that fact matches its
 //! binding. Over `mem` the proven peer is the transport's synthetic node id, independent of the root's
 //! cap key, which is exactly what lets this test bind a badge to the connector's proven id and exercise
-//! the binding check without a keyed transport. Over iroh/quirk the two coincide (the node binds under the
+//! the binding check without a keyed transport. Over iroh the two coincide (the node binds under the
 //! root secret), so the same badge both proves membership and matches its own binding.
 
 use core::time::Duration;
@@ -49,8 +49,7 @@ async fn family_gate_admits_a_bound_membership_badge_and_refuses_a_foreign_bindi
                     .expose()
                     .unwrap()
                     .run(&exposer, CancellationToken::new())
-                    .await
-                    .unwrap();
+                    .await;
             });
 
             let root = Identity::from_secret(&ROOT_SECRET).unwrap();
@@ -122,8 +121,7 @@ async fn a_refused_forward_fails_at_preflight_with_the_reason() {
                     .expose()
                     .unwrap()
                     .run(&exposer, CancellationToken::new())
-                    .await
-                    .unwrap();
+                    .await;
             });
 
             // A stranger presenting NO badge: the gate refuses it. `preflight` proves admission before

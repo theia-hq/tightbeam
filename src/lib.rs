@@ -31,7 +31,6 @@ pub mod open_policy;
 pub mod peer;
 pub mod raw_stream;
 mod raw_stream_fanout;
-pub mod security;
 pub mod tunnel;
 
 pub mod protocol;
