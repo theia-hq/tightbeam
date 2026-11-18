@@ -7,7 +7,7 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 use std::sync::Arc;
 
-use bifrost::{Abort, ConnInfo, NoDiscovery, Node, NodeId, Path, PathChanges, Relay, Session};
+use bifrost::{ConnInfo, NoDiscovery, Node, NodeId, Path, PathChanges, Relay, Session, WriteEnd};
 use bifrost_mem::MemTransport;
 use nauthy::Gate;
 use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
@@ -77,10 +77,22 @@ impl<W: io::AsyncWrite + Unpin> io::AsyncWrite for SlotWrite<W> {
     }
 }
 
-/// Aborts the stream it wraps: holding a slot changes nothing about how the stream ends.
-impl<W: Abort> Abort for SlotWrite<W> {
+/// Ends the stream it wraps: holding a slot changes nothing about how the stream ends.
+impl<W: WriteEnd> WriteEnd for SlotWrite<W> {
     fn abort(&mut self) {
         self.inner.abort();
+    }
+
+    /// The slot rides the future, not the call: the stream stays open until the peer holds its end, so
+    /// returning the slot any earlier would let the forward open past the peer's cap.
+    fn delivered(self) -> impl Future<Output = io::Result<()>> + Send + 'static {
+        let Self { inner, _slot: slot } = self;
+        let delivered = inner.delivered();
+        async move {
+            let outcome = delivered.await;
+            drop(slot);
+            outcome
+        }
     }
 }
 
@@ -326,9 +338,13 @@ impl io::AsyncWrite for NoStream {
     }
 }
 
-impl Abort for NoStream {
+impl WriteEnd for NoStream {
     fn abort(&mut self) {
         match *self {}
+    }
+
+    fn delivered(self) -> impl Future<Output = io::Result<()>> + Send + 'static {
+        core::future::ready(Err(io::ErrorKind::Unsupported.into()))
     }
 }
 
