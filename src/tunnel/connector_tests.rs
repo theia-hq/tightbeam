@@ -8,10 +8,10 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use bifrost::{ConnInfo, NoDiscovery, Node, NodeId, Path, PathChanges, Relay, Session, WriteEnd};
-use bifrost_mem::MemTransport;
+use bifrost_mem::{MemRead, MemSession, MemTransport, MemWrite};
 use nauthy::Gate;
 use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::{ConnectionLost, Connector, MAX_PIPES, PortForward, ServiceSession};
@@ -398,4 +398,232 @@ async fn a_service_session_reports_its_sessions_path_changes() {
     };
     let heard: Vec<Path> = session.path_changes().collect().await;
     assert_eq!(heard, [relayed(), Path::Direct]);
+}
+
+/// A forward to a host the test plays by hand, carrying one local client on one admitted stream. The host's
+/// halves of that stream and its session are held here, so nothing ends until a row ends it.
+struct Carried {
+    _nodes: [Node<MemTransport, NoDiscovery>; 2],
+    session: MemSession,
+    writer: MemWrite,
+    reader: MemRead,
+    client: TcpStream,
+    forward: tokio::task::JoinHandle<eyre::Result<()>>,
+}
+
+/// Run a forward to a hand-played host and connect `client` through it, returning once the host has
+/// admitted the client's stream. Call inside a `LocalSet`.
+async fn carried(client: TcpSocket) -> Carried {
+    let host = Node::new(MemTransport::bind(), NoDiscovery);
+    let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+    let admits = async {
+        let session = host.accept().await.expect("the forward reaches the host");
+        let (mut writer, mut reader) = session.accept_bi().await.expect("the probe stream");
+        Request::read(&mut reader)
+            .await
+            .expect("the probe's request");
+        Response::Ok
+            .write(&mut writer)
+            .await
+            .expect("admit the probe");
+        session
+    };
+    let preflight = Connector::to_node(host.node_id(), svc("demo"), None).preflight(&consumer, 0);
+    let (session, forward) = tokio::join!(admits, preflight);
+    let forward = forward.expect("the host admits the forward");
+    // A large send buffer, inherited by the accepted socket, so a reply's tail is still queued in the
+    // forward when it closes rather than already held by the client.
+    let listener = TcpSocket::new_v4().expect("a forward socket");
+    listener
+        .set_send_buffer_size(256 * 1024)
+        .expect("grow the forward's send buffer");
+    listener
+        .bind("127.0.0.1:0".parse().expect("a loopback address"))
+        .expect("bind the forward");
+    let listener = listener.listen(1).expect("listen");
+    let addr = listener.local_addr().expect("bound");
+    let forward = PortForward {
+        listener,
+        ..forward
+    };
+    let forward = tokio::task::spawn_local(forward.run());
+    let client = client.connect(addr).await.expect("the forward accepts");
+    let (mut writer, mut reader) = session.accept_bi().await.expect("the client's stream");
+    Request::read(&mut reader)
+        .await
+        .expect("the client's request");
+    Response::Ok
+        .write(&mut writer)
+        .await
+        .expect("admit the client");
+    Carried {
+        _nodes: [host, consumer],
+        session,
+        writer,
+        reader,
+        client,
+        forward,
+    }
+}
+
+/// A plain loopback client socket.
+fn client_socket() -> TcpSocket {
+    TcpSocket::new_v4().expect("a client socket")
+}
+
+/// Whether `ended` is the read of a stream that was cut off.
+fn reset(ended: &io::Result<usize>) -> bool {
+    matches!(ended, Err(error) if error.kind() == io::ErrorKind::ConnectionReset)
+}
+
+/// Read `stream` to its end within [`WITHIN`], failing the row rather than hanging it.
+async fn read_rest(stream: &mut (impl io::AsyncRead + Unpin)) -> io::Result<usize> {
+    let mut rest = Vec::new();
+    tokio::time::timeout(WITHIN, stream.read_to_end(&mut rest))
+        .await
+        .expect("the stream ends")
+}
+
+/// A local client that resets mid-upload reaches the host as a cut-off stream, never as an upload that
+/// ended there: a clean end would hand the far service a truncated upload as a finished one.
+#[tokio::test]
+async fn a_local_client_reset_mid_upload_resets_the_hosts_stream() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut carried = carried(client_socket()).await;
+            let part = b"the first part of an upload";
+            carried.client.write_all(part).await.expect("upload");
+            let mut got = vec![0_u8; part.len()];
+            carried
+                .reader
+                .read_exact(&mut got)
+                .await
+                .expect("the host reads the part");
+
+            carried
+                .client
+                .set_zero_linger()
+                .expect("arm the client's reset");
+            drop(carried.client);
+            let ended = read_rest(&mut carried.reader).await;
+            assert!(reset(&ended), "a client reset reaches the host: {ended:?}");
+        })
+        .await;
+}
+
+/// A host that cuts its stream off mid-download reaches the local client as a reset, never as a reply that
+/// ended there.
+#[tokio::test]
+async fn a_host_cut_off_mid_download_resets_the_local_client() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut carried = carried(client_socket()).await;
+            let part = b"the first part of a reply";
+            carried.writer.write_all(part).await.expect("reply");
+            let mut got = vec![0_u8; part.len()];
+            carried
+                .client
+                .read_exact(&mut got)
+                .await
+                .expect("the client reads the part");
+
+            carried.writer.abort();
+            let ended = read_rest(&mut carried.client).await;
+            assert!(reset(&ended), "a host cut-off resets the client: {ended:?}");
+        })
+        .await;
+}
+
+/// A session lost under a running forward drops every connection it carries where it stands, and each local
+/// client reads that as a reset: nothing runs on that way out, so only a socket armed when it was accepted
+/// can say it.
+#[tokio::test]
+async fn a_lost_session_resets_the_local_client() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut carried = carried(client_socket()).await;
+            let part = b"the first part of a reply";
+            carried.writer.write_all(part).await.expect("reply");
+            let mut got = vec![0_u8; part.len()];
+            carried
+                .client
+                .read_exact(&mut got)
+                .await
+                .expect("the client reads the part");
+
+            carried.session.close();
+            let ended = read_rest(&mut carried.client).await;
+            assert!(reset(&ended), "a lost session resets the client: {ended:?}");
+            let forwarded = tokio::time::timeout(WITHIN, carried.forward)
+                .await
+                .expect("the forward ends with its session")
+                .expect("the forward ran");
+            assert!(
+                forwarded.is_err_and(|error| error.downcast_ref::<ConnectionLost>().is_some()),
+                "the forward names the lost connection"
+            );
+        })
+        .await;
+}
+
+/// A forward whose client and host both end cleanly passes each side every byte and a clean end. The client
+/// reads slowly through a small receive buffer, so the reply's tail still waits in the forward's socket when
+/// the forward closes it, and a reset left armed there would drop it.
+#[tokio::test]
+async fn a_forward_that_ends_cleanly_both_ways_delivers_every_byte() {
+    const REPLY: usize = 1024 * 1024;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let socket = client_socket();
+            socket
+                .set_recv_buffer_size(16 * 1024)
+                .expect("shrink the client's receive buffer");
+            let Carried {
+                _nodes,
+                session: _session,
+                mut writer,
+                mut reader,
+                mut client,
+                forward: _forward,
+            } = carried(socket).await;
+            let upload = b"a whole request";
+            let reply: Vec<u8> = (0..REPLY).map(|at| (at % 251) as u8).collect();
+            let host = async {
+                let mut got = Vec::new();
+                tokio::time::timeout(WITHIN, reader.read_to_end(&mut got))
+                    .await
+                    .expect("the upload ends")
+                    .expect("the host reads a clean end");
+                assert_eq!(got, upload, "the host reads every byte of the upload");
+                writer.write_all(&reply).await.expect("reply");
+                writer.shutdown().await.expect("end the reply");
+            };
+            let client = async {
+                client.write_all(upload).await.expect("upload");
+                client.shutdown().await.expect("end the upload");
+                let mut got = Vec::new();
+                let mut chunk = vec![0_u8; 16 * 1024];
+                loop {
+                    let read = client
+                        .read(&mut chunk)
+                        .await
+                        .expect("the client reads a clean end");
+                    if read == 0 {
+                        return got;
+                    }
+                    got.extend_from_slice(&chunk[..read]);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            };
+            let ((), got) = tokio::time::timeout(WITHIN, async { tokio::join!(host, client) })
+                .await
+                .expect("the forward ends");
+            assert!(got == reply, "the client reads every byte the host sent");
+        })
+        .await;
 }

@@ -56,8 +56,10 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 /// Copy bytes both ways between a local duplex stream and a bifrost stream until both sides close.
 ///
-/// The shared byte pump the core funnels into once a stream is established: the exposer after it dials
-/// the local target, the connector after a service is accepted.
+/// The pump for a local end that has no reset to send: a `unix:` service once the exposer dials it. A TCP
+/// end, on either side of a forward, splices through its own armed socket instead, so a splice that did not
+/// finish reaches it as a reset.
+#[cfg(unix)]
 pub(crate) async fn splice<S, W, R>(local: S, writer: W, reader: R) -> io::Result<()>
 where
     S: io::AsyncRead + io::AsyncWrite + Unpin,
