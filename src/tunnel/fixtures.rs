@@ -1,8 +1,13 @@
 //! The test doubles and builders the tunnel's unit tests share: two handlers at either end of the
 //! open-safety marker, the one-door prove shortcut, the table builders, and a minimal wire client.
 
+use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::{Context, Poll};
+use std::sync::Arc;
+
 use nauthy::{Gate, Service};
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream, WriteHalf};
 
 use super::exposer::Exposer;
 use super::router::{PublicRequest, PublicUnsafeRequest, Services};
@@ -17,9 +22,10 @@ impl Handler for GatedNoop {
     async fn serve(
         &self,
         _served: Served<Self>,
-        _writer: BoxWrite,
+        mut writer: BoxWrite,
         _reader: BoxRead,
     ) -> Result<(), ServeError> {
+        writer.shutdown().await?;
         Ok(())
     }
 }
@@ -32,10 +38,57 @@ impl Handler for OpenNoop {
     async fn serve(
         &self,
         _served: Served<Self>,
-        _writer: BoxWrite,
+        mut writer: BoxWrite,
         _reader: BoxRead,
     ) -> Result<(), ServeError> {
+        writer.shutdown().await?;
         Ok(())
+    }
+}
+
+/// A host's write half over a tokio duplex, for driving the dispatcher with no transport. A duplex has no
+/// reset, so an abort is recorded in `aborted` instead of reaching the peer, which reads a clean end
+/// either way: a row about what the peer reads belongs on a transport.
+pub(super) struct DuplexWrite {
+    pub(super) half: WriteHalf<DuplexStream>,
+    pub(super) aborted: Arc<AtomicBool>,
+}
+
+impl DuplexWrite {
+    /// Wrap `half`, recording an abort in a fresh flag.
+    pub(super) fn new(half: WriteHalf<DuplexStream>) -> Self {
+        Self {
+            half,
+            aborted: Arc::default(),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for DuplexWrite {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().half).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().half).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().half).poll_shutdown(cx)
+    }
+}
+
+impl bifrost::WriteEnd for DuplexWrite {
+    fn abort(&mut self) {
+        self.aborted.store(true, Ordering::Relaxed);
+    }
+
+    async fn delivered(mut self) -> std::io::Result<()> {
+        self.half.shutdown().await
     }
 }
 

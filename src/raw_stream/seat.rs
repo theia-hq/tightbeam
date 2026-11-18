@@ -296,8 +296,8 @@ impl Seated {
     /// byte, the `Ok` included, which is what lets a dialer see a holder that refuses its bytes: a peer
     /// that grants no credit at all parks the `Ok` write, and that refusal is judged like any other.
     /// Displaced, the serve is dropped where it stands; dropping it drops the lent reader, whose guard
-    /// sends it to the dialer. The displaced peer's stream then ends as a clean close (the transport has no
-    /// reset), which is why a live source's end can be false.
+    /// sends it to the dialer. The writer goes unshut, so the dispatcher aborts it and the displaced peer
+    /// sees a reset, never the source's end.
     pub(crate) async fn serve<W, R>(self, writer: W, reader: R) -> io::Result<()>
     where
         W: AsyncWrite + Unpin,

@@ -393,8 +393,8 @@ async fn a_silent_proven_peer_releases_its_permit_by_the_deadline() {
                 tokio::time::timeout(Duration::from_millis(100), reader.read_to_end(&mut tail))
                     .await;
             assert!(
-                matches!(ended, Ok(Ok(_) | Err(_))),
-                "the host dropped the stream at its deadline"
+                matches!(&ended, Ok(Err(error)) if error.kind() == tokio::io::ErrorKind::ConnectionReset),
+                "the host cut the stream off at its deadline: {ended:?}"
             );
             let _again = hold(&session, &entered, 1).await;
         })
@@ -599,6 +599,14 @@ impl tokio::io::AsyncWrite for Stuck {
         _cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<std::io::Result<()>> {
         core::task::Poll::Pending
+    }
+}
+
+impl bifrost::WriteEnd for Stuck {
+    fn abort(&mut self) {}
+
+    fn delivered(self) -> impl Future<Output = std::io::Result<()>> + Send + 'static {
+        core::future::pending()
     }
 }
 

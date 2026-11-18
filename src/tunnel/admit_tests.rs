@@ -19,7 +19,7 @@ use crate::tunnel::exposer::{
     RAW_STREAM_OPEN_PERMITS,
 };
 use crate::tunnel::fixtures::{
-    GatedNoop, OpenNoop, ServiceStream, family_gate, prove, services, svc,
+    DuplexWrite, GatedNoop, OpenNoop, ServiceStream, family_gate, prove, services, svc,
 };
 use crate::tunnel::router::{PublicRequest, PublicServices, PublicUnsafeRequest, Services};
 use crate::tunnel::{BoxRead, BoxWrite, CancellationToken, Handler, ServeError, Served};
@@ -36,11 +36,12 @@ impl Handler for Parked {
     async fn serve(
         &self,
         _served: Served<Self>,
-        _writer: BoxWrite,
+        mut writer: BoxWrite,
         _reader: BoxRead,
     ) -> Result<(), ServeError> {
         self.entered.notify_one();
         let _permit = self.release.acquire().await;
+        writer.shutdown().await?;
         Ok(())
     }
 }
@@ -135,7 +136,15 @@ fn drive_open_in(
         // (peer -> `io::sink()`) ends on this EOF, so a served stream can actually finish (otherwise the
         // splice's `try_join!` would wait forever for the client to hang up).
         drop(client_write);
-        serve_request(peer, server_write, server_read, serving, session, None).await
+        serve_request(
+            peer,
+            DuplexWrite::new(server_write),
+            server_read,
+            serving,
+            session,
+            None,
+        )
+        .await
     };
     (client_read, serve)
 }
@@ -161,7 +170,7 @@ fn drive_frame(
         drop(client_write);
         serve_request(
             peer,
-            server_write,
+            DuplexWrite::new(server_write),
             server_read,
             serving,
             std::sync::Arc::new(PublicSession::default()),
@@ -1473,6 +1482,7 @@ impl Handler for Greeter {
         writer.flush().await?;
         self.released.notified().await;
         self.finished.store(true, Ordering::Relaxed);
+        writer.shutdown().await?;
         Ok(())
     }
 }
@@ -1491,7 +1501,7 @@ impl Handler for AfterPeer {
     async fn serve(
         &self,
         _served: Served<Self>,
-        _writer: BoxWrite,
+        mut writer: BoxWrite,
         mut reader: BoxRead,
     ) -> Result<(), ServeError> {
         let mut opening = [0u8; HELLO.len()];
@@ -1503,6 +1513,7 @@ impl Handler for AfterPeer {
         self.heard.notify_one();
         self.released.notified().await;
         self.finished.store(true, Ordering::Relaxed);
+        writer.shutdown().await?;
         Ok(())
     }
 }
@@ -1511,12 +1522,13 @@ impl Handler for AfterPeer {
 /// plus the host's serving future. [`drive_open`] closes the peer's write half as soon as the request is
 /// sent, and a first-traffic test has to own whether the peer ever speaks again: an EOF is the one thing
 /// a slow-loris never sends. The request is written before the host runs because the duplex buffer holds
-/// it, so the peer can then be genuinely silent.
+/// it, so the peer can then be genuinely silent. The flag reads whether the host aborted its writer.
 async fn dial_and_hold(
     service: &str,
     serving: std::sync::Arc<super::Serving>,
 ) -> (
     tokio::io::DuplexStream,
+    Arc<AtomicBool>,
     impl core::future::Future<Output = eyre::Result<()>> + use<>,
 ) {
     let (mut peer_end, host_end) = tokio::io::duplex(1024);
@@ -1530,6 +1542,8 @@ async fn dial_and_hold(
     .await
     .expect("write request");
     let peer = bifrost::NodeId::from_ed25519_secret(&[9u8; 32]);
+    let host_write = DuplexWrite::new(host_write);
+    let aborted = Arc::clone(&host_write.aborted);
     let serve = serve_request(
         peer,
         host_write,
@@ -1538,7 +1552,7 @@ async fn dial_and_hold(
         std::sync::Arc::new(PublicSession::default()),
         None,
     );
-    (peer_end, serve)
+    (peer_end, aborted, serve)
 }
 
 /// A peer that is ADMITTED and then says nothing is dropped. The pre-gate read bound stops at the gate,
@@ -1561,7 +1575,7 @@ async fn an_admitted_stream_that_never_speaks_is_dropped() {
             },
         )
         .expect("`park` binds");
-    let (mut peer, serve) = dial_and_hold(
+    let (mut peer, aborted, serve) = dial_and_hold(
         "park",
         open_serving(services, Semaphore::new(RAW_STREAM_OPEN_PERMITS)),
     )
@@ -1592,15 +1606,19 @@ async fn an_admitted_stream_that_never_speaks_is_dropped() {
         "the deadline is armed at the handoff and not before: an admitted stream gets the whole window"
     );
 
-    // What the peer observes, pinned: nothing after the `Ok`, then a close.
+    // What the peer observes, pinned: nothing after the `Ok`, and the stream cut off rather than ended.
     let mut tail = Vec::new();
     peer.read_to_end(&mut tail)
         .await
-        .expect("the host closed the stream");
+        .expect("the host dropped the stream");
     assert!(
         tail.is_empty(),
         "there is no refusal left to send once `Response::Ok` is on the wire, so the enforcement IS the \
-         close; a late refusal would be a second answer to a request already answered. Got {tail:?}"
+         drop; a late refusal would be a second answer to a request already answered. Got {tail:?}"
+    );
+    assert!(
+        aborted.load(Ordering::Relaxed),
+        "a stream dropped for silence is aborted, so the peer reads it as cut off, never as a clean end"
     );
 }
 
@@ -1624,7 +1642,7 @@ async fn a_stream_the_server_greets_survives_the_deadline() {
             },
         )
         .expect("`greet` binds");
-    let (mut peer, serve) = dial_and_hold(
+    let (mut peer, _aborted, serve) = dial_and_hold(
         "greet",
         open_serving(services, Semaphore::new(RAW_STREAM_OPEN_PERMITS)),
     )
@@ -1692,7 +1710,7 @@ async fn a_peer_that_speaks_promptly_is_unaffected() {
             },
         )
         .expect("`after` binds");
-    let (mut peer, serve) = dial_and_hold(
+    let (mut peer, _aborted, serve) = dial_and_hold(
         "after",
         open_serving(services, Semaphore::new(RAW_STREAM_OPEN_PERMITS)),
     )
@@ -1732,8 +1750,9 @@ async fn a_peer_that_speaks_promptly_is_unaffected() {
     );
 }
 
-/// A peer writer that never accepts a byte: a QUIC receiver advertising a zero stream window.
-struct NoCredit;
+/// A peer writer that never accepts a byte: a QUIC receiver advertising a zero stream window. It records
+/// an abort in its flag.
+struct NoCredit(Arc<AtomicBool>);
 
 impl tokio::io::AsyncWrite for NoCredit {
     fn poll_write(
@@ -1759,10 +1778,21 @@ impl tokio::io::AsyncWrite for NoCredit {
     }
 }
 
+impl bifrost::WriteEnd for NoCredit {
+    fn abort(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    fn delivered(self) -> impl Future<Output = std::io::Result<()>> + Send + 'static {
+        core::future::pending()
+    }
+}
+
 /// A `stdin:` holder that grants no credit at all never takes even its `Ok` byte. It is judged like any
 /// other stalled holder, from that first refused byte, so a contender dialing a window later takes the
 /// seat. An `Ok` written before the seat's metered, preemptible scope would park unjudged and hold the
-/// seat for as long as the connection lived.
+/// seat for as long as the connection lived. The displaced holder's stream is aborted, so it reads as cut
+/// off, never as the end of the source.
 #[tokio::test(start_paused = true)]
 async fn a_stdin_holder_that_never_takes_its_ok_is_displaced_by_a_contender() {
     let mut map = HashMap::new();
@@ -1790,9 +1820,10 @@ async fn a_stdin_holder_that_never_takes_its_ok_is_displaced_by_a_contender() {
         .write_all(&request)
         .await
         .expect("send the request");
+    let aborted = Arc::new(AtomicBool::new(false));
     let holding = tokio::spawn(serve_request(
         holder,
-        NoCredit,
+        NoCredit(Arc::clone(&aborted)),
         server_read,
         Arc::clone(&serving),
         Arc::new(PublicSession::default()),
@@ -1810,6 +1841,13 @@ async fn a_stdin_holder_that_never_takes_its_ok_is_displaced_by_a_contender() {
         "a holder that never took its `Ok` is displaced: {response:?}"
     );
     contending.abort();
-    holding.abort();
+    holding
+        .await
+        .expect("the holder's serve does not panic")
+        .expect("a displaced holder is no host error");
+    assert!(
+        aborted.load(Ordering::Relaxed),
+        "the displaced holder's stream is aborted"
+    );
     drop(holder_upstream);
 }

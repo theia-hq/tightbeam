@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use bifrost::{NoDiscovery, Node};
 use bifrost_mem::MemTransport;
 use nauthy::Gate;
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::Exposer;
 use crate::enabled::AllEnabled;
@@ -34,9 +34,10 @@ impl Handler for AmplifierNoop {
     async fn serve(
         &self,
         _served: Served<Self>,
-        _writer: BoxWrite,
+        mut writer: BoxWrite,
         _reader: BoxRead,
     ) -> Result<(), ServeError> {
+        writer.shutdown().await?;
         Ok(())
     }
 }
@@ -52,9 +53,10 @@ impl Handler for MeteredNoop {
     async fn serve(
         &self,
         _served: Served<Self>,
-        _writer: BoxWrite,
+        mut writer: BoxWrite,
         _reader: BoxRead,
     ) -> Result<(), ServeError> {
+        writer.shutdown().await?;
         Ok(())
     }
 }
@@ -636,8 +638,6 @@ where
 /// next peer reads the input written after it attached.
 #[tokio::test]
 async fn a_peer_that_reads_nothing_and_leaves_does_not_burn_stdin() {
-    use tokio::io::AsyncWriteExt as _;
-
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -692,8 +692,6 @@ async fn a_peer_that_reads_nothing_and_leaves_does_not_burn_stdin() {
 /// `echo_is_admitted_under_plain_public_with_no_unsafe_opt_in`).
 #[tokio::test]
 async fn an_echo_service_reflects_the_clients_own_bytes() {
-    use tokio::io::AsyncWriteExt as _;
-
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -775,8 +773,6 @@ async fn run_returns_gracefully_when_its_cancel_token_fires() {
 /// serve path, proving one source fans out to many independent cursors.
 #[tokio::test]
 async fn a_lossy_source_fans_out_to_many_consumers() {
-    use tokio::io::AsyncWriteExt as _;
-
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1079,4 +1075,390 @@ fn the_public_proof_refuses_a_never_handler_a_raw_stream_and_an_unexposed_name()
         unknown.to_string().contains("no service named"),
         "an unexposed public name is refused with the served list: {unknown}"
     );
+}
+
+/// How many bytes the clean-end row uploads: more than a loopback socket buffers, so the service is
+/// still reading when the forward closes its socket.
+const UPLOAD: usize = 1024 * 1024;
+
+/// Serve `web` as a forward to the loopback TCP port `port` under an open gate, on the current
+/// `LocalSet` until `stop` fires, and return the exposer's key to dial.
+fn spawn_forward(port: u16, stop: CancellationToken) -> bifrost::NodeId {
+    spawn_open(services(&[&format!("web=tcp:127.0.0.1:{port}")]), stop)
+}
+
+/// Serve `services` under an open gate on the current `LocalSet` until `stop` fires, and return the
+/// exposer's key to dial.
+fn spawn_open(services: Services, stop: CancellationToken) -> bifrost::NodeId {
+    let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
+    let exposer_id = exposer_node.node_id();
+    let exposer = prove(
+        services,
+        Gate::Open,
+        PublicRequest::none(),
+        PublicUnsafeRequest::none(),
+    )
+    .expect("the services build under an open gate");
+    tokio::task::spawn_local(async move {
+        exposer.run(&exposer_node, stop).await;
+    });
+    exposer_id
+}
+
+/// Whether `ended` is the read of a stream that was cut off.
+fn reset(ended: &std::io::Result<usize>) -> bool {
+    matches!(ended, Err(error) if error.kind() == tokio::io::ErrorKind::ConnectionReset)
+}
+
+/// A peer cut off mid-splice reaches the local TCP service as a reset, never as a clean end: a clean
+/// end would pass a truncated upload to the service as a finished one.
+#[tokio::test]
+async fn a_peer_cut_off_mid_splice_resets_the_local_tcp_service() {
+    use bifrost::WriteEnd as _;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind the service");
+            let port = listener.local_addr().expect("the service's address").port();
+            let exposer_id = spawn_forward(port, CancellationToken::new());
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let session = consumer.connect(exposer_id).await.expect("connect");
+            let mut stream = ServiceStream::open(&session, "web")
+                .await
+                .expect("the forward admits the peer under the open gate");
+            let (mut service, _) = listener.accept().await.expect("the forward dials");
+
+            // The first bytes reach the service, so the cut lands mid-splice.
+            let body = b"the first part of an upload";
+            stream.writer.write_all(body).await.expect("write the body");
+            let mut got = vec![0_u8; body.len()];
+            service
+                .read_exact(&mut got)
+                .await
+                .expect("the service reads the body");
+            assert_eq!(got, body);
+
+            stream.writer.abort();
+            let mut rest = Vec::new();
+            let ended = service.read_to_end(&mut rest).await;
+            assert!(
+                reset(&ended),
+                "a cut-off peer resets the service: {ended:?}"
+            );
+        })
+        .await;
+}
+
+/// A peer that ends its stream cleanly reaches the local TCP service as a clean end, after every byte
+/// it sent: the reset is for a cut-off peer alone.
+#[tokio::test]
+async fn a_peer_that_ends_cleanly_reaches_the_local_tcp_service_as_eof_with_every_byte() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // A small receive buffer, inherited by the accepted socket, keeps the service's window
+            // shut while it reads slowly.
+            let socket = tokio::net::TcpSocket::new_v4().expect("a service socket");
+            socket
+                .set_recv_buffer_size(16 * 1024)
+                .expect("shrink the service's receive buffer");
+            socket
+                .bind("127.0.0.1:0".parse().expect("a loopback address"))
+                .expect("bind the service");
+            let listener = socket.listen(1).expect("listen");
+            let port = listener.local_addr().expect("the service's address").port();
+            let exposer_id = spawn_forward(port, CancellationToken::new());
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let session = consumer.connect(exposer_id).await.expect("connect");
+            let mut stream = ServiceStream::open(&session, "web")
+                .await
+                .expect("the forward admits the peer under the open gate");
+            let (mut service, _) = listener.accept().await.expect("the forward dials");
+
+            // The service says nothing and ends its side at once, so the splice finishes as soon as the
+            // peer's bytes and end have been handed to the service's socket.
+            service.shutdown().await.expect("the service ends its side");
+            let body: Vec<u8> = (0..UPLOAD).map(|at| (at % 251) as u8).collect();
+            let peer = async {
+                stream
+                    .writer
+                    .write_all(&body)
+                    .await
+                    .expect("write the body");
+                stream.writer.shutdown().await.expect("end the upload");
+                let mut nothing = Vec::new();
+                stream
+                    .reader
+                    .read_to_end(&mut nothing)
+                    .await
+                    .expect("the service's side ends cleanly");
+                assert!(nothing.is_empty());
+            };
+            // The service reads slowly, so when the forward closes its socket the last bytes still wait
+            // in that socket's send buffer, and a reset sent in place of a clean close would drop them.
+            let reader = async {
+                let mut got = Vec::new();
+                let mut chunk = vec![0_u8; 16 * 1024];
+                loop {
+                    let read = service
+                        .read(&mut chunk)
+                        .await
+                        .expect("the service reads a clean end");
+                    if read == 0 {
+                        return got;
+                    }
+                    got.extend_from_slice(&chunk[..read]);
+                    tokio::time::sleep(core::time::Duration::from_millis(1)).await;
+                }
+            };
+            let ((), got) = tokio::join!(peer, reader);
+            assert!(got == body, "the service reads every byte the peer sent");
+        })
+        .await;
+}
+
+/// An exposer stopped mid-splice drops the forward where it stands, and the local TCP service reads that as
+/// a reset: nothing runs on that way out, so only a socket armed to reset from the start can say it.
+#[tokio::test]
+async fn a_stopped_exposer_resets_the_tcp_service_mid_splice() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind the service");
+            let port = listener.local_addr().expect("the service's address").port();
+            let stop = CancellationToken::new();
+            let exposer_id = spawn_forward(port, stop.clone());
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let session = consumer.connect(exposer_id).await.expect("connect");
+            let mut stream = ServiceStream::open(&session, "web")
+                .await
+                .expect("the forward admits the peer under the open gate");
+            let (mut service, _) = listener.accept().await.expect("the forward dials");
+
+            let body = b"the first part of an upload";
+            stream.writer.write_all(body).await.expect("write the body");
+            let mut got = vec![0_u8; body.len()];
+            service
+                .read_exact(&mut got)
+                .await
+                .expect("the service reads the body");
+
+            stop.cancel();
+            let mut rest = Vec::new();
+            let ended = service.read_to_end(&mut rest).await;
+            assert!(
+                reset(&ended),
+                "a stopped exposer resets the service: {ended:?}"
+            );
+        })
+        .await;
+}
+
+/// A local service that resets mid-reply fails the forward, and the peer reads its stream as cut off after
+/// the bytes it got, never as a reply that ended there.
+#[tokio::test]
+async fn a_local_service_that_resets_mid_reply_resets_the_peer() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind the service");
+            let port = listener.local_addr().expect("the service's address").port();
+            let exposer_id = spawn_forward(port, CancellationToken::new());
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let session = consumer.connect(exposer_id).await.expect("connect");
+            let mut stream = ServiceStream::open(&session, "web")
+                .await
+                .expect("the forward admits the peer under the open gate");
+            let (mut service, _) = listener.accept().await.expect("the forward dials");
+
+            let part = b"the first part of a reply";
+            service.write_all(part).await.expect("the service replies");
+            let mut got = vec![0_u8; part.len()];
+            stream
+                .reader
+                .read_exact(&mut got)
+                .await
+                .expect("the peer reads the part");
+
+            service.set_zero_linger().expect("arm the service's reset");
+            drop(service);
+            let mut rest = Vec::new();
+            let ended = stream.reader.read_to_end(&mut rest).await;
+            assert!(reset(&ended), "a service reset reaches the peer: {ended:?}");
+        })
+        .await;
+}
+
+/// A handler that answers in full and returns `Ok` without shutting its writer down. Only a `shutdown`
+/// ends a stream cleanly, so its peer reads a reset.
+struct Unshut;
+impl Handler for Unshut {
+    type Exposure = OptIn;
+    async fn serve(
+        &self,
+        _served: Served<Self>,
+        mut writer: BoxWrite,
+        mut reader: BoxRead,
+    ) -> Result<(), ServeError> {
+        let mut request = Vec::new();
+        reader.read_to_end(&mut request).await?;
+        writer.write_all(&request).await?;
+        writer.flush().await?;
+        Ok(())
+    }
+}
+
+/// `Ok` is the handler's own word on how it went, not the stream's end: one that never shut its writer down
+/// cannot tell a full reply from one it gave up on, so its peer reads a reset every time, and the host log
+/// says why.
+#[tokio::test]
+async fn a_handler_that_returns_ok_without_shutdown_resets_the_peer() {
+    let log = crate::log_capture::Captured::default();
+    let _capturing = log.install();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let services = Services(HashMap::new())
+                .with_handler("unshut", Unshut)
+                .expect("`unshut` binds");
+            let exposer_id = spawn_open(services, CancellationToken::new());
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let session = consumer.connect(exposer_id).await.expect("connect");
+            let mut stream = ServiceStream::open(&session, "unshut")
+                .await
+                .expect("the handler admits the peer under the open gate");
+
+            stream.writer.write_all(b"hello").await.expect("write");
+            stream.writer.shutdown().await.expect("end the request");
+            let mut reply = Vec::new();
+            let ended = stream.reader.read_to_end(&mut reply).await;
+            assert!(
+                reset(&ended),
+                "an unshut handler resets its peer: {ended:?}"
+            );
+        })
+        .await;
+    assert_eq!(
+        log.lines("without calling shutdown on its writer").len(),
+        1,
+        "the host warns once that the handler never ended its stream"
+    );
+}
+
+/// A source that hands out `body`, then fails once `fail` fires: a `stdin:` read error in the middle of
+/// a stream.
+struct FailingSource {
+    body: &'static [u8],
+    fail: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl tokio::io::AsyncRead for FailingSource {
+    fn poll_read(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> core::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if !this.body.is_empty() {
+            let take = this.body.len().min(buf.remaining());
+            buf.put_slice(&this.body[..take]);
+            this.body = &this.body[take..];
+            return core::task::Poll::Ready(Ok(()));
+        }
+        core::task::ready!(core::pin::Pin::new(&mut this.fail).poll(cx)).ok();
+        core::task::Poll::Ready(Err(std::io::Error::other("the source failed")))
+    }
+}
+
+/// A raw source that fails mid-stream cuts its peer off: a clean end there would pass a truncated stream
+/// as all the source had.
+#[tokio::test]
+async fn a_raw_source_that_fails_resets_the_peer() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let body: &'static [u8] = b"the first part of a live stream";
+            let (fail, failing) = tokio::sync::oneshot::channel();
+            let source = FailingSource {
+                body,
+                fail: failing,
+            };
+            let exposer_node = Node::new(MemTransport::bind(), NoDiscovery);
+            let exposer_id = exposer_node.node_id();
+            // Past the door, as the stdin row above: an open gate admits the peer with no token.
+            let exposer = Exposer {
+                services: stdin_service("cam", Box::new(source)),
+                gate: Gate::Open,
+                public: PublicServices::default(),
+                public_unsafe: PublicServices::default(),
+                enabled: Box::new(AllEnabled),
+                cuts: None,
+            };
+            tokio::task::spawn_local(async move {
+                exposer.run(&exposer_node, CancellationToken::new()).await;
+            });
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let session = consumer.connect(exposer_id).await.expect("connect");
+            let mut stream = ServiceStream::open(&session, "cam")
+                .await
+                .expect("the stream is admitted");
+            let mut got = vec![0_u8; body.len()];
+            stream
+                .reader
+                .read_exact(&mut got)
+                .await
+                .expect("the peer reads the first part");
+
+            fail.send(()).expect("the source is still read");
+            let mut rest = Vec::new();
+            let ended = stream.reader.read_to_end(&mut rest).await;
+            assert!(reset(&ended), "a failed source resets the peer: {ended:?}");
+        })
+        .await;
+}
+
+/// A refusal is written before the stream is guarded, so it still reaches the peer as a typed refusal and
+/// then a clean end: the guard is for streams that were served.
+#[tokio::test]
+async fn a_refusal_still_reaches_the_peer_as_a_typed_refusal_then_a_clean_end() {
+    use bifrost::Session as _;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Two names, so an absent one is not read as the only service.
+            let exposer_id = spawn_open(
+                services(&["web=tcp:127.0.0.1:9", "mail=tcp:127.0.0.1:9"]),
+                CancellationToken::new(),
+            );
+            let consumer = Node::new(MemTransport::bind(), NoDiscovery);
+            let session = consumer.connect(exposer_id).await.expect("connect");
+            let (mut writer, mut reader) = session.open_bi().await.expect("open a stream");
+            crate::protocol::Request {
+                service: "absent".to_owned(),
+                capability: None,
+                membership: None,
+            }
+            .write(&mut writer)
+            .await
+            .expect("write the request");
+            let response = crate::protocol::Response::read(&mut reader)
+                .await
+                .expect("read the response");
+            assert!(
+                matches!(response, crate::protocol::Response::Refused(_)),
+                "an absent name is refused: {response:?}"
+            );
+            let mut rest = Vec::new();
+            let ended = reader.read_to_end(&mut rest).await;
+            assert!(matches!(ended, Ok(0)), "a refusal ends cleanly: {ended:?}");
+        })
+        .await;
 }

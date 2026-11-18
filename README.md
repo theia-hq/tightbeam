@@ -127,6 +127,7 @@ one.
 ```rust
 use tightbeam::open_policy::Never;
 use tightbeam::tunnel::{BoxRead, BoxWrite, Handler, ServeError, Served};
+use tokio::io::AsyncWriteExt as _;
 
 struct Shell;
 
@@ -141,14 +142,17 @@ impl Handler for Shell {
     async fn serve(
         &self,
         served: Served<Self>,
-        writer: BoxWrite,
+        mut writer: BoxWrite,
         reader: BoxRead,
     ) -> Result<(), ServeError> {
         // `served` carries the gate's single-use witness: this code cannot run for a peer the gate did
         // not admit. An engine whose safety rests on a ROOT-verified peer narrows it with
         // `served.into_rooted()?` (an open witness is refused).
         let rooted = served.into_rooted()?;
-        run_shell(rooted, writer, reader)
+        run_shell(rooted, &mut writer, reader).await?;
+        // End the reply. A writer dropped without `shutdown` reaches the peer as a reset.
+        writer.shutdown().await?;
+        Ok(())
     }
 }
 

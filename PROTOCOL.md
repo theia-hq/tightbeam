@@ -61,7 +61,8 @@ Four rules bind this wire to the layer under it:
    `MUST NOT` send a credential and a host `MUST NOT` admit on the key or on a credential bound to it.
 4. After a successful response, every remaining octet in both directions belongs to the service. TB04
    defines no trailer, no keepalive, no close frame, and no escape sequence. The stream ends when the
-   session's stream ends.
+   session's stream ends. A stream also ends in a reset: the host cut it off, or the service ended
+   without a clean shutdown. A reset is an error to the dialer, never the end of the service's data.
 
 ## The magic: identity and version
 
@@ -211,6 +212,7 @@ Both sides are strictly sequential; there is no pipelining and no interleaving.
 | `AwaitingResponse` | tag `01` and an unknown code | fail the stream as unreadable | `Closed` |
 | `AwaitingResponse` | unknown tag, short read, or invalid UTF-8 | fail the stream | `Closed` |
 | `Piping` | either direction ends | let the other drain, then close | `Closed` |
+| `Piping` | reset received | fail the stream | `Closed` |
 
 A dialer `MUST NOT` write a payload octet while in `AwaitingResponse`. A refusal makes those octets
 unrecoverable, and on a credential path they would have been handed to a host that then declined the
