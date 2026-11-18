@@ -116,7 +116,10 @@ async fn a_finished_upload_reaches_the_service_whole_when_the_download_fails() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     };
-    let (forwarded, got) = tokio::join!(forward, service);
+    let (forwarded, got) =
+        tokio::time::timeout(ROW_TIMEOUT, async { tokio::join!(forward, service) })
+            .await
+            .expect("the service's reading ends the forward");
     assert!(forwarded.is_err(), "the way back failed");
     let got = got.expect("the service reads a clean end");
     assert!(got == body, "the service reads every byte the peer sent");
@@ -167,6 +170,10 @@ impl io::AsyncWrite for FailsMidReply {
 /// A drain deadline short enough for a row, standing in for the forward's 2 s.
 const SHORT_DRAIN: Duration = Duration::from_millis(200);
 
+/// A drain deadline long enough for the forward to discard a [`REPLY`] it cannot send on a loaded runner,
+/// still well inside [`ROW_TIMEOUT`].
+const IDLE_DRAIN: Duration = Duration::from_secs(1);
+
 /// A drain deadline no row reaches, so a row that ends in time proves another stop ended it.
 const UNREACHED_DRAIN: Duration = Duration::from_secs(60);
 
@@ -197,7 +204,7 @@ async fn a_finished_upload_reaches_an_idle_service_whole_after_the_drain_bound()
     // Fired once the forward has returned, so its socket is closed before the service reads the rest.
     let closed = tokio_util::sync::CancellationToken::new();
     let forward = async {
-        let forwarded = dial_and_splice_within(&addr, way_back, upload, SHORT_DRAIN).await;
+        let forwarded = dial_and_splice_within(&addr, way_back, upload, IDLE_DRAIN).await;
         closed.cancel();
         forwarded
     };
@@ -304,7 +311,15 @@ async fn a_service_that_stops_reading_is_released_at_the_discard_cap() {
 /// end the forward. The upload's tail is the accepted loss, and the service hears it as an error.
 #[tokio::test]
 async fn a_service_that_stops_reading_is_released_at_the_drain_deadline() {
+    let started = tokio::time::Instant::now();
     let (forwarded, got) = stop_reading_and_stream(SHORT_DRAIN, Duration::from_millis(20)).await;
+    // Ten deadlines of slack for a loaded runner, and still far short of the discard cap, which the trickle
+    // reaches only after about 20 s.
+    let took = started.elapsed();
+    assert!(
+        took < SHORT_DRAIN * 10,
+        "the deadline, not the cap, ended the forward: {took:?}"
+    );
     assert!(forwarded.is_err(), "the way back failed");
     assert_tail_lost(got);
 }
@@ -436,7 +451,10 @@ async fn a_failed_write_toward_the_peer_resets_the_tcp_service() {
         let mut rest = Vec::new();
         service.read_to_end(&mut rest).await
     };
-    let (forwarded, ended) = tokio::join!(forward, service);
+    let (forwarded, ended) =
+        tokio::time::timeout(ROW_TIMEOUT, async { tokio::join!(forward, service) })
+            .await
+            .expect("the failed write ends the forward");
     assert!(forwarded.is_err(), "the way back failed");
     assert!(
         matches!(&ended, Err(error) if error.kind() == io::ErrorKind::ConnectionReset),

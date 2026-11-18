@@ -25,9 +25,9 @@ One denylist holds revoked caps and revoked keys, and a revoked key ends a live 
   same key: both ed25519, same 32 bytes. An implementor outside tightbeam must add it.
 - **A stream the host cuts off now reaches the peer as a reset, not a clean end.** So does one whose
   handler returns without `shutdown` on its writer. A forwarded TCP service is reset unless the peer's end
-  reached it. Once it has, a later failure waits up to 2 s for the service to read the rest. A service that
-  does not read its input for that long, or a stream cut off or cancelled, can still lose the end of the
-  upload.
+  was handed to it. Once it was, a later failure waits up to 2 s for the service to read the rest. A service
+  that does not read its input for that long, sends more than 1 MiB of reply meanwhile, or a stream cut off
+  or cancelled, can still lose the end of the upload.
 
 ### Added
 - **`Connector::open_on(&session)` opens one admitted stream on a session you already hold**, so one

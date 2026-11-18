@@ -84,12 +84,13 @@ where
 
 /// How long, in total, a forward keeps a TCP service's socket open after the way back failed with the
 /// upload already handed over. The upload's tail still queued in the forward's kernel is at most one send
-/// buffer, which a service that reads at all takes in milliseconds; only a service that does not read its
-/// input for this long can still lose it.
+/// buffer. The drain ends early when the service ends, the upload is acknowledged, or the cap below is
+/// reached; a service that does not read for this long can still lose it.
 const HANDOVER_DRAIN: Duration = Duration::from_secs(2);
 
 /// How much of a service's reply a forward reads and discards while it waits for the upload to land. The
-/// reply goes nowhere, so a service that streams it without end is held to this much work.
+/// reply goes nowhere, so a service that streams it without end is held to this much work. Reaching it ends
+/// the drain, so the upload can then be lost.
 const HANDOVER_DRAIN_CAP: usize = 1024 * 1024;
 
 /// How often the drain asks the kernel whether the upload has left the forward's send queue.
