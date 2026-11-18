@@ -59,6 +59,9 @@ pub trait Service: Send + Sync + 'static {
     /// body owns the rest of the stream outright: stream a body to EOF, count a payload, join the halves
     /// and hand them to a foreign engine. Nothing was read ahead, so nothing has to be replayed.
     ///
+    /// End the stream as [`Handler::serve`] does: call `shutdown` on `writer`. Without it the peer gets a
+    /// reset.
+    ///
     /// The proof is a [`Served<Serve<Self>>`](Served), the serving proof for the handler that is
     /// actually BOUND, which is the wrapper. Naming the wrapper rather than `Self` costs nothing and
     /// keeps the proof's one property intact: `Serve<S>` is uniquely determined by `S`, so the proof is

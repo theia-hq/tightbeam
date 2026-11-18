@@ -53,6 +53,8 @@ impl Handler for Shout {
             writer.write_all(&buf[..read]).await?;
             writer.flush().await?;
         }
+        // End the reply. A writer dropped without `shutdown` reaches the peer as a reset.
+        writer.shutdown().await?;
         Ok(())
     }
 }
@@ -110,8 +112,9 @@ async fn run() -> eyre::Result<()> {
 
     let message = b"hello from the other node";
     client.write_all(message).await?;
-    let mut shouted = vec![0u8; message.len()];
-    client.read_exact(&mut shouted).await?;
+    client.shutdown().await?;
+    let mut shouted = Vec::new();
+    client.read_to_end(&mut shouted).await?;
     println!(
         "sent {:?}, the handler shouted back {:?}",
         String::from_utf8_lossy(message),

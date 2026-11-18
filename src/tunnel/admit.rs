@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::io::IoSlice;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use bifrost::{NodeId, Refusal, RefusalDetail};
+use bifrost::{NodeId, Refusal, RefusalDetail, WriteEnd};
 use nauthy::{Admitted, Cap, Gate, ProvenPeer, Revocations, Service, VerifyKey};
 use tightbeam_handler::bridge::Prepared;
 use tokio::io;
@@ -108,7 +108,7 @@ pub(super) async fn serve_request<W, R>(
     chains: Option<Arc<Mutex<AdmittedChains>>>,
 ) -> eyre::Result<()>
 where
-    W: io::AsyncWrite + Unpin + Send + 'static,
+    W: io::AsyncWrite + WriteEnd + Unpin + Send + 'static,
     R: io::AsyncRead + Unpin + Send + 'static,
 {
     let Serving {
@@ -380,17 +380,28 @@ where
 }
 
 /// Serve a stream whose every refusal is behind it: write the success and run the target.
+///
+/// The peer's writer is guarded from here on, and only here: every refusal was written before, on the bare
+/// half, and stays a clean end. Past this point a stream that ends any way but a successful `shutdown` (an
+/// error, a deadline, a cancel, a cut, a displaced seat, a handler that never shut down) reaches the peer
+/// as cut off, never as a finished stream it could mistake for the whole answer.
 async fn serve_ready<W, R>(
     ready: Ready<'_>,
     peer: NodeId,
     service: &Service,
-    mut writer: W,
+    writer: W,
     reader: R,
 ) -> eyre::Result<()>
 where
-    W: io::AsyncWrite + Unpin + Send + 'static,
+    W: io::AsyncWrite + WriteEnd + Unpin + Send + 'static,
     R: io::AsyncRead + Unpin + Send + 'static,
 {
+    let aborted = Arc::new(AtomicBool::new(false));
+    let mut writer = AbortUnlessShut {
+        half: writer,
+        shut: false,
+        aborted: Arc::clone(&aborted),
+    };
     match ready {
         // Direction is fixed at parse time: read the source, send its bytes to the peer, and discard any
         // bytes the peer sends upstream (a read-only source has nowhere to put them). Using `splice_halves`
@@ -432,11 +443,24 @@ where
                 // Biased so a serve that finishes in the same instant the deadline elapses is read as
                 // finished: the handler's own result wins the tie, never the clock.
                 biased;
-                result = served => result?,
+                result = served => {
+                    result?;
+                    // The handler's own future has ended, so a writer it did not hand to a detached task
+                    // has dropped by now, and the guard has said whether that drop aborted. A handler
+                    // that returns `Ok` without `shutdown` cuts its peer off with every reply, and only
+                    // this line tells the host why.
+                    if aborted.load(Ordering::Relaxed) {
+                        tracing::warn!(
+                            %peer,
+                            service = %service,
+                            "handler returned Ok without calling shutdown on its writer; the peer's stream was reset"
+                        );
+                    }
+                }
                 () = traffic.silent_past(FIRST_TRAFFIC_TIMEOUT) => {
                     // The success frame is already on the wire, so the enforcement IS the drop: the
-                    // halves go with `served` and the peer sees its stream close after an `Ok` it never
-                    // used. The cause exists only here, which is why it is logged at the level a stock
+                    // halves go with `served` and the peer reads its stream as cut off after an `Ok` it
+                    // never used. The cause exists only here, which is why it is logged at the level a stock
                     // serving filter shows rather than at `warn`, where a host watching a wedge would
                     // never see it.
                     tracing::error!(
@@ -909,6 +933,72 @@ impl<T: io::AsyncWrite + Unpin> io::AsyncWrite for Watched<T> {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().half).poll_shutdown(cx)
+    }
+}
+
+/// The peer's write half of an admitted stream, aborted on drop unless a `shutdown` succeeded. A successful
+/// `shutdown` is the one clean end: every other way out, an error, a dropped future, a panic, or a handler
+/// that returned without ending its stream, tells the peer the stream was cut off.
+///
+/// It sits innermost, under every wrapper that reaches it (the first-traffic watch, the seat's meter), and
+/// those forward `shutdown` to it, so a `shutdown` anywhere above is the one that disarms it. A writer that
+/// erases its type (a handler's [`BoxWrite`](tightbeam_handler::BoxWrite)) cannot call `abort` itself,
+/// which is why the guard lives below the erasure, where the half is still concrete.
+///
+/// `aborted` is set only when the drop actually aborted, so a writer still held by a detached task has not
+/// set it when the handler returns.
+struct AbortUnlessShut<W: WriteEnd> {
+    half: W,
+    shut: bool,
+    aborted: Arc<AtomicBool>,
+}
+
+impl<W: WriteEnd> Drop for AbortUnlessShut<W> {
+    fn drop(&mut self) {
+        if self.shut {
+            return;
+        }
+        // Synchronous and never blocks, which is what lets a `Drop` call it.
+        self.half.abort();
+        // `Relaxed`: the bit guards no other data, and its one reader polls the task that dropped this.
+        self.aborted.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Transparent but for `shutdown`, whose success it records. Keeps the inner half's vectored-write
+/// capability, for the same reason [`Watched`] does.
+impl<W: io::AsyncWrite + WriteEnd + Unpin> io::AsyncWrite for AbortUnlessShut<W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().half).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().half).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.half.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().half).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.half).poll_shutdown(cx);
+        if matches!(polled, Poll::Ready(Ok(()))) {
+            this.shut = true;
+        }
+        polled
     }
 }
 

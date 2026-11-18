@@ -88,6 +88,9 @@ pub trait Handler: Send + Sync + 'static {
 
     /// Serve ONE admitted stream: the handler-bound [`Served<Self>`](Served) proof (carrying the gate's
     /// single-use witness) and the stream halves.
+    ///
+    /// End the stream by calling `shutdown` on `writer`. A writer dropped without a successful `shutdown` (an
+    /// error, a panic, a dropped future, or a plain return) reaches the peer as a reset, never as a clean end.
     fn serve(
         &self,
         served: Served<Self>,
