@@ -27,7 +27,9 @@ One denylist holds revoked caps and revoked keys, and a revoked key ends a live 
   handler returns without `shutdown` on its writer. A forwarded TCP service is reset unless the peer's end
   was handed to it. Once it was, a later failure waits up to 2 s for the service to read the rest. A service
   that does not read its input for that long, sends more than 1 MiB of reply meanwhile, or a stream cut off
-  or cancelled, can still lose the end of the upload.
+  or cancelled, can still lose the end of the upload. A port forward's local client is reset the same way
+  when the host cuts its stream off, the session is lost, or the stream is refused. A client that resets
+  reaches the host as a reset.
 
 ### Added
 - **`Connector::open_on(&session)` opens one admitted stream on a session you already hold**, so one

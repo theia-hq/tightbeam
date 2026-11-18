@@ -7,17 +7,20 @@
 
 use core::time::Duration;
 
-use bifrost::{ConnInfo, Discovery, Node, NodeId, PathChanges, Refusal, Session, Transport};
+use bifrost::{
+    ConnInfo, Discovery, Node, NodeId, PathChanges, Refusal, Session, Transport, WriteEnd,
+};
 use eyre::WrapErr as _;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt as _, StreamExt as _};
 use nauthy::{Link, Service};
 use tokio::io;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
+use super::{AbortUnlessShut, ArmedTcp, HANDOVER_DRAIN};
 use crate::identity::AsNodeId as _;
+use crate::pipe_stdio_bridge;
 use crate::protocol::{Request, Response};
-use crate::{pipe_stdio_bridge, splice};
 
 /// A dial that reached the peer and was refused: the peer plus the typed
 /// classification, rendered as one line. Returned by [`Connector::preflight`].
@@ -260,6 +263,10 @@ const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 impl<S: Session> PortForward<S> {
     /// Forward each accepted TCP connection over its own stream, until the session ends; prints nothing.
     ///
+    /// A local client is reset when the host cuts its stream off, the session is lost, or the stream is
+    /// refused. A client that resets reaches the host as a reset. A clean end in both directions delivers
+    /// every byte.
+    ///
     /// # Errors
     ///
     /// [`ConnectionLost`] once the session ends (the host closed it, or the network path to it failed); every
@@ -284,12 +291,25 @@ impl<S: Session> PortForward<S> {
                     // One local accept failing must not drop the pipes already in flight: log the
                     // error and keep the local listener up. Pause before the next accept, while still
                     // polling the pipes: an error like running out of descriptors fails again at once.
-                    let (tcp, _) = match accepted {
-                        Ok(accepted) => accepted,
+                    let tcp = match accepted {
+                        Ok((tcp, _)) => tcp,
                         Err(error) => {
                             tracing::warn!(%error, "local accept failed; still listening");
                             retry.as_mut().reset(tokio::time::Instant::now() + ACCEPT_RETRY);
                             paused = true;
+                            continue;
+                        }
+                    };
+                    // Armed as it is taken in, before the pipe is first polled, so a connection the
+                    // forward drops for any reason from here on (a refused or unopened stream, a lost
+                    // session) reads as cut off, never as a service that answered nothing. A socket
+                    // that will not arm is dropped and its descriptor freed with it, so accepting goes
+                    // on at once: pausing here would let a client that connects and resets at once
+                    // hold off every other accept.
+                    let tcp = match ArmedTcp::arm(tcp) {
+                        Ok(tcp) => tcp,
+                        Err(error) => {
+                            tracing::warn!(%error, "local connection dropped before it was carried");
                             continue;
                         }
                     };
@@ -388,7 +408,7 @@ impl<S: Session> Session for ServiceSession<S> {
 }
 
 /// Carry one local connection: open its stream to the peer, then request the service over it.
-async fn forward<S: Session>(session: &S, request: Request, tcp: TcpStream) -> eyre::Result<()> {
+async fn forward<S: Session>(session: &S, request: Request, tcp: ArmedTcp) -> eyre::Result<()> {
     let (writer, reader) = session
         .open_bi()
         .await
@@ -397,19 +417,30 @@ async fn forward<S: Session>(session: &S, request: Request, tcp: TcpStream) -> e
 }
 
 /// Open a stream to a service: send the request, and if the host accepts, pipe the connection.
+///
+/// The stream toward the host is guarded from the admission on, so a local client that resets, a failed
+/// read from the host or a forward dropped with its session reaches the host as cut off, never as an upload
+/// that ended there. The local client hears the same of the host through its armed socket.
 async fn request_service<W, R>(
     request: Request,
-    tcp: TcpStream,
+    tcp: ArmedTcp,
     mut writer: W,
     mut reader: R,
 ) -> eyre::Result<()>
 where
-    W: io::AsyncWrite + Unpin,
+    W: io::AsyncWrite + WriteEnd + Unpin,
     R: io::AsyncRead + Unpin,
 {
     request.write(&mut writer).await?;
     match Response::read(&mut reader).await? {
-        Response::Ok => splice(tcp, writer, reader).await?,
+        Response::Ok => {
+            let writer = AbortUnlessShut {
+                half: writer,
+                shut: false,
+                aborted: None,
+            };
+            tcp.splice(writer, reader, HANDOVER_DRAIN).await?;
+        }
         Response::Refused(refusal) => return Err(bifrost::Error::Refused(refusal).into()),
     }
     Ok(())

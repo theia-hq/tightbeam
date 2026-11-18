@@ -9,10 +9,13 @@
 //! clap or a store.
 
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::io::IoSlice;
+use std::sync::Arc;
 
+use bifrost::WriteEnd;
 // The handler contract lives in the lean `tightbeam-handler` crate, re-exported here
 // unchanged so every existing `tightbeam::tunnel::*` path keeps working, and a service implements the
 // contract without taking this crate's tree. The erased bridge is imported, not re-exported: `Target` stores
@@ -24,7 +27,7 @@ use tokio::io::{self, AsyncReadExt as _};
 use tokio::net::TcpStream;
 use tokio::net::tcp::WriteHalf;
 
-use crate::{splice, splice_halves};
+use crate::splice_halves;
 
 mod admit;
 mod catalog;
@@ -82,10 +85,11 @@ where
     dial_and_splice_within(addr, writer, reader, HANDOVER_DRAIN).await
 }
 
-/// How long, in total, a forward keeps a TCP service's socket open after the way back failed with the
-/// upload already handed over. The upload's tail still queued in the forward's kernel is at most one send
-/// buffer. The drain ends early when the service ends, the upload is acknowledged, or the cap below is
-/// reached; a service that does not read for this long can still lose it.
+/// How long, in total, a forward keeps its local TCP end's socket open after the way back failed with the
+/// peer's stream already handed over. The local end is the service on the exposing side and the client on
+/// the dialing side; below it is called the service. The tail still queued in the forward's kernel is at
+/// most one send buffer. The drain ends early when the service ends, the upload is acknowledged, or the cap
+/// below is reached; a service that does not read for this long can still lose it.
 const HANDOVER_DRAIN: Duration = Duration::from_secs(2);
 
 /// How much of a service's reply a forward reads and discards while it waits for the upload to land. The
@@ -110,37 +114,14 @@ where
 {
     match addr.split_once(':') {
         Some(("tcp", host_port)) => {
-            let mut local = TcpStream::connect(host_port).await?;
-            // Zero linger from the first byte, so every way this socket closes before the peer's end was
-            // handed over (an error either way, a cancel, a deadline, a cut, a killed process) resets the
-            // service rather than passing it a truncated stream as a finished one. Armed here, not on the
-            // way out, because a process that dies runs no code on the way out.
-            local.set_zero_linger()?;
-            let mut handed_over = false;
-            let (local_reader, local_writer) = local.split();
-            let spliced = splice_halves(
-                local_reader,
-                Handover {
-                    half: local_writer,
-                    handed_over: &mut handed_over,
-                },
-                writer,
-                reader,
-            )
-            .await;
-            // The peer's writer was dropped inside the splice, so the peer has already heard the failure;
-            // the drain holds only the local socket. It runs in place, never spawned, so a cut, a cancel or
-            // a deadline that drops this future ends it too.
-            if spliced.is_err() && handed_over {
-                drain_after_handover(&mut local, drain).await;
-            }
-            spliced?;
+            let local = TcpStream::connect(host_port).await?;
+            ArmedTcp::arm(local)?.splice(writer, reader, drain).await?;
         }
         #[cfg(unix)]
         Some(("unix", path)) => {
             // A unix socket has no reset, so a splice that did not finish reaches this service as a clean end.
             let local = tokio::net::UnixStream::connect(path).await?;
-            splice(local, writer, reader).await?;
+            crate::splice(local, writer, reader).await?;
         }
         #[cfg(not(unix))]
         Some(("unix", _)) => {
@@ -160,9 +141,56 @@ where
     Ok(())
 }
 
-/// The write half toward a local TCP service, clearing the zero linger once the peer's end has been handed
-/// to the forward's kernel: a `shutdown` that returned `Ok` queued every byte and the end there, and a reset
-/// from this side after it would take back a finished upload because the other direction failed later. It
+/// A local TCP socket armed to reset: zero linger from the first byte, so every way it closes before the
+/// peer's end was handed over (an error either way, a cancel, a deadline, a cut, a lost session, a killed
+/// process) resets the other side rather than passing it a truncated stream as a finished one. Armed when
+/// the socket is had, not on the way out, because a process that dies runs no code on the way out. The one
+/// type both local ends of a forward splice through: the service the exposer dials and the client the
+/// dialer accepts.
+struct ArmedTcp(TcpStream);
+
+impl ArmedTcp {
+    /// Arm `socket` to reset on close.
+    fn arm(socket: TcpStream) -> io::Result<Self> {
+        socket.set_zero_linger()?;
+        Ok(Self(socket))
+    }
+
+    /// Splice the socket against a peer stream. The linger is cleared when the peer's end is handed to the
+    /// socket (see [`Handover`]); a splice that fails after that drains in place for at most `drain` (see
+    /// [`drain_after_handover`]), and one that fails before it resets the socket as it drops.
+    async fn splice<W, R>(self, writer: W, reader: R, drain: Duration) -> io::Result<()>
+    where
+        W: io::AsyncWrite + Unpin,
+        R: io::AsyncRead + Unpin,
+    {
+        let Self(mut local) = self;
+        let mut handed_over = false;
+        let (local_reader, local_writer) = local.split();
+        let spliced = splice_halves(
+            local_reader,
+            Handover {
+                half: local_writer,
+                handed_over: &mut handed_over,
+            },
+            writer,
+            reader,
+        )
+        .await;
+        // The peer's writer was dropped inside the splice, so the peer has already heard the failure; the
+        // drain holds only the local socket. It runs in place, never spawned, so a cut, a cancel, a lost
+        // session or a deadline that drops this future ends it too.
+        if spliced.is_err() && handed_over {
+            drain_after_handover(&mut local, drain).await;
+        }
+        spliced
+    }
+}
+
+/// The write half toward a forward's local TCP end (a service, or a dialer's client), clearing the zero
+/// linger once the peer's end has been handed to the forward's kernel: a `shutdown` that returned `Ok`
+/// queued every byte and the end there, and a reset from this side after it would take back a finished
+/// upload because the other direction failed later. It
 /// records the handover, because queued is not delivered: a close that resets before the queue drains still
 /// loses the queue, which is what [`drain_after_handover`] waits out.
 ///
@@ -221,7 +249,77 @@ impl io::AsyncWrite for Handover<'_> {
     }
 }
 
-/// Hold a TCP service's socket open after the way back failed with the upload handed over, reading and
+/// The write half of a stream toward the peer, aborted on drop unless a `shutdown` succeeded. A successful
+/// `shutdown` is the one clean end: every other way out, an error, a dropped future, a lost session, a
+/// panic, or a handler that returned without ending its stream, tells the peer the stream was cut off. Both
+/// ends of a stream carry it once the stream is admitted: the exposer over what it serves, and the dialer
+/// over what a local client sends.
+///
+/// It sits innermost, under every wrapper that reaches it (the first-traffic watch, the seat's meter), and
+/// those forward `shutdown` to it, so a `shutdown` anywhere above is the one that disarms it. A writer that
+/// erases its type (a handler's [`BoxWrite`]) cannot call `abort` itself, which is why the guard lives below
+/// the erasure, where the half is still concrete.
+///
+/// `aborted`, when someone asked, is set only when the drop actually aborted, so a writer still held by a
+/// detached task has not set it when the handler returns.
+struct AbortUnlessShut<W: WriteEnd> {
+    half: W,
+    shut: bool,
+    aborted: Option<Arc<AtomicBool>>,
+}
+
+impl<W: WriteEnd> Drop for AbortUnlessShut<W> {
+    fn drop(&mut self) {
+        if self.shut {
+            return;
+        }
+        // Synchronous and never blocks, which is what lets a `Drop` call it.
+        self.half.abort();
+        // `Relaxed`: the bit guards no other data, and its one reader polls the task that dropped this.
+        if let Some(aborted) = &self.aborted {
+            aborted.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Transparent but for `shutdown`, whose success it records. Keeps the inner half's vectored-write
+/// capability, since dropping it would split one splice write into many.
+impl<W: io::AsyncWrite + WriteEnd + Unpin> io::AsyncWrite for AbortUnlessShut<W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().half).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().half).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.half.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().half).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.half).poll_shutdown(cx);
+        if matches!(polled, Poll::Ready(Ok(()))) {
+            this.shut = true;
+        }
+        polled
+    }
+}
+
+/// Hold a local TCP end's socket open after the way back failed with the upload handed over, reading and
 /// discarding the service's reply, until the upload has had its chance to land. It stops at the first of: the
 /// service's end, the forward's send queue empty (the service's kernel acknowledged every byte), the cap of
 /// discarded reply, or `deadline` from the failure. The deadline is total, never idle, so a service that

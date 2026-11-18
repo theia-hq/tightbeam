@@ -20,6 +20,7 @@ use tokio::io;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
+use super::AbortUnlessShut;
 use super::cut::AdmittedChains;
 use super::exposer::{PROVEN_STREAM_DEADLINE, PublicPool, PublicSession, Serving};
 use super::router::{Access, PublicServices, Route, Services, Target};
@@ -400,7 +401,7 @@ where
     let mut writer = AbortUnlessShut {
         half: writer,
         shut: false,
-        aborted: Arc::clone(&aborted),
+        aborted: Some(Arc::clone(&aborted)),
     };
     match ready {
         // Direction is fixed at parse time: read the source, send its bytes to the peer, and discard any
@@ -933,72 +934,6 @@ impl<T: io::AsyncWrite + Unpin> io::AsyncWrite for Watched<T> {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().half).poll_shutdown(cx)
-    }
-}
-
-/// The peer's write half of an admitted stream, aborted on drop unless a `shutdown` succeeded. A successful
-/// `shutdown` is the one clean end: every other way out, an error, a dropped future, a panic, or a handler
-/// that returned without ending its stream, tells the peer the stream was cut off.
-///
-/// It sits innermost, under every wrapper that reaches it (the first-traffic watch, the seat's meter), and
-/// those forward `shutdown` to it, so a `shutdown` anywhere above is the one that disarms it. A writer that
-/// erases its type (a handler's [`BoxWrite`](tightbeam_handler::BoxWrite)) cannot call `abort` itself,
-/// which is why the guard lives below the erasure, where the half is still concrete.
-///
-/// `aborted` is set only when the drop actually aborted, so a writer still held by a detached task has not
-/// set it when the handler returns.
-struct AbortUnlessShut<W: WriteEnd> {
-    half: W,
-    shut: bool,
-    aborted: Arc<AtomicBool>,
-}
-
-impl<W: WriteEnd> Drop for AbortUnlessShut<W> {
-    fn drop(&mut self) {
-        if self.shut {
-            return;
-        }
-        // Synchronous and never blocks, which is what lets a `Drop` call it.
-        self.half.abort();
-        // `Relaxed`: the bit guards no other data, and its one reader polls the task that dropped this.
-        self.aborted.store(true, Ordering::Relaxed);
-    }
-}
-
-/// Transparent but for `shutdown`, whose success it records. Keeps the inner half's vectored-write
-/// capability, for the same reason [`Watched`] does.
-impl<W: io::AsyncWrite + WriteEnd + Unpin> io::AsyncWrite for AbortUnlessShut<W> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().half).poll_write(cx, buf)
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().half).poll_write_vectored(cx, bufs)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.half.is_write_vectored()
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().half).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let polled = Pin::new(&mut this.half).poll_shutdown(cx);
-        if matches!(polled, Poll::Ready(Ok(()))) {
-            this.shut = true;
-        }
-        polled
     }
 }
 
