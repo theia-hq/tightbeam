@@ -7,7 +7,9 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 use std::sync::Arc;
 
-use bifrost::{ConnInfo, NoDiscovery, Node, NodeId, Path, PathChanges, Relay, Session, WriteEnd};
+use bifrost::{
+    ConnInfo, NoDiscovery, Node, NodeId, Path, PathChanges, Refusal, Relay, Session, WriteEnd,
+};
 use bifrost_mem::{MemRead, MemSession, MemTransport, MemWrite};
 use nauthy::Gate;
 use tokio::io::{self, AsyncReadExt as _, AsyncWriteExt as _};
@@ -400,8 +402,8 @@ async fn a_service_session_reports_its_sessions_path_changes() {
     assert_eq!(heard, [relayed(), Path::Direct]);
 }
 
-/// A forward to a host the test plays by hand, carrying one local client on one admitted stream. The host's
-/// halves of that stream and its session are held here, so nothing ends until a row ends it.
+/// A forward to a host the test plays by hand, carrying one local client on one stream the host has answered.
+/// The host's halves of that stream and its session are held here, so nothing ends until a row ends it.
 struct Carried {
     _nodes: [Node<MemTransport, NoDiscovery>; 2],
     session: MemSession,
@@ -412,8 +414,8 @@ struct Carried {
 }
 
 /// Run a forward to a hand-played host and connect `client` through it, returning once the host has
-/// admitted the client's stream. Call inside a `LocalSet`.
-async fn carried(client: TcpSocket) -> Carried {
+/// given the client's stream `answer`. Call inside a `LocalSet`.
+async fn carried(client: TcpSocket, answer: Response) -> Carried {
     let host = Node::new(MemTransport::bind(), NoDiscovery);
     let consumer = Node::new(MemTransport::bind(), NoDiscovery);
     let admits = async {
@@ -452,10 +454,10 @@ async fn carried(client: TcpSocket) -> Carried {
     Request::read(&mut reader)
         .await
         .expect("the client's request");
-    Response::Ok
+    answer
         .write(&mut writer)
         .await
-        .expect("admit the client");
+        .expect("answer the client's stream");
     Carried {
         _nodes: [host, consumer],
         session,
@@ -491,7 +493,7 @@ async fn a_local_client_reset_mid_upload_resets_the_hosts_stream() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut carried = carried(client_socket()).await;
+            let mut carried = carried(client_socket(), Response::Ok).await;
             let part = b"the first part of an upload";
             carried.client.write_all(part).await.expect("upload");
             let mut got = vec![0_u8; part.len()];
@@ -519,7 +521,7 @@ async fn a_host_cut_off_mid_download_resets_the_local_client() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut carried = carried(client_socket()).await;
+            let mut carried = carried(client_socket(), Response::Ok).await;
             let part = b"the first part of a reply";
             carried.writer.write_all(part).await.expect("reply");
             let mut got = vec![0_u8; part.len()];
@@ -537,14 +539,13 @@ async fn a_host_cut_off_mid_download_resets_the_local_client() {
 }
 
 /// A session lost under a running forward drops every connection it carries where it stands, and each local
-/// client reads that as a reset: nothing runs on that way out, so only a socket armed when it was accepted
-/// can say it.
+/// client reads that as a reset: nothing runs on that way out, so only a socket armed before then can say it.
 #[tokio::test]
 async fn a_lost_session_resets_the_local_client() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut carried = carried(client_socket()).await;
+            let mut carried = carried(client_socket(), Response::Ok).await;
             let part = b"the first part of a reply";
             carried.writer.write_all(part).await.expect("reply");
             let mut got = vec![0_u8; part.len()];
@@ -564,6 +565,25 @@ async fn a_lost_session_resets_the_local_client() {
             assert!(
                 forwarded.is_err_and(|error| error.downcast_ref::<ConnectionLost>().is_some()),
                 "the forward names the lost connection"
+            );
+        })
+        .await;
+}
+
+/// A host that refuses a client's stream reaches the local client as a reset, never as a service that
+/// answered nothing. The client sends nothing first, so no unread byte resets the socket on its own: only an
+/// arm set when the connection was accepted, before any answer, can say it.
+#[tokio::test]
+async fn a_refused_stream_resets_the_local_client() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut carried =
+                carried(client_socket(), Response::Refused(Refusal::NotAdmitted)).await;
+            let ended = read_rest(&mut carried.client).await;
+            assert!(
+                reset(&ended),
+                "a refused stream resets the client: {ended:?}"
             );
         })
         .await;
@@ -590,7 +610,7 @@ async fn a_forward_that_ends_cleanly_both_ways_delivers_every_byte() {
                 mut reader,
                 mut client,
                 forward: _forward,
-            } = carried(socket).await;
+            } = carried(socket, Response::Ok).await;
             let upload = b"a whole request";
             let reply: Vec<u8> = (0..REPLY).map(|at| (at % 251) as u8).collect();
             let host = async {

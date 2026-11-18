@@ -263,6 +263,10 @@ const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 impl<S: Session> PortForward<S> {
     /// Forward each accepted TCP connection over its own stream, until the session ends; prints nothing.
     ///
+    /// A local client is reset when the host cuts its stream off, the session is lost, or the stream is
+    /// refused. A client that resets reaches the host as a reset. A clean end in both directions delivers
+    /// every byte.
+    ///
     /// # Errors
     ///
     /// [`ConnectionLost`] once the session ends (the host closed it, or the network path to it failed); every
@@ -287,15 +291,25 @@ impl<S: Session> PortForward<S> {
                     // One local accept failing must not drop the pipes already in flight: log the
                     // error and keep the local listener up. Pause before the next accept, while still
                     // polling the pipes: an error like running out of descriptors fails again at once.
-                    // Armed as it is taken in, before the pipe is first polled, so a connection the
-                    // forward drops for any reason from here on (a refused or unopened stream, a lost
-                    // session) reads as cut off, never as a service that answered nothing.
-                    let tcp = match accepted.and_then(|(tcp, _)| ArmedTcp::arm(tcp)) {
-                        Ok(tcp) => tcp,
+                    let tcp = match accepted {
+                        Ok((tcp, _)) => tcp,
                         Err(error) => {
                             tracing::warn!(%error, "local accept failed; still listening");
                             retry.as_mut().reset(tokio::time::Instant::now() + ACCEPT_RETRY);
                             paused = true;
+                            continue;
+                        }
+                    };
+                    // Armed as it is taken in, before the pipe is first polled, so a connection the
+                    // forward drops for any reason from here on (a refused or unopened stream, a lost
+                    // session) reads as cut off, never as a service that answered nothing. A socket
+                    // that will not arm is dropped and its descriptor freed with it, so accepting goes
+                    // on at once: pausing here would let a client that connects and resets at once
+                    // hold off every other accept.
+                    let tcp = match ArmedTcp::arm(tcp) {
+                        Ok(tcp) => tcp,
+                        Err(error) => {
+                            tracing::warn!(%error, "local connection dropped before it was carried");
                             continue;
                         }
                     };
