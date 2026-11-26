@@ -955,7 +955,7 @@ async fn an_unadmitted_dialer_gets_one_uniform_refusal_no_reason_no_menu() {
 /// The unknown-service menu must not cross the wire even to an ADMITTED caller: under an open gate every
 /// dialer is admitted, yet a probe for a name the node does not expose still gets the uniform refusal,
 /// never the sorted "this node exposes: ..." menu that used to enumerate the surface. (The teaching hint
-/// returns as the gated `control.services` verb, not as a free menu on the wrong-name path.)
+/// returns as the gated catalog read, not as a free menu on the wrong-name path.)
 #[tokio::test]
 async fn an_unknown_service_probe_never_gets_the_menu_even_when_admitted() {
     let local = tokio::task::LocalSet::new();

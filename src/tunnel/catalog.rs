@@ -1,5 +1,5 @@
 //! The service catalog: what a node publishes it serves, with the posture a dialer faces, and the
-//! self-delimiting wire form the member-only `control.services` read carries it in.
+//! self-delimiting wire form the member-only catalog read carries it in.
 //!
 //! The one thing the route table puts on the wire, so its bounds and its decoder live here, apart from the
 //! table that fills it: a blob reaching [`ServiceCatalog::decode`] is untrusted.
@@ -57,7 +57,7 @@ pub struct ServiceEntry {
     /// The posture a dialer faces reaching this service (gated behind a member badge, or open to anyone).
     pub posture: Posture,
 }
-/// The services a node SERVES, each with its reach posture: the answer the gated `control.services` read
+/// The services a node SERVES, each with its reach posture: the answer the gated catalog read
 /// returns. A pure snapshot read from what the exposer was built with (its
 /// [`Services`](super::router::Services) + gate), no mutable
 /// state. Entries are sorted by name, so the wire is canonical and a rendered table reads in a stable order.

@@ -239,7 +239,7 @@ where
         // cross the wire: enumerating the service menu to a dialer hands an unauthorized peer the node's
         // capability list before it has proved anything, so the wire gets the same indistinguishable refusal
         // as any not-admitted dial. A dialer learns a service exists only by being admitted to it; the
-        // teaching hint returns as the gated `control.services` verb, never as a free menu here. (This is
+        // teaching hint returns as the gated catalog read, never as a free menu here. (This is
         // reached only past the gate: an Open node, or a whole-node member badge that admits any name -- so
         // uniformity here also stops a member from mapping the menu by probing wrong names, keeping the same
         // rule at every dialer class.) The lookup is hoisted so the floor and the dispatch below read the same
