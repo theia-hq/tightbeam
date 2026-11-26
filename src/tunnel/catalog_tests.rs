@@ -11,7 +11,7 @@ use crate::tunnel::fixtures::{OpenNoop, services};
 use crate::tunnel::router::{PublicRequest, PublicUnsafeRequest};
 
 /// The catalog a gated node serves reports every service as `gated`, name-sorted, and survives a wire
-/// round trip byte for byte: the read `control.services` returns and the client decodes are the same value.
+/// round trip byte for byte: the catalog the read returns and the client decodes are the same value.
 #[test]
 fn a_gated_catalog_reports_gated_and_round_trips() {
     let services = services(&["c=tcp:127.0.0.1:80"])

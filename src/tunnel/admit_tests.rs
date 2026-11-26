@@ -1168,7 +1168,7 @@ fn a_public_member_admits_a_stranger_and_every_miss_takes_the_family_path() {
         "an unsafe-open raw stream admits as a Slip, never a whole-node member"
     );
 
-    // MISS (gated-present): `control.stop` is served but NOT open on either overlay, so a stranger takes
+    // MISS (gated-present): `member.only` is served but NOT open on either overlay, so a stranger takes
     // the family path and is refused. MISS (absent): a name the node does not serve takes the SAME path.
     assert!(
         admit(
@@ -1178,7 +1178,7 @@ fn a_public_member_admits_a_stranger_and_every_miss_takes_the_family_path() {
             stranger,
             None,
             None,
-            &svc("control.stop")
+            &svc("member.only")
         )
         .is_err(),
         "a served-but-gated service is refused for a stranger (family path)"
@@ -1236,7 +1236,7 @@ fn a_member_dial_ignores_a_second_slot_when_slot_one_is_not_authority_bound() {
 
 /// The flagship, at the tunnel level: a family-gated node opens ONE service per-service; a
 /// stranger with no token is ADMITTED to that service but still REFUSED, uniformly, for a gated service
-/// and for the always-on `control.stop`, which can never be opened. Proves the anti-oracle survives the
+/// and for the always-on member-only route, which can never be opened. Proves the anti-oracle survives the
 /// overlay: the gated refusals are the same payload-free class.
 #[tokio::test]
 async fn a_stranger_is_admitted_to_an_opened_service_and_uniformly_refused_for_the_rest() {
@@ -1244,14 +1244,14 @@ async fn a_stranger_is_admitted_to_an_opened_service_and_uniformly_refused_for_t
     local
         .run_until(async {
             // `open` is an OptIn responder (openable); `locked` is a Never handler (never openable);
-            // `control.stop` stands in for the always-on gated control surface (also a Never handler).
+            // `member.only` stands in for an always-on member-only route (also a Never handler).
             let services = Services(HashMap::new())
                 .with_handler("open", OpenNoop)
                 .expect("`open` binds")
                 .with_handler("locked", GatedNoop)
                 .expect("`locked` binds")
-                .with_handler("control.stop", GatedNoop)
-                .expect("`control.stop` binds");
+                .with_handler("member.only", GatedNoop)
+                .expect("`member.only` binds");
             let exposer = prove(
                 services,
                 family_gate("flagship"),
@@ -1277,19 +1277,19 @@ async fn a_stranger_is_admitted_to_an_opened_service_and_uniformly_refused_for_t
                 .await
                 .expect("the opened service serves the stranger");
 
-            // The same stranger is REFUSED for a gated service AND for control.stop, with the same
+            // The same stranger is REFUSED for a gated service AND for the member-only route, with the same
             // typed refusal: opening one service leaks nothing about the gated ones.
             let session = consumer.connect(exposer_id).await.expect("connect");
             let Err(gated) = ServiceStream::open(&session, "locked").await else {
                 panic!("a gated service must refuse the stranger");
             };
             let session = consumer.connect(exposer_id).await.expect("connect");
-            let Err(control) = ServiceStream::open(&session, "control.stop").await else {
-                panic!("the always-on control surface must refuse the stranger");
+            let Err(member_only) = ServiceStream::open(&session, "member.only").await else {
+                panic!("the always-on member-only route must refuse the stranger");
             };
             assert_eq!(
-                gated, control,
-                "a gated service and the control surface refuse identically (no oracle)"
+                gated, member_only,
+                "a gated service and the member-only route refuse identically (no oracle)"
             );
             assert_eq!(
                 gated,

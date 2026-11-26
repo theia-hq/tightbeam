@@ -80,7 +80,7 @@ impl ExposeCmd {
         <T::Session as Session>::Write: Send + 'static,
         <T::Session as Session>::Read: Send + 'static,
     {
-        // Build the gate before announcing readiness. This thin demo has no auto-added `control.*` services,
+        // Build the gate before announcing readiness. This thin demo has no member-only services of its own,
         // so its `--public` stays a whole-node opt-out (a deliberate `Gate::Open` BASE); an embedder opens
         // individual services per-service instead. An unprovisioned node with NO `--public`
         // fails HERE, loudly, through the shared `resolve_gate` policy, never on a permissive default.

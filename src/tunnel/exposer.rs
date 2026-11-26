@@ -291,7 +291,7 @@ impl Exposer {
     /// proven public overlay decides posture, the target decides kind, the
     /// bound handler declares its metering), so an embedder draws its banner from declared facts rather than
     /// by re-parsing an address string. DISTINCT from [`Router::catalog`](super::Router::catalog): that
-    /// is the on-wire snapshot the member-only `control.services` read serves; this is the local banner
+    /// is the on-wire snapshot the member-only catalog read serves; this is the local banner
     /// view (kind + metering never cross
     /// the wire).
     pub fn manifest(&self) -> Vec<ManifestEntry> {

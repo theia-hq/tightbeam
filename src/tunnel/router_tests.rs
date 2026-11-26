@@ -662,7 +662,7 @@ fn a_synthetic_shaped_name_is_just_a_bound_name() {
 }
 
 /// The catalog reports each service's PER-SERVICE posture: a service in the public request reads `open`,
-/// the rest `gated`, under a family base gate. This is what the `control.services` read serves.
+/// the rest `gated`, under a family base gate. This is what the catalog read serves.
 #[test]
 fn a_catalog_reports_public_services_open_and_the_rest_gated() {
     let services = services(&["web=tcp:127.0.0.1:80"])
@@ -692,7 +692,7 @@ fn a_catalog_reports_public_services_open_and_the_rest_gated() {
 }
 
 /// The catalog's self-listing contract: `self_listing` renders the one row whose handler value
-/// is being built from the catalog (the member-only `control.services` read) as a GATED entry, sorted in
+/// is being built from the catalog (the member-only catalog read) as a GATED entry, sorted in
 /// tightbeam with the rest, so a consumer never patches the wire ordering itself.
 #[test]
 fn a_catalog_self_lists_the_row_being_built_gated() {
@@ -700,12 +700,12 @@ fn a_catalog_self_lists_the_row_being_built_gated() {
     let router = Router::new(gate)
         .parse(&["aaa=tcp:127.0.0.1:81".to_owned()])
         .expect("parses");
-    let catalog = router.catalog(Some(svc("control.services")));
+    let catalog = router.catalog(Some(svc("catalog.read")));
     let names: Vec<&str> = catalog.entries().map(|entry| entry.name.as_str()).collect();
-    assert_eq!(names, ["aaa", "control.services"], "sorted, row included");
+    assert_eq!(names, ["aaa", "catalog.read"], "sorted, row included");
     let self_row = catalog
         .entries()
-        .find(|entry| entry.name == "control.services")
+        .find(|entry| entry.name == "catalog.read")
         .expect("the self-listing row is present");
     assert_eq!(
         self_row.posture,

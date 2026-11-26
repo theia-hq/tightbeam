@@ -171,9 +171,9 @@ impl Router {
         &self.gate
     }
 
-    /// The served services and their reach posture, for the `control.services` read: a name-sorted
+    /// The served services and their reach posture, for the member-only catalog read: a name-sorted
     /// [`ServiceCatalog`] snapshot. `self_listing` names the one row whose handler VALUE is built from this
-    /// catalog (the member-only `control.services` read): it is rendered as a GATED entry and sorted in
+    /// catalog (the catalog read itself): it is rendered as a GATED entry and sorted in
     /// tightbeam, so a caller never patches the wire ordering itself. The only legitimate catalog-serving
     /// handler is member-only (a `Never` route can never be open), so Gated is its only possible posture.
     ///
@@ -520,7 +520,7 @@ impl Services {
         names.into_iter()
     }
 
-    /// The served services and their reach posture, for the `control.services` read: a name-sorted
+    /// The served services and their reach posture, for the member-only catalog read: a name-sorted
     /// [`ServiceCatalog`] snapshot. The posture is the EFFECTIVE one a dialer faces, PER SERVICE: a service
     /// is [`Open`](Posture::Open) if the node's base `gate` is [`Gate::Open`] (everything is open to anyone)
     /// OR the service is a member of the public overlay `public` (opened per-service); otherwise it is
@@ -734,7 +734,7 @@ impl Services {
 /// [`TargetKind`] it forwards to, and the responder-side [`Metering`] its handler declared when open.
 ///
 /// A LOCAL render view an embedder draws its OWN banner from, DISTINCT from the on-wire [`ServiceEntry`] the
-/// member-only `control.services` read returns: the banner is printed by a node to its own operator, so it
+/// member-only catalog read returns: the banner is printed by a node to its own operator, so it
 /// carries the extra render tells (kind, metering) that never cross the wire, and it stays off the
 /// anti-oracle surface the wire catalog guards. Built by [`Exposer::manifest`] from the resolved
 /// services, so a consumer RENDERS declared facts (posture from the proven overlay, kind from the target,
@@ -795,7 +795,7 @@ impl PublicRequest {
         Self(names.into_iter().collect())
     }
 
-    /// Whether `name` was requested public, for a display read (the `control.services` catalog). This reads
+    /// Whether `name` was requested public, for a display read (the catalog). This reads
     /// the raw request, never the proof, so it is a DISPLAY predicate only, never an admission decision.
     fn contains(&self, name: &str) -> bool {
         let Self(names) = self;
@@ -829,7 +829,7 @@ impl PublicUnsafeRequest {
         Self(names.into_iter().collect())
     }
 
-    /// Whether `name` was requested unsafe-open, for a display read (the `control.services` catalog). This
+    /// Whether `name` was requested unsafe-open, for a display read (the catalog). This
     /// reads the raw request, never the proof, so it is a DISPLAY predicate only, never an admission decision.
     fn contains(&self, name: &str) -> bool {
         let Self(names) = self;
@@ -841,7 +841,7 @@ impl PublicUnsafeRequest {
 /// validated at [`Exposer::with_public`] against the served set AND its target's [`open_safe`](Target::open_safe)
 /// posture, so a member is, by construction, an exposed, open-safe service. Membership is the ONLY fast/open
 /// path at admission ([`admit`](super::admit)); a `Never` handler, a raw stream, or a name the node does not serve can
-/// never be a member, so `control.*` and every keyless shell stay member-only by SET NON-MEMBERSHIP, a
+/// never be a member, so a member-only service and every keyless shell stay member-only by SET NON-MEMBERSHIP, a
 /// stronger guarantee than a map entry that merely holds a permissive value.
 #[derive(Debug, Clone, Default)]
 pub(super) struct PublicServices(pub(super) HashSet<String>);
